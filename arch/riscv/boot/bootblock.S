@@ -25,13 +25,37 @@ main:
 	call  bios_func_entry
 
 
-	// TODO: [p1-task2] call BIOS to read kernel in SD card
+	// 任务2：调用 BIOS 的 bios_sd_read 把内核从 SD 卡读入内存
+	//   内核占用的扇区数由 createimage 写在镜像偏移 0x1fc 处
+	//   （即内存 0x502001fc，位于 bootblock 自己扇区的尾部），这里用 lh 读出
+	//   镜像布局：第 0 扇区 = bootblock，第 1 扇区起 = 内核
+	//   加载目标：0x50201000，每个扇区 512 字节
+	li    t3, os_size_loc       // t3 = 0x502001fc（扇区数字段地址）
+	lh    t2, 0(t3)             // t2 = 内核占用的扇区数
+	li    t0, 1                 // t0 = 起始扇区号（SD 卡第 1 扇区）
+	li    t1, kernel            // t1 = 目标内存地址
 
+read_loop:
+	beqz  t2, read_done         // 扇区数为 0 则不读（防御性判断）
+
+	move  a0, t1                // a0 = 本次读取的目标内存地址
+	li    a1, 1                 // a1 = 每次读 1 个扇区
+	move  a2, t0                // a2 = 本次读取的扇区号
+	li    a7, BIOS_SDREAD       // a7 = 11
+	call  bios_func_entry
+
+	addi  t1, t1, 512           // 下一个扇区的目标地址
+	addi  t0, t0, 1             // 下一个扇区号
+	addi  t2, t2, -1            // 剩余扇区数减一
+	j     read_loop
+
+read_done:
 
 	// TODO: [p1-task4] load task-related arguments and pass them to kernel
 
 
-	// TODO: [p1-task2] jump to kernel to start UCAS-OS
+	// 任务2：跳转到内核入口，启动 UCAS-OS
+	jal   kernel
 
 	/************************************************************/
 	/* Do not touch this comment. Reserved for future projects. */

@@ -76,13 +76,20 @@ int main(void)
     bios_putstr("Hello OS!\n\r");
     bios_putstr(buf);
 
-    // TODO: Load tasks by either task id [p1-task3] or task name [p1-task4],
-    //   and then execute them.
-
-    // Infinite while loop, where CPU stays in a low-power state (QAQQQQQQQQQQQ)
+    // 任务2：键盘回显循环
+    //   bios_getchar() 在无输入时返回 -1，必须跳过不输出，
+    //   否则会把 -1 当成字符打出去，屏幕上出现乱码
     while (1)
     {
-        asm volatile("wfi");
+        int ch = bios_getchar();
+
+        if (ch == -1)
+            continue;
+
+        bios_putchar(ch);
+
+        // TODO: [p1-task3] 在此按 taskid 加载并执行用户程序
+        // TODO: [p1-task4] 改为按 taskname 加载并执行用户程序
     }
 
     return 0;
