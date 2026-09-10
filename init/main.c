@@ -129,12 +129,12 @@ int main(void)
 
         // 跳转到 app 入口；app 的 crt0 会在 app main 返回后跳回内核
         //
-        // 这里必须把返回地址放进 ra，但不能用普通的函数指针调用：
-        //   ((void(*)(void))entry)() 会被 GCC 编译成 `jalr a0`，
-        //   返回地址写进了 a0 而不是 ra，crt0 靠 ra 跳回内核就回不来了。
-        // 也不能写 `jalr ra, %0`：本工具链的 GAS 对 rd=x1(ra) 的 jalr
-        // 一律错编成 rd=a0（rd=x2/x3/x10 都是对的，实测过）。
-        // 所以用局部标签让汇编器算好返回地址放进 ra，再做间接跳转。
+        // 关于返回地址的说明（勘误后）：GCC 对函数指针调用本就会生成
+        //   jalr ra, rs（rd=x1，返回地址进 ra）；objdump 会把 rd=ra 的
+        //   jalr 简写成 `jalr a0` 这类省略形式（见 log/task3-工作日志.md
+        //   "jalr 根因复核"），早期据此误判为"返回地址进 a0"。
+        // 这里仍显式先设 ra 再间接跳转，属于双保险：行为与 GCC 隐式生成
+        //   完全等价，且把"返回地址落在哪"写清楚，便于阅读与维护。
         asm volatile(
             "la   ra, 1f\n\t"
             "jalr a0, %0\n\t"

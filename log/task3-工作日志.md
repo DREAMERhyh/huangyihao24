@@ -130,15 +130,14 @@ jr    ra
 - 加载失败判定 `entry == 0`（`load_task_img` 用 0 作错误哨兵，合法入口恒 ≥ 0x52000000）。
 - 每轮循环都重新打印 `Please input a task id:`，app 返回后提示会再次出现。
 
-### 6. ⚠️ 跳转 app 必须让返回地址进 `ra`（本任务最大的坑）
+### 6. 跳转 app 的返回地址设计（含勘误）
 
-GCC 把 `((void(*)(void))(uintptr_t)entry)()` 编译成 **`jalr a0`**——
-返回地址写进了 **a0** 而不是 ra，crt0 靠 ra 跳回内核就会回不来。
+GCC 把 `((void(*)(void))(uintptr_t)entry)()` 编译成 **带链接的 jalr
+（rd=ra）**，返回地址本来就会进 ra——早期误读 objdump 画风以为进了 a0，
+见文末"附：前置项 1 jalr 根因复核"。
 
-而写成 `jalr ra, %0` 也不行：本工具链的 GAS 对 `rd=x1(ra)` 的 `jalr`
-**一律错编成 rd=a0**（`rd=x2/x3/x10/s0/t0` 都是对的，逐一实测过）。
-
-最终解法——用局部标签让汇编器算好返回地址，不写魔数：
+当前写法显式先置 ra 再做间接跳转（双保险，与 GCC 隐式行为完全等价），
+且让"返回地址落在哪"在源码里一目了然：
 
 ```c
 asm volatile(
@@ -156,7 +155,7 @@ asm volatile(
 ```
 502011be: auipc ra,0x0
 502011c2: addi  ra,ra,12  # 502011ca
-502011c6: jalr  a0,a5     # 跳 app 入口
+502011c6: jalr  a0,a5     # 跳 app 入口（ra 已显式指向 1:）
 502011ca: j 50201146      # ← app 返回后落在这里，正好是循环回边
 ```
 
@@ -251,10 +250,17 @@ QEMU 退出码 124 = `timeout` 主动杀进程（内核循环不会自行退出�
 
 ## 踩坑记录
 
-1. **`jalr ra, x` 在本工具链下被错编成 rd=a0**（见 §6）。用
-   `la ra, 1f` + `jalr a0, %0` + `1:` 绕过，返回地址仍正确落进 ra。
-2. **`((fn)entry)()` 生成 `jalr a0`**，返回地址进 a0 而非 ra，配合坑 1 差点让整个
-   "app 返回内核"链路失败。逐条反汇编才发现，不是猜的。
+> 坑 1、2 的根因描述**【勘误】**：详见文末"附：前置项 1 jalr 根因复核"。
+> 结论：`jalr ra, a0` 与 GCC 函数指针调用的编码都是 rd=x1（返回地址进 ra），
+> 并不存在"返回地址进 a0"或"GAS 错编"的问题；当时是把 objdump 的省略画风
+> （rd=ra 时显示为 `jalr a0`）误读成了指令语义。`la ra, 1f` 属双保险，保留。
+
+1. **objdump 的 `jalr` 画风会误导人**：rd=ra 时它显示 `jalr a0`（省略 ra），
+   与 rd=a0 时显示 `jalr a0, a0` 混在一起看很容易误判。判断真实编码必须
+   用 `python` 解 `(enc>>7)&0x1f` 或看 `xxd` 原始字节。
+2. **函数指针调用的编码形态与上下文有关**：GCC 在"调用后无后继代码"时用
+   `jr`（不链接，rd=x0）；在"调用后仍有代码"时用带链接的 jalr（rd=ra）。
+   本任务内核在 while 循环里调用，返回地址确实进 ra，链路本来畅通。
 3. **GAS 不会为访存指令自动物化地址**（两次踩到）：
    Task 2 的 `lh t2, 0(os_size_loc)`，本任务的 `sd ra, saved_ra`。
    都必须先 `la`/`li` 把地址算进寄存器再用。
@@ -273,3 +279,89 @@ Task 3 自检全部通过：自建 createimage 按固定扇区数排布镜像并
 （共享栈 0x50400000 + `sb` 逐字节清 BSS + `.data` 槽保存内核 sp/ra）并能在
 app 返回后跳回内核，`main` 的 taskid 分发对 4 个 app 全部生效、越界被拒、
 非数字被忽略、全程无跑飞。
+
+---
+
+# 附：验收前三个前置项复核（Task 4 之前关闭）
+
+## 前置项 1：jalr 根因复核（结论：早期诊断是误读，特此勘误）
+
+### 原日志的说法（**错误，已更正**）
+
+> "GCC 会把 `((fn)entry)()` 编译成 `jalr a0`，返回地址被写进 a0 而不是 ra"
+> "本工具链的 GAS 对 rd=x1(ra) 的 jalr 一律错编成 rd=a0"
+
+### 复核实验（最小复现，/tmp/repro/jalr-repro*.S, orig.c）
+
+```asm
+f1:  jalr  ra, 0(a0)    → 0x000500e7  → 手工解码 rd=x1(ra), rs1=x10(a0)  ✓ 正确
+f2:  jalr  x1, 0(a0)    → 0x000500e7  → rd=x1   ✓
+f4:  jalr  s0, a0       → 0x00050467  → rd=x8(s0), rs1=a0                ✓ 正确
+f5:  jalr  a0, a0       → 0x00050567  → rd=a0, rs1=a0（这才是 GCC)
+                                      （的产物形态之一，但只出现在无需返回处）
+```
+
+| 解码 | rd | 说明 |
+|---|---|---|
+| `0x000500e7` | **x1 (ra)** | `jalr ra, a0` 的正确编码；objdump 把 rd=ra 简写成 `jalr a0`，早期据此误判成 rd=a0 |
+| `0x00050467` | x8 (s0) | `jalr s0, a0`，正常 |
+| `0x00050567` | x10 (a0) | `jalr a0, a0`，只有显式写成 rd=a0 才是 a0 |
+
+C 侧最小复现（与内核原始写法相同的模式）：
+
+```c
+while (1) { if (entry == 0) continue; ((void(*)(void))(uintptr_t)entry)(); }
+```
+
+GCC -O2 生成 `c.jalr rs`（压缩，`c.jalr rs1` 的 ISA 语义就是
+`jalr x1, 0(rs1)`，**链接到 ra**），或 4 字节 `jalr ra, rs`。两种都正确。
+
+### 结论
+
+1. **"GAS 错编 rd=x1 → rd=a0" 不成立**：`jalr ra, a0` 编码就是
+   `0x000500e7`（rd=x1）。之前判定为 `jalr a0, a0` 是**把 objdump 的
+   省略画风当成了指令语义**。
+2. **"GCC 把返回地址写进 a0" 也不成立**：GCC 的函数指针调用（带后继代码时）
+   生成的是带链接的 jalr，返回地址进 ra。原始 `((fn)entry)()` 写法本来就正确。
+3. **替代假设（".bss 槽被清零"）不适用**：槽位从实现之初就在 `.data`，
+   从未有 ".bss 中保存再被清零"的版本被构建或运行过；不存在运行时故障。
+4. **当前代码为何保留 `la ra, 1f`**：与 GCC 隐式行为完全等价（都把返回地址
+   指向 `1:` 即循环回边），是**双保险**，代码不改，仅修正注释与根因描述。
+
+## 前置项 2：crt0 未使用 s0–s11（内核 s 寄存器存活的手工保证）
+
+链接后 `auipc` app 的 crt0 反汇编（`objdump -d build/auipc` 的 `_start` 到 `main`）：
+
+```
+_start:   auipc t2,0; addi t2,t2,#saved_ra; sd ra,0(t2)
+          auipc t3,0; addi t3,t3,#saved_sp; sd sp,0(t3)
+          lui   sp,0x50400                    # 共享 app 栈
+          auipc t0,0; addi t0,t0,#__bss_start
+          auipc t1,0; addi t1,t1,#__BSS_END__
+clear_loop: bge t0,t1,clear_done; sb zero,0(t0); addi t0,t0,1; j clear_loop
+clear_done: jal main
+          auipc t2,0; ...; ld sp,#saved_sp
+          auipc t3,0; ...; ld ra,#saved_ra
+          ret                                  # = jalr x0, ra
+```
+
+使用的寄存器白名单：**`ra, sp, t0, t1, t2, t3`，不含任何 `s0–s11`**。
+这是内核 `main()` 里跨 app 存活的 s 寄存器（`-O2` 会把 `task_num`、提示串
+地址等 hoist 进 s 寄存器）不被 app 破坏的**唯一手工保证**，已核验。
+
+## 前置项 3：`init_task_num()` 的读取机制与隐藏依赖
+
+```c
+task_num = *(const uint16_t *)IMG_APP_NUM_LOC;   // IMG_APP_NUM_LOC = 0x502001f8
+```
+
+- **地址**：`0x502001f8`，落在第 0 扇区（bootblock 扇区）尾部偏移 `0x1f8`，
+  由自建 `createimage` 的 `write_img_info()` 写入 app 总数。
+- **机制**：内核**直接读内存**，不经过 `bios_sd_read`。
+- **隐藏依赖**：`0x502001f8` 之所以在内存里，是因为 U-Boot 的
+  `CONFIG_BOOTCOMMAND = "run distro_bootcmd\n virtio read 50200000 0 2\n"`
+  在 autoboot 时把镜像前 **2 个扇区**读进 `0x50200000–0x502003ff`，
+  `0x502001f8` 恰好落在这 2 扇区内。也就是说**内核行为借用了 U-Boot 预读的
+  副作用**——若只预读 1 扇区、或信息字段挪出第 0 扇区，该读法立即失效。
+  这个依赖只在 Task 3 的镜像信息区成立；**Task 4 按任务书写明要求改为
+  bootblock 读 app-info 后主动传参给内核**，替代该直接读法。
