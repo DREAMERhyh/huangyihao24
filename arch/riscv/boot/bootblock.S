@@ -16,7 +16,13 @@ main:
 	// fence on all memory and I/O
 	fence
 
-	// TODO: [p1-task1] call BIOS to print string "It's bootblock!"
+	// 任务1：调用 BIOS 的 bios_putstr 打印 bootblock 标志串
+	//   调用约定：a0 = 字符串首地址，a7 = 功能号，然后跳转到 bios_func_entry
+	//   0x50150000 处是一条 ecall + ret，ret 依赖 ra 返回，
+	//   用 call(即 jal) 可让汇编器自动填好返回地址 ra
+	la    a0, msg
+	li    a7, BIOS_PUTSTR
+	call  bios_func_entry
 
 
 	// TODO: [p1-task2] call BIOS to read kernel in SD card
@@ -37,5 +43,5 @@ stop:
 
 .data
 
-msg: .string "It's a bootloader...\n\r"
+msg: .string "It's Dreamerhyh's bootloader...\n\r"
 
