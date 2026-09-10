@@ -17,6 +17,15 @@
 
 #define NBYTES2SEC(nbytes) (((nbytes) / SECTOR_SIZE) + ((nbytes) % SECTOR_SIZE != 0))
 
+/* 任务3 的镜像布局：bootblock 独占第 0 扇区，内核与每个 app 各占固定扇区数。
+ * 注意：这两个宏必须与 include/os/task.h 里的同名宏保持一致 */
+#define KERNEL_FIXED_SECTORS 32
+#define APP_FIXED_SECTORS    15
+
+/* 镜像信息区（位于第 0 扇区尾部）。用户程序数目放在 0x1f8 而不是 0x1fe，
+ * 因为 0x1fe/0x1ff 已被官方签名 0x55 0xaa 占用 */
+#define IMG_APP_NUM_LOC      (OS_SIZE_LOC - 4)
+
 /* TODO: [p1-task4] design your own task_info_t */
 typedef struct {
 
@@ -94,6 +103,7 @@ static void create_image(int nfiles, char *files[])
     for (int fidx = 0; fidx < nfiles; ++fidx) {
 
         int taskidx = fidx - 2;
+        int file_start = phyaddr;   /* 本文件写入镜像的起始字节偏移 */
 
         /* open input file */
         fp = fopen(*files, "r");
@@ -122,14 +132,30 @@ static void create_image(int nfiles, char *files[])
 
         /* write padding bytes */
         /**
-         * TODO:
-         * 1. [p1-task3] do padding so that the kernel and every app program
-         *  occupies the same number of sectors
-         * 2. [p1-task4] only padding bootblock is allowed!
+         * 任务3：bootblock 独占第 0 扇区，内核与每个 app 各占固定扇区数，
+         * 这样 loader 可以直接用 taskid 算出扇区号。
+         * TODO: [p1-task4] only padding bootblock is allowed!
          */
-        if (strcmp(*files, "bootblock") == 0) {
-            write_padding(img, &phyaddr, SECTOR_SIZE);
+        int allocated_sectors = 1;
+
+        if (strcmp(*files, "main") == 0) {
+            allocated_sectors = KERNEL_FIXED_SECTORS;
+        } else if (taskidx >= 0) {
+            allocated_sectors = APP_FIXED_SECTORS;
         }
+
+        /* 该文件实际占用的扇区数（只统计真正写进镜像的字节） */
+        int actual_sectors = NBYTES2SEC(phyaddr - file_start);
+
+        printf("\t\tactual %d sector(s) / allocated %d sector(s)\n",
+               actual_sectors, allocated_sectors);
+
+        if (actual_sectors > allocated_sectors) {
+            error("%s: need %d sector(s), but only %d allocated\n",
+                  *files, actual_sectors, allocated_sectors);
+        }
+
+        write_padding(img, &phyaddr, file_start + allocated_sectors * SECTOR_SIZE);
 
         fclose(fp);
         files++;
@@ -213,8 +239,35 @@ static void write_padding(FILE *img, int *phyaddr, int new_phyaddr)
 static void write_img_info(int nbytes_kernel, task_info_t *taskinfo,
                            short tasknum, FILE * img)
 {
-    // TODO: [p1-task3] & [p1-task4] write image info to some certain places
-    // NOTE: os size, infomation about app-info sector(s) ...
+    // 任务3：把镜像信息写进第 0 扇区（bootblock 扇区）的尾部
+    //
+    //   偏移 0x1f8 : 用户程序数目（2 字节，小端）
+    //   偏移 0x1fc : 内核占用的扇区数（2 字节，小端）—— bootblock 用 lh 从这里读
+    //   偏移 0x1fe : 官方签名 0x55 0xaa
+    //
+    // 内核扇区数写"实际占用"而不是"分配"，因为 bootblock 按此值精确读入内核；
+    // Task 4 改成紧凑排列后同样成立。
+    // 用户程序数目放在 0x1f8 而不是 0x1fe，是为了避开官方签名。
+    // TODO: [p1-task4] write task_info_t array (AppInfo) for loading by name
+
+    uint16_t ksectors = (uint16_t)NBYTES2SEC(nbytes_kernel);
+
+    fseek(img, IMG_APP_NUM_LOC, SEEK_SET);
+    fputc(tasknum & 0xff, img);
+    fputc((tasknum >> 8) & 0xff, img);
+
+    fseek(img, OS_SIZE_LOC, SEEK_SET);
+    fputc(ksectors & 0xff, img);
+    fputc((ksectors >> 8) & 0xff, img);
+
+    fseek(img, BOOT_LOADER_SIG_OFFSET, SEEK_SET);
+    fputc(BOOT_LOADER_SIG_1, img);
+    fputc(BOOT_LOADER_SIG_2, img);
+
+    printf("\n[img info] kernel sectors : %d @ 0x%03x\n", ksectors, OS_SIZE_LOC);
+    printf("[img info] app number     : %d @ 0x%03x\n", tasknum, IMG_APP_NUM_LOC);
+    printf("[img info] boot signature : 0x%02x 0x%02x @ 0x%03x\n",
+           BOOT_LOADER_SIG_1, BOOT_LOADER_SIG_2, BOOT_LOADER_SIG_OFFSET);
 }
 
 /* print an error message and exit */
