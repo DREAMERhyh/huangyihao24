@@ -215,10 +215,17 @@ QEMU 退出码 124 = `timeout` 主动杀进程（内核回显循环不会自行�
    它的 bash 包装进程命令行本身含有该字符串，会被自己匹配到，误判成"有残留进程"。
    精确检查用 `ps -C qemu-system-riscv64`（按进程名匹配）+ `ss -ltn | grep 45454`（按端口）。
    `.scratch/verify.sh` 内部不受影响（脚本命令行是 `bash .scratch/verify.sh`，不含该串）。
-4. **`tasks[16]` 被 `-O2` 优化掉了**：`nm build/main` 显示 `tasks` 与 `__BSS_END__`
-   同址（0x502015e8），说明当前没人引用 `tasks`，其 16 字节没进 BSS。
-   Task 4 真正使用 `tasks` 后它会自动回到 BSS、`__BSS_END__` 随之右移，
+4. **`tasks[16]` 不占 BSS 空间的原因**：`nm build/main` 显示 `tasks` 与 `__BSS_END__`
+   同址（0x502015e8）。原因是 `task_info_t` 目前是**空结构体**，GNU C 下
+   `sizeof(task_info_t) == 0`，所以 `tasks[16]` 展开为 0 字节。
+   **这与 `-O2` 优化无关**（此前记录误写成"-O2 优化掉了"，已更正）。
+   Task 4 给 `task_info_t` 加上字段后 `sizeof` 非零，`__BSS_END__` 会随之右移，
    而 `head.S` 用符号取址，无需改动。
+5. **head.S 用 8 字节 `sd` 清零 BSS 隐含一个对齐假设**：实测 `__bss_start = 0x502015b0`
+   是 8 字节对齐的，所以 `sd` 不会越界。但 `riscv.lds` 里 `__bss_start` 没有显式对齐指令，
+   这个对齐并非脚本保证。**Task 4 结构体变大、BSS 变长时必须复查该地址的对齐情况**；
+   若不满足则应改成 `sb` 逐字节清零（对比：app 侧的 `auipc` 其 `__bss_start = 0x5201021c`
+   就**不是** 8 对齐，因此 crt0.S 必须用 `sb`）。
 5. 两份 RWX 段警告（bootblock 与 main）都无害。
 
 ## 结论
