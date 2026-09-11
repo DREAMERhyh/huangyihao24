@@ -1,5 +1,8 @@
 # 05 任务3：自建 createimage、按 taskid 运行多程序
 
+> **读完你能回答的 3 个问题**：① "分配值 32/15" 和 "实际值 4" 各指什么？② loader 怎么用
+> taskid 算出要读的 SD 扇区号？③ crt0 为什么把内核的 sp/ra 存进 `.data` 槽而不是寄存器？
+
 > 本小节按 **Task 3 形态**讲述：①createimage 固定扇区布局 + 信息字段；②loader 按
 > taskid 读取；③crt0 给用户程序建 C 环境；④main 的 taskid 分发。此后任务把这条
 > 链路不断改造。
@@ -148,3 +151,22 @@ Please input a task id: 4Error: task id out of range!
 - **Task 5**：双镜像，`start_sector` 变为 apps.img 相对扇区，loader 加 `boot_apps_base`；
   main 增加 `list` 命令。
 - `KERNEL_FIXED_SECTORS / APP_FIXED_SECTORS` 两个宏在 Task 4 后**退役删除**。
+---
+
+## 覆盖率自检表（05）
+
+> 行号区间：**当时（Task 3）形态**的 createimage.c / loader.c / crt0.S / main.c。
+> Task 3 后 createimage 与 main.c 已被大幅改造，逐任务对照请结合 `log/task3-工作日志.md`。
+
+| 源文件块（当时行号区间） | 讲解方式 | 归组理由 |
+|---|---|---|
+| createimage：`KERNEL_FIXED_SECTORS/APP_FIXED_SECTORS` 宏 | 逐条 | "分配值"是本任务概念核心（32/15 vs 实际 4） |
+| createimage：`write_img_info`（写 0x1f8/0x1fc/0x1fe）| 逐条 | 信息字段三处偏移语义，必须逐条讲清 |
+| createimage：padding/对照表（actual/allocated + `actual>allocated→error`）| 归组 | 一段流程而非单行语义，整段讲"固定槽位+越限即错" |
+| loader：`block = 1+32+taskid*15` 与 `entry = 0x52000000+i*0x10000`（两行）| 逐条 | 扇区公式是 loader 唯一正确性来源（含 bootblock 扇区让位的 +1 解释） |
+| loader：`bios_sd_read(...)` 与 `return 0/entry` | 归组 | 读+返回值是公式的落点，配合上一行 |
+| crt0：`sd ra→saved_ra`/`sd sp→saved_sp`（两行）| 逐条 | 现场保存策略是本任务最关键设计（为什么 .data 而不 .bss/不借寄存器） |
+| crt0：`li sp,APP_STACK_TOP`（hex）| 逐条 | 共享栈决策要单独论证（0x50400000 vs 0x504fffff） |
+| crt0：BSS 清零（`sb` 循环）| 逐条 | sb vs sd 的越界风险需要逐句展开 |
+| crt0：`call main` + 恢复 + `jr ra` | 归组 | 返回链路与保存是对称结构，合并讲清往返 |
+| main.c：`read_taskid` + 越界判断 + `load_task_img(id)` 调用 | 逐条 | 越界保护（id<task_num）是验收点，必须逐条 |
