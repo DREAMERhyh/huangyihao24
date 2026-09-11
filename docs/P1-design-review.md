@@ -56,7 +56,7 @@
 
 ```
 a7 = 功能号；a0/a1/a2… = 参数；跳转 0x50150000
-0x50150000 处由 U-Boot 写入一条 ecall + ret（见 u-boot cmd/loadboot.c:write_oslab_instrs）
+0x50150000 处由 U-Boot 写入一条 ecall + ret（出处：Phase 0 §5，`cmd/loadboot.c:write_oslab_instrs`）
 ```
 
 | 宏 | 值 | 接口 | 参数 |
@@ -70,7 +70,7 @@ a7 = 功能号；a0/a1/a2… = 参数；跳转 0x50150000
 - **bootblock 侧**：纯汇编直接 `la a0,msg` / `li a7,BIOS_PUTSTR` / `call bios_func_entry`
   （call 自动填 ra；0x50150000 的 ret 靠 ra 返回）。
 - **内核 C 侧**：`arch/riscv/bios/common.c` 的 `call_bios()` 把功能号放 **a7**、参数放
-  a0..a4（伪函数指针调用，U-Boot `mcall_trap()` 读 `regs->a7` 分发、结果写回 `regs->a0`）。
+  a0..a4（伪函数指针调用，U-Boot `mcall_trap()` 读 `regs->a7` 分发、结果写回 `regs->a0`，出处：Phase 0 §5）。
 - **内核跳转表 0x51ffff00**：`include/os/kernel.h` 定义 `KERNEL_JMPTAB_BASE=0x51ffff00`，
   `init_jmptab()` 把 `port_write/port_write_ch/port_read_ch/sd_read/sd_write` 的函数指针
   拷进去；内核所有 `bios_putstr/bios_getchar/bios_sd_read` 都是
@@ -245,9 +245,9 @@ $ make run
 真实日志节选（等待约 6 秒的 U-Boot autoboot 后出现 `=>` 提示符）：
 
 ```
-U-Boot 2024.07UCAS_OS DASICS v3.1.0 ...
+U-Boot 2024.07UCAS_OS DASICS v3.1.0-00024-gf507a8a632-dirty (Sep 07 2025 - 00:28:01 +0000)
 DRAM:  256 MiB
-Hit any key to stop autoboot:  0
+Hit any key to stop autoboot:  0 
 virtio read: device 0 block # 0, count 2 ... 2 blocks read: OK
 => loadboot
 It's Dreamerhyh's bootloader...
@@ -374,11 +374,11 @@ nope         # 未知名
    的非 -O2 基线可对比——Task 4 内核还因新增功能从 4 增至 6 扇区。如实报告，无伪造
    对比（依据见 `log/task4-工作日志.md` §7 与 Makefile）。
 8. **Q：上板时怎么写盘？双镜像和单 image 怎么切换？**
-   A：`make floppy` 默认**方案 A**：单 `dd if=build/image of=/dev/sdX3`（与 QEMU 同一
-   文件，一致性好）。上板要"两个文件分别写入连续扇区"时用**方案 B**：先写 kernel.img，
-   再 `dd if=apps.img of=/dev/sdX seek=(1+K+A)`，偏移计算式（1+K+A、A=1）已留在
-   `Makefile` 的 floppy 注释里（依据：Makefile floppy 规则注释；
-   `log/task5-设计提案.md` §4）。
+   A：`make floppy` 默认**方案 A**：单 `dd if=build/image of=$(DISK)3`（DISK=/dev/sdb，
+   与 QEMU 同一文件，一致性好）。上板要"两个文件分别写入连续扇区"时用**方案 B**：
+   先写 kernel.img，再 `dd if=apps.img of=$(DISK) seek=(1+K+A)`（dd 默认 bs=512，
+   即写到第 1+K+A 扇区），偏移计算式已留在 `Makefile` 的 floppy 注释里（依据：
+   Makefile floppy 规则注释；`log/task5-设计提案.md` §4）。
 9. **Q：启动阶段怎么保证没读 apps 区？（"只读内核镜像"怎么论证）**
    A：**代码路径审查**：bootblock 全文件只有 1 处 `bios_sd_read`（内核加载循环，
    范围固化在扇区 1..K，见 bootblock.S）；u-boot 预读只覆盖扇区 0..1；内核启动只多读

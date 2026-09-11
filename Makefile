@@ -115,8 +115,8 @@ clean:
 # 任务5：两张镜像分别写入 SD 卡（等价于单文件 image 的连续扇区），方案说明见
 # log/task5-设计提案.md §4。本机无板卡、一切到 QEMU 层，采用方案 A（单 dd，
 # 与 QEMU 用同一个 image，一致性验证最简单）。
-# 方案 B（上板时切换）：kernel.img 写 sdX 首部；apps.img 写到偏移
-#   (1 + 内核扇区数 + 1) 扇区，即 seek=((0x1fc 处读到的 K)+2)*512 字节处。
+# 方案 B（上板时切换）：kernel.img 写 $(DISK)3 首部；apps.img 写到偏移
+#   (1 + 内核扇区数 + 1) 扇区，即 seek=((0x1fc 处读到的 K)+2)（dd 默认 bs=512）。
 floppy:
 	sudo fdisk -l $(DISK)
 	sudo dd if=$(DIR_BUILD)/image of=$(DISK)3 conv=notrunc

@@ -21,7 +21,7 @@
 
 - 现象：回显循环跑起来后满屏乱码。
 - 原因：`bios_getchar()` 在无输入时返回 **-1**；把它当字符打印就是 0xFF。
-  （根因：U-Boot `__serial_cgetc` 在无数据时 `return -1`。）
+  （根因：U-Boot `__serial_cgetc` 在无数据时 `return -1`，出处：Phase 0 §5。）
 - 修法：`if (ch == -1) continue;`——-1 必须跳过。
 - 预防：Task 2 验收就断言"日志中无 0xFF 字节"。
 
