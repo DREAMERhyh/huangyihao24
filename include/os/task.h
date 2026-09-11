@@ -39,10 +39,17 @@ extern uint64_t boot_apps_base;
 /* Task 4 的 task_info_t：按"名称 + 起始扇区 + 扇区数 + 内存入口"设计 */
 typedef struct {
     char      name[TASK_NAME_LEN];   /* app 名，与 ELF 文件名一致 */
-    uint32_t  start_sector;          /* 该 app 在镜像中的起始扇区号 */
+    uint32_t  start_sector;          /* 该 app 在 apps.img 中的相对扇区号 */
     uint32_t  sector_num;            /* 占用扇区数 = NBYTES2SEC(p_filesz) */
     uint32_t  vaddr_entry;           /* 内存入口地址 */
 } task_info_t;
+
+/* 收官护栏：这些断言守住 bootblock 传参 A=1、createimage 与内核结构体一致等前提；
+ * 若将来改动破坏任一约束，编译期即报错，而不是在运行期跑飞。 */
+_Static_assert(sizeof(task_info_t) == 28, "task_info_t 必须是 28 字节（createimage 同款）");
+_Static_assert(TASK_NAME_LEN == 16, "TASK_NAME_LEN 必须与 createimage 一致（16）");
+_Static_assert(TASK_MAXNUM * sizeof(task_info_t) <= SECTOR_SIZE,
+               "AppInfo 必须能放进 1 个扇区，否则 bootblock 的 A=1 传参失效");
 
 extern task_info_t tasks[TASK_MAXNUM];
 
