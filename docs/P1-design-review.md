@@ -158,7 +158,7 @@ build/image = kernel.img ∥ apps.img   （Makefile cat 拼接，createimage 不
 
 `task_info_t{name[16], start_sector, sector_num, vaddr_entry}`（28B），16 槽，未用槽清零。
 **`start_sector` = apps.img 内相对扇区号**（要点 3"用户镜像文件中……的地址"背书）：
-出 two 文件解耦，加载时 `base + rel`。
+两文件解耦，加载时 `base + rel`。
 
 ### 内存映射总表
 
@@ -200,3 +200,194 @@ build/image = kernel.img ∥ apps.img   （Makefile cat 拼接，createimage 不
 - 各任务自检：`log/taskN-工作日志.md`；验证脚本 `.scratch/verify.sh`（最终 20 断言）；
   QEMU 日志 `.scratch/task5-qemu.log`。
 - 镜像产物：`build/kernel.img` / `build/apps.img` / `build/image`。
+---
+
+## 现场演示流程（9.16 评审用，引文一律取自 .scratch/task5-qemu.log 真实日志）
+
+> 命令序列即最终 Build → 制镜像 → 运行 → 交互的完整路径。所有"预期输出"为真实
+> 日志摘录（`^M` 是终端回车，`\e[...m` 是 2048 的 ANSI 上色，均按 `cat -v` 原样）。
+
+### 步骤 0：构建（make dirs → make elf → make image）
+
+```bash
+$ make dirs && make elf         # 创建 build/，交叉编译 bootblock/内核/4 个 app
+$ make image
+```
+
+`make image` 真实输出节选（含完整布局核算）：
+
+```
+cd ./build && ./createimage --extended bootblock main 2048 auipc bss data
+0x50200000: bootblock sec  0 ..  0  (130 bytes, 1 sector)
+0x50201000: main     sec  1 ..  6  (3032 bytes, 6 sectors)
+-APPINFO--- appinfo  sec  7 ..  7  (448 bytes, 1 sectors)
+0x52000000: 2048     relsec  0 ..  9  (4752 bytes, 10 sectors)
+0x52010000: auipc    relsec 10 .. 11  (644 bytes, 2 sectors)
+0x52020000: bss     relsec 12 .. 12  (368 bytes, 1 sectors)
+0x52030000: data    relsec 13 .. 21  (4536 bytes, 9 sectors)
+[layout] kernel.img : 8 sectors = 1(boot) + 6(kernel) + 1(appinfo)
+[layout] apps.img   : 22 sectors = 22(apps)
+[layout] apps base (SD 扇区) : 8 (= kernel.img 总扇区 = 1+K+A)
+[layout] app#1 相对扇区 : 0（apps.img 内，无固定空泡）
+cd ./build && cat kernel.img apps.img > image
+```
+
+**这一步验证了什么**：双镜像制品形态（kernel.img=8 扇区=1+6+1、apps.img=22=Σapp）、
+AppInfo 相对扇区（2048 rel=0、auipc rel=10…）、apps 基址=8=1+K+A、cat 拼接等价。
+制品断言（扇区整、`image==kernel+apps`）由 `.scratch/verify.sh` 自动核验。
+
+### 步骤 1：启动（make run）
+
+```bash
+$ make run
+```
+
+真实日志节选（等待约 6 秒的 U-Boot autoboot 后出现 `=>` 提示符）：
+
+```
+U-Boot 2024.07UCAS_OS DASICS v3.1.0 ...
+DRAM:  256 MiB
+Hit any key to stop autoboot:  0
+virtio read: device 0 block # 0, count 2 ... 2 blocks read: OK
+=> loadboot
+It's Dreamerhyh's bootloader...
+Hello OS!
+bss check: t version: 2
+Available tasks: 2048, auipc, bss, data
+```
+
+**这一步验证了什么**：U-Boot 预读前 2 扇区 → `loadboot` 跳 0x50200000 → bootblock 打印
+标志串 → 读内核（0x1fc=lh 得 6 扇区）→ head.S 清 BSS（`bss check: t` 过）→ main 出
+欢迎信息与任务名列表。
+
+### 步骤 2：查看应用信息（list）
+
+真实日志：
+
+```
+Please input a task name: list
+name              start size   entry
+2048            0    10    0x52000000
+auipc           10    2    0x52010000
+bss             12    1    0x52020000
+data            13    9    0x52030000
+```
+
+**这一步验证了什么**：slide 25 可选项"显示应用信息"命令成立；`start` 为 apps.img
+相对扇区，`entry` 为各 app 的 Elf 入口（=窗口基址）。
+
+### 步骤 3：按名启动四个 app（auipc → bss → data → 2048）
+
+真实日志：
+
+```
+Please input a task name: auipc[auipc] Info: testpc = 0x52010064
+Please input a task name: bss[bss] Info: passed bss check!
+Please input a task name: data[data] Info: checking data!
+[data] Info: checking data --- [OK]!
+Please input a task name: 2048 2048 - Game
+ * Use h-j-k-l / w-a-s-d keys to move the tiles.
+ ...
+Press 'Enter' key to continue.. 
+ [2048]: Exit 2048 game ...
+```
+
+**每一步验证了什么**：按名匹配 → `bios_sd_read(base+rel)` 只读该 app → crt0 建立 C 环境
+（auipc 打印 PC=0x52010064 说明代码确实在窗口内执行；bss 通过 = crt0 的 `sb` 逐字节
+清 BSS 生效；data 全量校验通过；2048 进菜单后 q 退出 = crt0 交回控制权、回到内核
+主循环）。
+
+### 步骤 4：错误处理（nope 拒绝、空行判非法）
+
+真实日志：
+
+```
+Please input a task name: nopeError: unknown task or load failed!
+Please input a task name: Error: invalid input!
+```
+
+**这一步验证了什么**：未知名被拒（loader 遍历 tasks[] 未匹配 → 返回 0 → 提示错误并
+回到输入循环）；空行判非法（readline 返回 0）；全程无跑飞。
+
+### 完整交互序列（一次性可复制）
+
+```text
+make dirs && make elf && make image && make run
+# 约 6s 后：
+loadboot
+list
+auipc
+bss
+data
+2048
+<Enter>      # 2048 菜单继续
+q            # 退出 2048，回到内核
+nope         # 未知名
+<Enter>      # 空行（主动提示 + 错误演示）
+```
+
+---
+
+## 预答问题清单（评审问答预演）
+
+1. **Q：app 共享栈顶为什么是 0x50400000，而不是紧贴内核栈的 0x504fffff，也不是每个 app 自己的 64KB 窗口顶部？**
+   A：`KERNEL_STACK=0x50500000` 向下生长；若 app 栈顶是 0x504fffff，与内核栈只差一个
+   字节，两个向下生长的栈必然交叠、互相踩踏。而 0x50400000 让内核栈独享
+   0x50400000–0x50500000（1MB），app 栈向下仍有约 2MB，且架构是**串行单任务**——同一
+   时刻只有一个 app 在跑，共享一个栈安全。不用每 app 窗口顶部，是因为那样 4 个窗口
+   各留一截栈顶空间、浪费且任务书只要求"可调整但需说明"（依据：`arch/riscv/crt0/crt0.S`
+   的 `APP_STACK_TOP`；否决 0x504fffff 的裁决记录在 `log/Phase0-代码勘察报告.md` 勘误 2）。
+2. **Q：AppInfo 为什么必须放在 kernel.img 里？**
+   A：内核启动时 `init_task_info()` 要读 AppInfo 填 tasks[]；若它在 apps.img，内核
+   **启动阶段**就得读应用区，直接违反任务书正文"只把内核镜像从SD卡读取到内存中"与
+   slide 25 "only the kernel image is loaded"。这是矛盾法推出的**必然性**，不是自由选择
+   （依据：`kernel/loader/loader.c`→`init/main.c:init_task_info`；布局论证见
+   `log/task5-设计提案.md` §2.2）。
+3. **Q：AppInfo 的 start_sector 为什么用 apps.img 内相对扇区号，而不是 SD 绝对扇区？**
+   A：要点 3 原文"标识**用户镜像文件中**各个用户程序的地址"就是相对语义的原文背书；
+   只有相对扇区才能让两文件真正解耦——AppInfo 与 kernel.img 的长度 K、拼接顺序无关，
+   加载时 `bios_sd_read(base + rel)` 的 base 只有一处取值。若存绝对扇区，K 一变全部
+   槽位错（依据：`tools/createimage.c` 填充 `start_sector=app_rel_sec[i]`；
+   `kernel/loader/loader.c` 用 `boot_apps_base + tasks[i].start_sector`）。
+4. **Q：为什么不能挂第二块盘？"单卡两分区"的等价性怎么讲？**
+   A：`arch/riscv/bios/common.c` 属于不可改清单，其中 `sd_read` 经 U-Boot
+   `blk_read_devnum(if_type_virtio, 0, …)` **硬编码 device 0**——QEMU 第二块 `-drive`
+   的设备 1 永远读不到（Phase 0 §3 结论 3 勘察确认）。所以双镜像只能落地为"单个
+   sd.img/sd 卡内两分区"。等价性：image 是连续字节流、BIOS 按扇区号寻址、无文件边界，
+   Makefile 的 `cat kernel.img apps.img > image` 就是"两文件写入 SD 卡连续扇区"在文件
+   层面的精确模拟（依据：Makefile image 规则；`log/task5-设计提案.md` §4）。
+5. **Q：crt0 如何把控制权交回内核？s 寄存器怎么保证？**
+   A：进入 crt0 时把内核的 `ra`/`sp` 写进 **`.data` 槽**（`saved_ra`/`saved_sp`），app
+   `main` 返回后再从槽恢复并 `jr ra`；之所以不借寄存器，是因为 a0 会被 app main 冲掉、
+   s 寄存器又违反被调用者 ABI（内核 main 的 s 寄存器跨 app 存活，-O2 会把 task_num 等
+   hoist 进 s 寄存器）。槽放 `.data` 而非 `.bss`，否则清 bss 会抹掉刚存的值。crt0 全程
+   只用 `ra/sp/t0..t3`，四个 app 反汇编核验 **s0–s11 出现次数 = 0**（依据：
+   `arch/riscv/crt0/crt0.S`；`log/task3-工作日志.md` 前置项 2）。
+6. **Q：init_task_info 为什么要 512B 对齐缓冲中转，不直接整扇区读进 tasks[]？**
+   A：tasks[] 是 16×28=448 字节，一次 `bios_sd_read` 读 512B 会**越界覆写 tasks 后面
+   64 字节的 .bss**。用 `aligned(512)` 的 `appinfo_buf` 缓冲后再 `memcpy(task_num*28)`
+   就只拷真实数据（依据：`init/main.c:init_task_info`；越界风险见
+   `log/task4-工作日志.md` §3）。
+7. **Q：-O2 到底怎么回事？任务书说 Task 4 加 -O2，怎么没有对比？**
+   A：`start-code 的 Makefile` 的 `CFLAGS` 里**本来就有 -O2**，bootblock/内核/app 三份
+   产物从 Task 1 起就一直是 -O2 编译，因此不存在"Task 4 加 -O2"的动作，也没有 Task 3
+   的非 -O2 基线可对比——Task 4 内核还因新增功能从 4 增至 6 扇区。如实报告，无伪造
+   对比（依据见 `log/task4-工作日志.md` §7 与 Makefile）。
+8. **Q：上板时怎么写盘？双镜像和单 image 怎么切换？**
+   A：`make floppy` 默认**方案 A**：单 `dd if=build/image of=/dev/sdX3`（与 QEMU 同一
+   文件，一致性好）。上板要"两个文件分别写入连续扇区"时用**方案 B**：先写 kernel.img，
+   再 `dd if=apps.img of=/dev/sdX seek=(1+K+A)`，偏移计算式（1+K+A、A=1）已留在
+   `Makefile` 的 floppy 注释里（依据：Makefile floppy 规则注释；
+   `log/task5-设计提案.md` §4）。
+9. **Q：启动阶段怎么保证没读 apps 区？（"只读内核镜像"怎么论证）**
+   A：**代码路径审查**：bootblock 全文件只有 1 处 `bios_sd_read`（内核加载循环，
+   范围固化在扇区 1..K，见 bootblock.S）；u-boot 预读只覆盖扇区 0..1；内核启动只多读
+   AppInfo 扇区 1+K；三者在 `0..1+K ⊆ kernel.img(0..1+K+A-1)` 内。**日志证据**：QEMU
+   日志在按名启动前没有对 apps 内容的任何输出；loader 只在匹配后按 `base+rel` 读。
+   **局限**：QEMU 无法输出读 I/O 的分区归属日志，故这是"代码审查+行为日志"两级论证。
+10. **Q：跳转 app 的 `la ra, 1f` 双保险是什么意思？objdump 显示 `jalr a0` 是不是坑？**
+    A：GAS 对 `jalr ra, x` 的编码是**正确的 rd=x1**（Task 3 曾因 objdump 把 rd=ra 的
+    jalr 缩写显示成 `jalr a0` 而误判成"返回地址进 a0"，已用反汇编+Python 位段解码
+    复核纠错）。`la ra,1f` 显式把返回地址指向循环回边，与编译器隐式行为等价，纯属
+    双保险、把"返回地址在哪"写进源码（依据：`init/main.c` 跳转注释；
+    `log/task3-工作日志.md` 前置项 1 最小复现）。
