@@ -6,7 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define IMAGE_FILE "./image"
+#define KERNEL_IMAGE_FILE "./kernel.img"
+#define APPS_IMAGE_FILE   "./apps.img"
 #define ARGS "[--extended] [--vm] <bootblock> <executable-file> ..."
 
 #define SECTOR_SIZE 512
@@ -120,46 +121,62 @@ static void create_image(int nfiles, char *files[])
 {
     int tasknum = nfiles - 2;
     int phyaddr = 0;
-    FILE *img = NULL;
+    FILE *img = NULL, *aimg = NULL;
     Elf64_Ehdr ehdr;
     Elf64_Phdr phdr;
 
-    /* 每个文件的布局信息 */
-    uint32_t used_bytes[TASK_MAXNUM + 2];   /* 顺序：bootblock, main, app... */
+    /* 每个文件的布局信息（顺序：files[0]=bootblock, files[1]=main, files[2..]=app） */
+    uint32_t used_bytes[TASK_MAXNUM + 2];
     uint64_t entry_addr[TASK_MAXNUM + 2];
 
     /* 预扫描一遍文件，得到每个文件实际会写进镜像的字节数 */
     for (int fidx = 0; fidx < nfiles; ++fidx)
         used_bytes[fidx] = scan_elf(files[fidx], &entry_addr[fidx]);
 
-    /* ---- 布局计算（全部按扇区） ---- */
-    int boot_sec        = 0;
-    int kernel_sec      = 1;
-    int kernel_sectors  = NBYTES2SEC(used_bytes[1]);            /* 内核 */
-    int appinfo_sec     = APPINFO_SEC_START(kernel_sectors);    /* 1+K */
-    int appinfo_sectors = NBYTES2SEC(TASK_MAXNUM * sizeof(task_info_t)); /* 1 */
-    int app_sec[TASK_MAXNUM];
-    int cur = appinfo_sec + appinfo_sectors;
+    /* ---- 任务5 双镜像布局（两文件相互解耦） ----
+     * kernel.img: 扇区 0 bootblock | 1..K 内核 | K+1 AppInfo(A=1 扇区)
+     * apps.img:   各 app 紧凑排列；AppInfo 记录的是 apps.img 内相对扇区号
+     * apps 区基址（SD 绝对扇区）= 1 + K + A（= kernel.img 总扇区数）
+     */
+    int kernel_sectors  = NBYTES2SEC(used_bytes[1]);              /* K */
+    int appinfo_sectors = NBYTES2SEC(TASK_MAXNUM * sizeof(task_info_t)); /* A = 1 */
+    int apps_base_sector = 1 + kernel_sectors + appinfo_sectors;  /* 传内核 */
 
+    int app_rel_sec[TASK_MAXNUM];   /* apps.img 内相对扇区号 */
+    int cur = 0;
     for (int i = 0; i < tasknum; ++i) {
-        app_sec[i] = cur;
+        app_rel_sec[i] = cur;
         cur += NBYTES2SEC(used_bytes[2 + i]);
     }
-    int total_sectors = cur;
+    int apps_total_sectors = cur;
+    int kernelimg_sectors = apps_base_sector;
 
-    printf("===== 镜像布局（紧凑排列） =====\n");
+    printf("===== 任务5 双镜像布局 =====\n");
 
-    /* ---- 写镜像 ---- */
-    img = fopen(IMAGE_FILE, "w");
+    /* 填充 taskinfo[]：start_sector 一律为 apps.img 内相对扇区号 */
+    for (int i = 0; i < tasknum; ++i) {
+        if (strlen(files[2 + i]) >= TASK_NAME_LEN) {
+            error("task name '%s' too long (>= %d)\n", files[2 + i],
+                  TASK_NAME_LEN);
+        }
+        strcpy(taskinfo[i].name, files[2 + i]);
+        taskinfo[i].start_sector = app_rel_sec[i];
+        taskinfo[i].sector_num   = NBYTES2SEC(used_bytes[2 + i]);
+        taskinfo[i].vaddr_entry  = (uint32_t)entry_addr[2 + i];
+    }
+    for (int i = tasknum; i < TASK_MAXNUM; ++i)
+        memset(&taskinfo[i], 0, sizeof(task_info_t));
+
+    /* ========== kernel.img ========== */
+    img = fopen(KERNEL_IMAGE_FILE, "w");
     assert(img != NULL);
 
-    /* 第 0 扇区：bootblock */
+    /* 扇区 0：bootblock */
     FILE *fp = fopen(files[0], "r");
     assert(fp != NULL);
     read_ehdr(&ehdr, fp);
     printf("0x%04lx: %-8s sec %2d .. %2d  (%d bytes, 1 sector)\n",
-           ehdr.e_entry, files[0], boot_sec, boot_sec,
-           used_bytes[0]);
+           ehdr.e_entry, files[0], 0, 0, used_bytes[0]);
     for (int ph = 0; ph < ehdr.e_phnum; ph++) {
         read_phdr(&phdr, fp, ph, ehdr);
         if (phdr.p_type != PT_LOAD)
@@ -178,9 +195,8 @@ static void create_image(int nfiles, char *files[])
     assert(fp != NULL);
     read_ehdr(&ehdr, fp);
     printf("0x%04lx: %-8s sec %2d .. %2d  (%d bytes, %d sectors)\n",
-           ehdr.e_entry, files[1], kernel_sec,
-           kernel_sec + kernel_sectors - 1, used_bytes[1],
-           kernel_sectors);
+           ehdr.e_entry, files[1], 1,
+           1 + kernel_sectors - 1, used_bytes[1], kernel_sectors);
     for (int ph = 0; ph < ehdr.e_phnum; ph++) {
         read_phdr(&phdr, fp, ph, ehdr);
         if (phdr.p_type != PT_LOAD)
@@ -190,73 +206,66 @@ static void create_image(int nfiles, char *files[])
     fclose(fp);
     write_padding(img, &phyaddr, (1 + kernel_sectors) * SECTOR_SIZE);
 
-    /* 扇区 K+1：AppInfo 区（task_info_t 数组，槽位清零） */
+    /* 扇区 K+1：AppInfo 区（槽位清零；start_sector 为 apps.img 相对扇区） */
     printf("-APPINFO--- %-8s sec %2d .. %2d  (%d bytes, %d sectors)\n",
-           "appinfo", appinfo_sec,
-           appinfo_sec + appinfo_sectors - 1,
+           "appinfo", 1 + kernel_sectors,
+           1 + kernel_sectors + appinfo_sectors - 1,
            (int)(TASK_MAXNUM * sizeof(task_info_t)), appinfo_sectors);
-    for (int i = 0; i < tasknum; ++i) {
-        /* 文件名可能很长：超过槽位就报错，绝不截断 */
-        if (strlen(files[2 + i]) >= TASK_NAME_LEN) {
-            error("task name '%s' too long (>= %d)\n", files[2 + i],
-                  TASK_NAME_LEN);
-        }
-        strcpy(taskinfo[i].name, files[2 + i]);
-        taskinfo[i].start_sector = app_sec[i];
-        taskinfo[i].sector_num   = NBYTES2SEC(used_bytes[2 + i]);
-        taskinfo[i].vaddr_entry  = (uint32_t)entry_addr[2 + i];
-    }
-    /* 剩余槽位清零（未用槽位的 name[0]=='\0'，内核靠它识别空槽） */
-    for (int i = tasknum; i < TASK_MAXNUM; ++i)
-        memset(&taskinfo[i], 0, sizeof(task_info_t));
-    write_appinfo(tasknum, appinfo_sec * SECTOR_SIZE, img);
-    /* fwrite 不经过 phyaddr 计数：同步一次，再把该扇区尾部(448B 之后)清零 */
-    phyaddr = appinfo_sec * SECTOR_SIZE +
+    write_appinfo(tasknum, (1 + kernel_sectors) * SECTOR_SIZE, img);
+    /* fwrite 不经过 phyaddr：同步后补该扇区尾部(448B 后) */
+    phyaddr = (1 + kernel_sectors) * SECTOR_SIZE +
               (int)(TASK_MAXNUM * sizeof(task_info_t));
-    write_padding(img, &phyaddr, (appinfo_sec + appinfo_sectors) * SECTOR_SIZE);
+    write_padding(img, &phyaddr, apps_base_sector * SECTOR_SIZE);
 
-    /* 扇区 K+2 起：各 app 紧凑排列（无固定空泡） */
+    /* ---- 镜像信息字段（0x1f8/0x1fc/0x1fe，写在 kernel.img 第 0 扇区） ---- */
+    write_img_info((uint16_t)kernel_sectors, (short)tasknum, img);
+
+    /* kernel.img 大小自检：创作路径上 padding 已保证 phyaddr 恰停在整数个扇区 */
+    if (phyaddr != kernelimg_sectors * SECTOR_SIZE) {
+        error("kernel.img layout mismatch: computed %d bytes, wrote %d\n",
+              kernelimg_sectors * SECTOR_SIZE, phyaddr);
+    }
+    fclose(img);
+
+    /* ========== apps.img ========== */
+    aimg = fopen(APPS_IMAGE_FILE, "w");
+    assert(aimg != NULL);
+    phyaddr = 0;
+
     for (int i = 0; i < tasknum; ++i) {
         fp = fopen(files[2 + i], "r");
         assert(fp != NULL);
         read_ehdr(&ehdr, fp);
-        printf("0x%04lx: %-8s sec %2d .. %2d  (%d bytes, %d sectors)\n",
-               ehdr.e_entry, files[2 + i], app_sec[i],
-               app_sec[i] + taskinfo[i].sector_num - 1,
+        printf("0x%04lx: %-8s relsec %2d .. %2d  (%d bytes, %d sectors)\n",
+               ehdr.e_entry, files[2 + i], app_rel_sec[i],
+               app_rel_sec[i] + taskinfo[i].sector_num - 1,
                used_bytes[2 + i], taskinfo[i].sector_num);
         for (int ph = 0; ph < ehdr.e_phnum; ph++) {
             read_phdr(&phdr, fp, ph, ehdr);
             if (phdr.p_type != PT_LOAD)
                 continue;
-            write_segment(phdr, fp, img, &phyaddr);
+            write_segment(phdr, fp, aimg, &phyaddr);
         }
         fclose(fp);
-        write_padding(img, &phyaddr, (app_sec[i] + taskinfo[i].sector_num) *
-                                     SECTOR_SIZE);
+        write_padding(aimg, &phyaddr,
+                      (app_rel_sec[i] + taskinfo[i].sector_num) * SECTOR_SIZE);
     }
 
-    /* 布局自检：按公式核算总扇区数，与文件实际大小必须一致 */
-    int actual_total = phyaddr / SECTOR_SIZE;
-    if (actual_total != total_sectors) {
-        error("layout mismatch: computed %d sectors, wrote %d\n",
-              total_sectors, actual_total);
-    }
+    /* apps.img 大小自检：恰好整扇区且与公式核算一致 */
+    if (phyaddr != apps_total_sectors * SECTOR_SIZE)
+        error("apps.img layout mismatch: computed %d bytes, wrote %d\n",
+              apps_total_sectors * SECTOR_SIZE, phyaddr);
+    fclose(aimg);
 
-    /* ---- 镜像信息字段 ---- */
-    write_img_info((uint16_t)kernel_sectors, (short)tasknum, img);
-
-    printf("\n===== 布局核算 =====");
-    printf("\n[layout] total sectors : %d = 1(boot) + %d(kernel) + %d(appinfo)"
-           " + %d(apps)\n",
-           total_sectors, kernel_sectors, appinfo_sectors,
-           total_sectors - 1 - kernel_sectors - appinfo_sectors);
-    printf("[layout] appinfo sector : %d (= 1 + kernel_sectors)\n",
-           appinfo_sec);
-    printf("[layout] app#1 sector   : %d (= 1 + kernel_sectors + %d)"
-           "  (无固定空泡)\n",
-           tasknum > 0 ? app_sec[0] : -1, appinfo_sectors);
-
-    fclose(img);
+    printf("\n===== 布局核算 =====\n");
+    printf("[layout] kernel.img : %d sectors = 1(boot) + %d(kernel) + %d(appinfo)\n",
+           kernelimg_sectors, kernel_sectors, appinfo_sectors);
+    printf("[layout] apps.img   : %d sectors = %d(apps)\n",
+           apps_total_sectors, apps_total_sectors);
+    printf("[layout] apps base (SD 扇区) : %d (= kernel.img 总扇区 = 1+K+A)\n",
+           apps_base_sector);
+    printf("[layout] app#1 相对扇区 : %d（apps.img 内，无固定空泡）\n",
+           tasknum > 0 ? app_rel_sec[0] : -1);
 }
 
 static void read_ehdr(Elf64_Ehdr * ehdr, FILE * fp)

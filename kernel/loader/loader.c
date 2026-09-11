@@ -20,12 +20,13 @@ uint64_t load_task_img(const char *taskname)
 
         if (strcmp(tasks[i].name, taskname) == 0)
         {
-            // 从 SD 卡读入该 app 的入口窗口。
-            //   start_sector / sector_num / vaddr_entry 都来自镜像 AppInfo 区，
-            //   不再依赖固定扇区数布局（Task 3 的公式已退役）。
+            // 任务5：从 SD 卡读入该 app 的入口窗口。
+            //   tasks[i].start_sector 是 apps.img 内的相对扇区号，需加上
+            //   bootblock 传来的 apps 区基址（= 1+K+A）才是 SD 绝对扇区。
+            //   只读目标 app 本身（要点 4："只加载要运行的用户程序"）。
             if (bios_sd_read(tasks[i].vaddr_entry,
                              tasks[i].sector_num,
-                             tasks[i].start_sector) != 0)
+                             (unsigned)(boot_apps_base + tasks[i].start_sector)) != 0)
                 return 0;   // 任务存在但镜像读取失败
 
             return (uint64_t)tasks[i].vaddr_entry;

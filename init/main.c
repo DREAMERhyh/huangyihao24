@@ -11,11 +11,12 @@
 int version = 2; // version must between 0 and 9
 char buf[VERSION_BUF];
 
-// bootblock 经 head.S 传来的引导参数（Task 4）：
-//   a0 = AppInfo 区起始扇区号，a1 = 用户程序数目
+// bootblock 经 head.S 传来的引导参数（Task 4/5）：
+//   a0 = AppInfo 区起始扇区号，a1 = 用户程序数目，a2 = apps 区基址
 //   定义见 task.h；赋值在 head.S 清完 BSS 后完成
 uint64_t boot_appinfo_sector;
 uint64_t boot_appnum;
+uint64_t boot_apps_base;
 
 // Task info array
 task_info_t tasks[TASK_MAXNUM];
@@ -72,6 +73,64 @@ static void init_task_info(void)
 
     memcpy((void *)tasks, (const void *)appinfo_buf,
            (size_t)task_num * sizeof(task_info_t));
+}
+
+// 任务5：十进制无符号打印（内核无 itoa，除 10 取余、倒序输出）
+static void put_uint(unsigned int val)
+{
+    char tmp[12];
+    int i = 0;
+
+    if (val == 0) {
+        bios_putchar('0');
+        return;
+    }
+    while (val > 0) {
+        tmp[i++] = (char)('0' + val % 10);
+        val /= 10;
+    }
+    while (i > 0)
+        bios_putchar(tmp[--i]);
+}
+
+// 任务5：十六进制打印（地址用 16 进制更直观）
+static void put_hex(unsigned int val)
+{
+    static const char hex[] = "0123456789abcdef";
+    char tmp[9];
+    int i = 0;
+
+    bios_putstr("0x");
+    if (val == 0) {
+        bios_putchar('0');
+        return;
+    }
+    while (val > 0) {
+        tmp[i++] = hex[val & 0xf];
+        val >>= 4;
+    }
+    while (i > 0)
+        bios_putchar(tmp[--i]);
+}
+
+// 任务5：显示应用信息（slide 25 可选项；name / start(相对扇区) / size / entry）
+static void show_task_list(void)
+{
+    bios_putstr("name              start size   entry\r\n");
+    for (int i = 0; i < task_num; ++i)
+    {
+        int pad = TASK_NAME_LEN - strlen(tasks[i].name);
+
+        bios_putstr(tasks[i].name);
+        while (pad-- > 0)
+            bios_putchar(' ');
+        put_uint(tasks[i].start_sector);
+        bios_putstr("    ");
+        put_uint(tasks[i].sector_num);
+        bios_putstr("    ");
+        put_hex(tasks[i].vaddr_entry);
+        bios_putstr("\r\n");
+    }
 }
 
 // 任务4：读入一行由 \r 或 \n 结束的程序名。
@@ -180,6 +239,13 @@ int main(void)
 
         if (len <= 0) {
             bios_putstr("Error: invalid input!\n\r");
+            continue;
+        }
+
+        // 任务5：信息显示命令（slide 25 可选项）——输入 "list" 查看应用信息
+        if (strcmp(name, "list") == 0)
+        {
+            show_task_list();
             continue;
         }
 

@@ -112,6 +112,11 @@ dirs:
 clean:
 	rm -rf $(DIR_BUILD)
 
+# 任务5：两张镜像分别写入 SD 卡（等价于单文件 image 的连续扇区），方案说明见
+# log/task5-设计提案.md §4。本机无板卡、一切到 QEMU 层，采用方案 A（单 dd，
+# 与 QEMU 用同一个 image，一致性验证最简单）。
+# 方案 B（上板时切换）：kernel.img 写 sdX 首部；apps.img 写到偏移
+#   (1 + 内核扇区数 + 1) 扇区，即 seek=((0x1fc 处读到的 K)+2)*512 字节处。
 floppy:
 	sudo fdisk -l $(DISK)
 	sudo dd if=$(DIR_BUILD)/image of=$(DISK)3 conv=notrunc
@@ -161,7 +166,10 @@ elf: $(ELF_BOOT) $(ELF_MAIN) $(ELF_USER)
 $(ELF_CREATEIMAGE): $(SRC_CREATEIMAGE)
 	$(HOST_CC) $(SRC_CREATEIMAGE) -o $@ -ggdb -Wall
 
+# 任务5：createimage 产出 kernel.img 与 apps.img 两个文件；
+# `cat` 拼接成 build/image（QEMU 用，等价于两文件分别写入 SD 卡连续扇区）。
 image: $(ELF_CREATEIMAGE) $(ELF_BOOT) $(ELF_MAIN) $(ELF_USER)
 	cd $(DIR_BUILD) && ./$(<F) --extended $(filter-out $(<F), $(^F))
+	cd $(DIR_BUILD) && cat kernel.img apps.img > image
 
 .PHONY: image

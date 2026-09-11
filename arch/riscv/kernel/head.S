@@ -28,14 +28,16 @@ clear_loop:
   j     clear_loop
 clear_done:
 
-  /* 任务4：保存 bootblock 传来的引导参数
-   *   a0 = AppInfo 区起始扇区号，a1 = 用户程序数目
-   *   必须放在清完 BSS 之后：这两个全局量在 .bss 里，先清再存。
+  /* 任务4/5：保存 bootblock 传来的引导参数
+   *   a0 = AppInfo 区起始扇区号，a1 = 用户程序数目，a2 = apps 区基址
+   *   必须放在清完 BSS 之后：这三个全局量在 .bss 里，先清再存。
    *   此后 main() 从全局量取值，内核不再直接读 0x50200xxx。 */
   la    t2, boot_appinfo_sector
   sd    a0, 0(t2)
   la    t3, boot_appnum
   sd    a1, 0(t3)
+  la    t4, boot_apps_base
+  sd    a2, 0(t4)
 
   /* 任务2：建立 C 运行环境
    *   栈顶 0x50500000（KERNEL_STACK），向下生长；

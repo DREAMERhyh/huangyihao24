@@ -26,13 +26,15 @@
  */
 #define APPINFO_SECTORS    NBYTES2SEC(TASK_MAXNUM * sizeof(task_info_t))  /* = 1 */
 
-/* bootblock 经寄存器传给内核的引导参数（Task 4）：
+/* bootblock 经寄存器传给内核的引导参数（Task 4 + Task 5）：
  *   a0 = AppInfo 区起始扇区号
  *   a1 = 用户程序数目（bootblock 从镜像偏移 0x1f8 读出）
- * head.S 在清完 BSS 后把这两个值存进下面的全局量，再跳 main。
+ *   a2 = apps 区基址（SD 绝对扇区 = 1+K+A，即 kernel.img 总扇区数）
+ * head.S 在清完 BSS 后把这三个值存进下面的全局量，再跳 main。
  * 注意：内核一律不直接读 0x50200xxx（那是 bootblock 扇区，只允许 bootblock 读）。 */
 extern uint64_t boot_appinfo_sector;
 extern uint64_t boot_appnum;
+extern uint64_t boot_apps_base;
 
 /* Task 4 的 task_info_t：按"名称 + 起始扇区 + 扇区数 + 内存入口"设计 */
 typedef struct {
