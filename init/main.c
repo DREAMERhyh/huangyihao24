@@ -11,6 +11,12 @@
 int version = 2; // version must between 0 and 9
 char buf[VERSION_BUF];
 
+// bootblock 经 head.S 传来的引导参数（Task 4）：
+//   a0 = AppInfo 区起始扇区号，a1 = 用户程序数目
+//   定义见 task.h；赋值在 head.S 清完 BSS 后完成
+uint64_t boot_appinfo_sector;
+uint64_t boot_appnum;
+
 // Task info array
 task_info_t tasks[TASK_MAXNUM];
 
@@ -41,30 +47,81 @@ static void init_jmptab(void)
 
 static void init_task_info(void)
 {
-    // TODO: [p1-task4] Init 'tasks' array via reading app-info sector
-    // NOTE: You need to get some related arguments from bootblock first
+    // 任务4：从 AppInfo 区读出 task_info_t 数组，填进 tasks[]。
+    //   位置与数量来自 bootblock 传参（head.S 已存进 boot_appinfo_sector /
+    //   boot_appnum），不再直接读 0x50200xxx。
+    //   AppInfo 必须先读到本地 512B 对齐缓冲中转，再拷 task_num*sizeof 字节
+    //   进 tasks[]，不能整扇区直读 tasks[]（会越界覆写 tasks 后面的 .bss）。
+    // NOTE: [p1-task3] 的 taskid 读取已废弃，改按名字加载（见 main 循环）。
+    static uint8_t appinfo_buf[SECTOR_SIZE]
+        __attribute__((aligned(SECTOR_SIZE)));
+
+    task_num = (int)boot_appnum;
+
+    if (task_num <= 0 || task_num > TASK_MAXNUM) {
+        task_num = 0;
+        return;
+    }
+
+    // 读出 AppInfo 区（固定 APPINFO_SECTORS = 1 个扇区）
+    if (bios_sd_read((unsigned)(unsigned long)appinfo_buf, APPINFO_SECTORS,
+                     (unsigned)boot_appinfo_sector) != 0) {
+        task_num = 0;
+        return;
+    }
+
+    memcpy((void *)tasks, (const void *)appinfo_buf,
+           (size_t)task_num * sizeof(task_info_t));
 }
 
-// 任务3：从镜像信息区读出用户程序数目，作为 taskid 的合法上界
-static void init_task_num(void)
+// 任务4：读入一行由 \r 或 \n 结束的程序名。
+//   支持退格（BS=0x08 / DEL=0x7f）；名字截断到 TASK_NAME_LEN-1；
+//   若某行超长则"整个名字"判非法，清空到行尾后返回 0。
+//   \r 与 \n 都立即终止；后续的 \r 或 \n（如 \r\n 的另一半）会以空行被
+//   瞬间消费掉，由调用方忽略空行，不会卡住。
+static int readline(char *buf, int cap)
 {
-    task_num = *(const uint16_t *)IMG_APP_NUM_LOC;
-}
+    int len = 0;
 
-// 任务3：逐个读字符并回显，直到读到一个数字为止，返回它代表的 taskid
-static int read_taskid(void)
-{
+    buf[0] = '\0';
     while (1)
     {
         int ch = bios_getchar();
 
         if (ch == -1)
-            continue;   // 无输入时跳过，否则会把 -1 当字符打出乱码
+            continue;   // 无输入跳过
 
-        bios_putchar(ch);
+        if (ch == '\n' || ch == '\r') {   // 双终止符
+            buf[len] = '\0';
+            return len;
+        }
 
-        if (ch >= '0' && ch <= '9')
-            return ch - '0';   // 非数字字符（含回车）只回显、不参与解析
+        if (ch == '\b' || ch == 0x7f) {   // 退格：BS 或 DEL
+            if (len > 0) {
+                len--;
+                bios_putchar('\b');        // 回显擦除
+                bios_putchar(' ');
+                bios_putchar('\b');
+            }
+            continue;
+        }
+
+        if (ch < ' ' || ch > '~')         // 不可打印字符忽略
+            continue;
+
+        if (len >= cap - 1) {              // 名字超长：本行作废
+            while (1) {
+                while ((ch = bios_getchar()) == -1)
+                    ;
+                if (ch == '\n' || ch == '\r')
+                    break;
+            }
+            buf[0] = '\0';
+            return 0;
+        }
+
+        bios_putchar(ch);                  // 回显
+        buf[len++] = (char)ch;
     }
 }
 
@@ -80,11 +137,8 @@ int main(void)
     // Init jump table provided by kernel and bios(ΦωΦ)
     init_jmptab();
 
-    // Init task information (〃'▽'〃)
+    // Init task information from bootblock-passed AppInfo (〃'▽'〃)
     init_task_info();
-
-    // 任务3：从镜像信息区读出用户程序数目
-    init_task_num();
 
     // Output 'Hello OS!', bss check result and OS version
     char output_str[] = "bss check: _ version: _\n\r";
@@ -105,25 +159,35 @@ int main(void)
     bios_putstr("Hello OS!\n\r");
     bios_putstr(buf);
 
-    // 任务3：交互式读入 taskid，加载并执行对应用户程序
-    //   taskid 必须 < app 总数，越界则提示错误并回到输入循环，不得跑飞
+    // 任务4：列出可用的任务名，方便按名加载
+    bios_putstr("Available tasks: ");
+    for (int i = 0; i < task_num; ++i) {
+        bios_putstr(tasks[i].name);
+        if (i + 1 < task_num)
+            bios_putstr(", ");
+    }
+    bios_putstr("\n\r");
+
+    // 任务4：交互式读入程序名，在 AppInfo 里匹配、加载并执行
+    //   未知名/空行/超长行都提示错误并回到输入循环，不得跑飞
     while (1)
     {
-        bios_putstr("Please input a task id: ");
+        char name[TASK_NAME_LEN];
 
-        int id = read_taskid();
+        bios_putstr("Please input a task name: ");
 
-        if (id >= task_num)
-        {
-            bios_putstr("Error: task id out of range!\n\r");
+        int len = readline(name, TASK_NAME_LEN);
+
+        if (len <= 0) {
+            bios_putstr("Error: invalid input!\n\r");
             continue;
         }
 
-        uint64_t entry = load_task_img(id);
+        uint64_t entry = load_task_img(name);
 
         if (entry == 0)
         {
-            bios_putstr("Error: load task img failed!\n\r");
+            bios_putstr("Error: unknown task or load failed!\n\r");
             continue;
         }
 
@@ -143,8 +207,6 @@ int main(void)
             : "r"(entry)
             : "ra", "a0", "memory"
         );
-
-        // TODO: [p1-task4] 改为按 taskname 加载并执行用户程序
     }
 
     return 0;

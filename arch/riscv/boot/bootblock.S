@@ -51,8 +51,18 @@ read_loop:
 
 read_done:
 
-	// TODO: [p1-task4] load task-related arguments and pass them to kernel
-
+	// 任务4：把镜像布局参数传给内核（替代内核直接读 0x50200xxx）：
+	//   布局：扇区 0 = bootblock，1..1+K-1 = 内核，1+K = AppInfo 区，
+	//         之后 = 各 app 紧凑排列。K 是上面从 0x1fc 读出的内核扇区数。
+	//   传参约定（head.S 会保存，见 task.h）：
+	//     a0 = AppInfo 区起始扇区号 = 1 + K
+	//          （t0 在循环结束时正好停在 1+K，直接复用）
+	//     a1 = 用户程序数目（从本扇区偏移 0x1f8 读出）
+	//   这依赖 U-Boot `virtio read 50200000 0 2` 预读前 2 扇区到 0x50200000：
+	//   0x502001fc/0x1f8 才在内存里可读（见 log/task3 前置项 3 的隐藏依赖说明）。
+	move  a0, t0               // a0 = 1 + K（AppInfo 起始扇区）
+	li    t3, os_size_loc - 4  // t3 = 0x502001f8（app 数目字段地址）
+	lh    a1, 0(t3)            // a1 = 用户程序数目
 
 	// 任务2：跳转到内核入口，启动 UCAS-OS
 	jal   kernel

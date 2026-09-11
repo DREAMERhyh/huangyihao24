@@ -352,6 +352,16 @@ app 的 64KB 窗口内代码+数据紧贴窗口底部（2048 占 0x1228、data �
 2. **app 栈位置**：初稿提案"共享栈顶 0x504fffff"被用户驳回——该地址与
    `KERNEL_STACK=0x50500000` 仅差 1 字节，两个向下生长的栈顶部必然交叠。
    已改为**共享栈顶 0x50400000**，见 §8.4。
+3. **Task 3 审批语"bootblock 零改动"（用户自己纠正为错误表述，我未及时点破冲突）**：
+   - Task 3 验收通过消息里的原话是"bootblock.S：读内核扇区数的逻辑保持从 0x1fc 读取
+     （与 Task 2 一致，天然兼容）"，这句容易被读成"bootblock 零改动"；
+   - 但 **`bootblock.S:25` 本身就是 `[p1-task4] load task-related arguments and pass
+     them to kernel` 的 TODO**（本报告 §7 已列出），Task 4 必须填它（读 AppInfo、传参），
+     任务书原文"bootblock.S：读内核扇区数的逻辑保持从 0x1fc 读取"只是约束**那一处逻辑**
+     不变，并不表示 bootblock 完全不动；
+   - 按 Task 2 立下的规矩："指令与源码/任务书冲突时必须显式点破再行动"，我应当在
+     Task 3 汇报里指出"该承诺与 bootblock.S:25 的 [p1-task4] TODO 冲突"，当时没提，
+     **这是继 head.S 之后第二次漏点破**。此处正式勘误，并在 Task 4 冲突表里登记。
 
 ---
 
