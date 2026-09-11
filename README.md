@@ -47,8 +47,9 @@ Please input a task name: auipc
 
 ## 文档
 
+- 教学文档（11 件套）：`docs/00-项目总览.md` … `docs/10-常见报错FAQ.md`（完整目录见 [docs/](docs/)）
+- 设计评审（slide 26 四要点 + 演示流程 + 预答清单）：`docs/P1-design-review.md`
 - 任务书/课件原文：`docs/taskbook-extracts-p1.md`
-- 设计评审（slide 26 四要点）：`docs/P1-design-review.md`
 - 各任务日志与工作流程：`log/`（勘察报告、工作流程、task1–5 日志、task5 设计提案）
 
 ## 分支与提交
