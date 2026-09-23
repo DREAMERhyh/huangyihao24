@@ -1,15 +1,23 @@
 #include <common.h>
 #include <asm.h>
+#include <asm/unistd.h>
+#include <os/loader.h>
+#include <os/irq.h>
+#include <os/sched.h>
+#include <os/lock.h>
 #include <os/kernel.h>
 #include <os/task.h>
 #include <os/string.h>
-#include <os/loader.h>
+#include <os/mm.h>
+#include <os/time.h>
+#include <sys/syscall.h>
+#include <screen.h>
+#include <printk.h>
+#include <assert.h>
 #include <type.h>
+#include <csr.h>
 
-#define VERSION_BUF 50
-
-int version = 2; // version must between 0 and 9
-char buf[VERSION_BUF];
+extern void ret_from_exception();
 
 // bootblock 经 head.S 传来的引导参数（任务5 起为【字节】语义）：
 //   a0 = AppInfo 起始字节偏移，a1 = 用户程序数目，a2 = apps 区起始字节偏移
@@ -24,18 +32,6 @@ task_info_t tasks[TASK_MAXNUM];
 // 任务3：镜像里记录的用户程序数目（createimage 写在镜像偏移 0x1f8）
 int task_num = 0;
 
-static int bss_check(void)
-{
-    for (int i = 0; i < VERSION_BUF; ++i)
-    {
-        if (buf[i] != 0)
-        {
-            return 0;
-        }
-    }
-    return 1;
-}
-
 static void init_jmptab(void)
 {
     volatile long (*(*jmptab))() = (volatile long (*(*))())KERNEL_JMPTAB_BASE;
@@ -44,6 +40,19 @@ static void init_jmptab(void)
     jmptab[CONSOLE_PUTCHAR] = (long (*)())port_write_ch;
     jmptab[CONSOLE_GETCHAR] = (long (*)())port_read_ch;
     jmptab[SD_READ]         = (long (*)())sd_read;
+    jmptab[SD_WRITE]        = (long (*)())sd_write;
+    jmptab[QEMU_LOGGING]    = (long (*)())qemu_logging;
+    jmptab[SET_TIMER]       = (long (*)())set_timer;
+    jmptab[READ_FDT]        = (long (*)())read_fdt;
+    jmptab[MOVE_CURSOR]     = (long (*)())screen_move_cursor;
+    jmptab[PRINT]           = (long (*)())printk;
+    jmptab[YIELD]           = (long (*)())do_scheduler;
+    jmptab[MUTEX_INIT]      = (long (*)())do_mutex_lock_init;
+    jmptab[MUTEX_ACQ]       = (long (*)())do_mutex_lock_acquire;
+    jmptab[MUTEX_RELEASE]   = (long (*)())do_mutex_lock_release;
+
+    // TODO: [p2-task1] (S-core) initialize system call table.
+
 }
 
 static void init_task_info(void)
@@ -128,10 +137,9 @@ static void put_hex(unsigned int val)
         bios_putchar(tmp[--i]);
 }
 
-// 任务5：显示应用信息（slide 25 可选项；name / start(相对扇区) / size / entry）
+// 任务5：显示应用信息（slide 25 可选项；name / start(相对字节) / size / entry）
 static void show_task_list(void)
 {
-    // 任务5：offset / size 均为【字节】语义（镜像内部按字节紧密排列）
     bios_putstr("name              offset size   entry\r\n");
     for (int i = 0; i < task_num; ++i)
     {
@@ -200,41 +208,24 @@ static int readline(char *buf, int cap)
     }
 }
 
-/************************************************************/
-/* Do not touch this comment. Reserved for future projects. */
-/************************************************************/
+// P2：P1 的"按名加载单个程序并跳转过去"变成了"按名挑出一组要并发运行的程序"。
+//   被选中的程序由 init_pcb 逐个装载成 PCB，之后交给 do_scheduler 轮流执行，
+//   所以这里只收集名单，不再跳转。交互格式沿用 P1：一行一个名字，
+//   空行表示"选完了，开始调度"，list 打印应用信息表。
+static task_info_t *running_tasks[TASK_MAXNUM];
+static int running_task_num = 0;
 
-int main(void)
+static task_info_t *lookup_task(const char *name)
 {
-    // Check whether .bss section is set to zero
-    int check = bss_check();
-
-    // Init jump table provided by kernel and bios(ΦωΦ)
-    init_jmptab();
-
-    // Init task information from bootblock-passed AppInfo (〃'▽'〃)
-    init_task_info();
-
-    // Output 'Hello OS!', bss check result and OS version
-    char output_str[] = "bss check: _ version: _\n\r";
-    char output_val[2] = {0};
-    int i, output_val_pos = 0;
-
-    output_val[0] = check ? 't' : 'f';
-    output_val[1] = version + '0';
-    for (i = 0; i < sizeof(output_str); ++i)
-    {
-        buf[i] = output_str[i];
-        if (buf[i] == '_')
-        {
-            buf[i] = output_val[output_val_pos++];
-        }
+    for (int i = 0; i < task_num; ++i) {
+        if (strcmp(tasks[i].name, name) == 0)
+            return &tasks[i];
     }
+    return 0;
+}
 
-    bios_putstr("Hello OS!\n\r");
-    bios_putstr(buf);
-
-    // 任务4：列出可用的任务名，方便按名加载
+static void select_tasks(void)
+{
     bios_putstr("Available tasks: ");
     for (int i = 0; i < task_num; ++i) {
         bios_putstr(tasks[i].name);
@@ -243,52 +234,130 @@ int main(void)
     }
     bios_putstr("\n\r");
 
-    // 任务4：交互式读入程序名，在 AppInfo 里匹配、加载并执行
-    //   未知名/空行/超长行都提示错误并回到输入循环，不得跑飞
     while (1)
     {
         char name[TASK_NAME_LEN];
 
-        bios_putstr("Please input a task name: ");
+        bios_putstr("Please input a task name ('list' for info, empty line to start): ");
 
-        int len = readline(name, TASK_NAME_LEN);
-
-        if (len <= 0) {
-            bios_putstr("Error: invalid input!\n\r");
+        if (readline(name, TASK_NAME_LEN) <= 0) {   // 空行/非法行
+            if (running_task_num > 0)
+                return;                             // 开始调度
+            bios_putstr("Error: no task selected!\n\r");
             continue;
         }
 
-        // 任务5：信息显示命令（slide 25 可选项）——输入 "list" 查看应用信息
-        if (strcmp(name, "list") == 0)
-        {
+        if (strcmp(name, "list") == 0) {            // 任务5：信息显示命令
             show_task_list();
             continue;
         }
 
-        uint64_t entry = load_task_img(name);
-
-        if (entry == 0)
-        {
-            bios_putstr("Error: unknown task or load failed!\n\r");
+        task_info_t *task = lookup_task(name);
+        if (task == 0) {
+            bios_putstr("Error: unknown task!\n\r");
             continue;
         }
 
-        // 跳转到 app 入口；app 的 crt0 会在 app main 返回后跳回内核
-        //
-        // 关于返回地址的说明（勘误后）：GCC 对函数指针调用本就会生成
-        //   jalr ra, rs（rd=x1，返回地址进 ra）；objdump 会把 rd=ra 的
-        //   jalr 简写成 `jalr a0` 这类省略形式（见 log/task3-工作日志.md
-        //   "jalr 根因复核"），早期据此误判为"返回地址进 a0"。
-        // 这里仍显式先设 ra 再间接跳转，属于双保险：行为与 GCC 隐式生成
-        //   完全等价，且把"返回地址落在哪"写清楚，便于阅读与维护。
-        asm volatile(
-            "la   ra, 1f\n\t"
-            "jalr a0, %0\n\t"
-            "1:\n\t"
-            :
-            : "r"(entry)
-            : "ra", "a0", "memory"
-        );
+        // 每个 app 只有一块固定的加载窗口，同一个程序不能选两次
+        int dup = 0;
+        for (int i = 0; i < running_task_num; ++i) {
+            if (running_tasks[i] == task)
+                dup = 1;
+        }
+        if (dup) {
+            bios_putstr("Error: task already selected!\n\r");
+            continue;
+        }
+
+        running_tasks[running_task_num++] = task;
+    }
+}
+
+/************************************************************/
+static void init_pcb_stack(
+    ptr_t kernel_stack, ptr_t user_stack, ptr_t entry_point,
+    pcb_t *pcb)
+{
+     /* TODO: [p2-task3] initialization of registers on kernel stack
+      * HINT: sp, ra, sepc, sstatus
+      * NOTE: To run the task in user mode, you should set corresponding bits
+      *     of sstatus(SPP, SPIE, etc.).
+      */
+    regs_context_t *pt_regs =
+        (regs_context_t *)(kernel_stack - sizeof(regs_context_t));
+
+
+    /* TODO: [p2-task1] set sp to simulate just returning from switch_to
+     * NOTE: you should prepare a stack, and push some values to
+     * simulate a callee-saved context.
+     */
+    switchto_context_t *pt_switchto =
+        (switchto_context_t *)((ptr_t)pt_regs - sizeof(switchto_context_t));
+
+}
+
+static void init_pcb(void)
+{
+    // 本次要跑哪些程序由这里的交互决定（名单见 running_tasks / running_task_num）
+    select_tasks();
+
+    /* TODO: [p2-task1] load needed tasks and init their corresponding PCB */
+
+    // 内核自己也得有个 PCB：调度、屏幕光标等都是经由 current_running 访问的
+    current_running = &pid0_pcb;
+}
+
+static void init_syscall(void)
+{
+    // TODO: [p2-task3] initialize system call table.
+}
+/************************************************************/
+
+int main(void)
+{
+    // Init jump table provided by kernel and bios(ΦωΦ)
+    init_jmptab();
+
+    // Init task information from bootblock-passed AppInfo (〃'▽'〃)
+    init_task_info();
+
+    // Init Process Control Blocks |•'-'•) ✧
+    init_pcb();
+    printk("> [INIT] PCB initialization succeeded.\n");
+
+    // Read CPU frequency (｡•ᴗ-)_
+    time_base = bios_read_fdt(TIMEBASE);
+
+    // Init lock mechanism o(´^｀)o
+    init_locks();
+    printk("> [INIT] Lock mechanism initialization succeeded.\n");
+
+    // Init interrupt (^_^)
+    init_exception();
+    printk("> [INIT] Interrupt processing initialization succeeded.\n");
+
+    // Init system call table (0_0)
+    init_syscall();
+    printk("> [INIT] System call initialized successfully.\n");
+
+    // Init screen (QAQ)
+    init_screen();
+    printk("> [INIT] SCREEN initialization succeeded.\n");
+
+    // TODO: [p2-task4] Setup timer interrupt and enable all interrupt globally
+    // NOTE: The function of sstatus.sie is different from sie's
+
+
+
+    // Infinite while loop, where CPU stays in a low-power state (QAQQQQQQQQQQQ)
+    while (1)
+    {
+        // If you do non-preemptive scheduling, it's used to surrender control
+        do_scheduler();
+
+        // If you do preemptive scheduling, they're used to enable CSR_SIE and wfi
+        // enable_preempt();
+        // asm volatile("wfi");
     }
 
     return 0;
