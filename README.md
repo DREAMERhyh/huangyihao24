@@ -1,57 +1,116 @@
 # C-Core Bootloader（UCAS 操作系统研讨课 Project 1）
 
-完整的五任务实现：bootblock → 内核加载与 C 运行环境 → 自建 createimage 与多任务加载
-→ 紧凑镜像 + 按名加载 → 双镜像内核分区 + 运行时动态加载用户程序。全部在 QEMU 上
-验证通过（无开发板）。
+五个任务全部实现，并在 QEMU 上验证通过（无开发板）。
+**本文件只列验收时实际要敲的命令**；原理与设计说明见 [docs/](docs/)。
 
-## 概览
+---
 
-- 启动链路：QEMU `-kernel u-boot` → 输入 `loadboot` → bootblock（0x50200000）
-  → 调 BIOS 从 SD 读内核到 0x50201000 → head.S 清 BSS、设栈、跳 main。
-- 镜像：`build/image = build/kernel.img ∥ build/apps.img`（cat 拼接，等价于
-  "两文件分别写入 SD 卡连续扇区"）。
-- 用户程序：按名字运行（`auipc` / `bss` / `data` / `2048`），可用 `list` 查看
-  应用信息（name/start/size/entry）。
-
-## 构建与运行
+## 一、构建
 
 ```bash
-make dirs && make elf      # 交叉编译 bootblock / 内核 / 4 个 app
-make image                 # createimage 产出 kernel.img+apps.img 并 cat 成 image
-make run                   # 启动 QEMU，出现 "=>" 后输入 loadboot
-make debug + make gdb      # QEMU 联调
+cd ~/oslab-course/huangyihao24      # 仓库根目录
+
+make dirs                           # 建 build/ 目录
+make elf                            # 交叉编译 bootblock / 内核 / 4 个 app
+make image                          # createimage 产出 kernel.img + apps.img，再 cat 拼成 image
 ```
 
-启动后交互示例：
+等价的一条命令：
 
-```
-loadboot
-It's Dreamerhyh's bootloader...
-Hello OS!
-Available tasks: 2048, auipc, bss, data
-Please input a task name: list
-name              start size   entry
-2048            0    10    0x52000000
-...
-Please input a task name: auipc
-[auipc] Info: testpc = 0x...
+```bash
+make all
 ```
 
-## 布局摘要
+**构建成功标志**（`make image` 末尾会打印布局核算）：
 
-- 内存：bootblock `0x50200000`；内核 `0x50201000`；内核栈 `0x50500000`；
-  app 共享栈 `0x50400000`；BIOS 跳转表 `0x51ffff00`；app 窗口 `0x52000000 + i*0x10000`。
-- 镜像信息字段（kernel.img 第 0 扇区尾部）：`0x1f8`=app 数，`0x1fc`=内核扇区数，
-  `0x1fe`=`55 aa` 签名；AppInfo 区在 kernel.img 扇区 `1+K`（`start_sector` 为
-  apps.img 内相对扇区号）。
+```
+[layout] kernel.img : 8 sectors = 1(boot) + 6(kernel) + 1(appinfo)
+[layout] apps.img   : 22 sectors = 22(apps)
+[layout] apps base (SD 扇区) : 8 (= kernel.img 总扇区 = 1+K+A)
+```
 
-## 文档
+---
 
-- 教学文档（11 件套）：`docs/00-项目总览.md` … `docs/10-常见报错FAQ.md`（完整目录见 [docs/](docs/)）
+## 二、在 QEMU 上运行验证
+
+```bash
+make run
+```
+
+**QEMU 里的操作顺序**：
+
+```
+① 等约 6 秒（U-Boot 自检 + autoboot 走完，出现 "=> " 提示符）
+
+② 输入：
+        loadboot
+
+③ 屏幕依次出现：
+        It's Dreamerhyh's bootloader...
+        Hello OS!
+        bss check: t version: 2
+        Available tasks: 2048, auipc, bss, data
+        Please input a task name:
+
+④ 依次输入（每个名字后按回车）：
+        list         ← 应用信息表（name / start / size / entry）
+        auipc        ← [auipc] Info: testpc = 0x5201xxxx
+        bss          ← [bss] Info: passed bss check!
+        data         ← [data] Info: checking data --- [OK]!
+        2048         ← 打印游戏菜单后按回车继续；按 q 退出游戏
+        nope         ← 应提示 unknown task 且不跑飞
+
+⑤ 退出 QEMU：
+        Ctrl+a    然后按    x
+```
+
+---
+
+## 三、自动化验证（可选）
+
+```bash
+bash .scratch/verify.sh
+```
+
+脚本会自动起 QEMU、注入上述输入、断言 14 项、打印
+`>>> 任务5 全部断言通过 <<<`，并清理残留进程。
+
+---
+
+## 四、上板（有开发板时）
+
+```bash
+make all                            # 构建（与 QEMU 完全相同）
+make floppy                         # sudo dd if=build/image of=/dev/sdb3 conv=notrunc
+make minicom                        # sudo minicom -D /dev/ttyUSB1
+```
+
+在 minicom 里同样输入 `loadboot`，然后按上面第 ②③④ 步操作。
+
+---
+
+## 附一：关键地址与镜像字段（速查）
+
+| 项 | 值 |
+|---|---|
+| bootblock 加载地址 | `0x50200000` |
+| 内核入口 | `0x50201000` |
+| 内核栈顶 | `0x50500000` |
+| app 共享栈顶 | `0x50400000` |
+| BIOS 跳转表 | `0x51ffff00` |
+| app 窗口 | `0x52000000 + i*0x10000` |
+| 镜像信息字段 | `0x1f8`=app 数、`0x1fc`=内核扇区数、`0x1fe`=`55 aa` |
+| AppInfo 区 | kernel.img 扇区 `1+K`（`start_sector` 为 apps.img 内相对扇区号） |
+
+## 附二：文档索引
+
+- 教学文档 11 件套：`docs/00-项目总览.md` … `docs/10-常见报错FAQ.md`
 - 设计评审（slide 26 四要点 + 演示流程 + 预答清单）：`docs/P1-design-review.md`
+- 代码演进史 + 学习问答集（78 问）：`docs/11-代码演进史.md`
+- 汇报素材（我写的代码清单）：`docs/12-我写的代码清单.md`
 - 任务书/课件原文：`docs/taskbook-extracts-p1.md`
-- 各任务日志与工作流程：`log/`（勘察报告、工作流程、task1–5 日志、task5 设计提案）
+- 各任务日志与工作流程：`log/`
 
-## 分支与提交
+## 附三：分支
 
 全部工作在 `Project1` 分支；每个任务一个中文 commit（见 `git log`）。
