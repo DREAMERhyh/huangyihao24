@@ -287,6 +287,17 @@ static void init_pcb_stack(
     regs_context_t *pt_regs =
         (regs_context_t *)(kernel_stack - sizeof(regs_context_t));
 
+    /* 任务3：伪造一份"刚从用户态陷入、现场已存好"的陷阱帧。
+     *   switch_to 末尾 jr ra 跳到 ret_from_exception 后，RESTORE_CONTEXT
+     *   会照着它把寄存器铺回 CPU，最后 sret 进用户态。 */
+    memset((void *)pt_regs, 0, sizeof(regs_context_t));
+
+    pt_regs->regs[2]  = (reg_t)user_stack;    // sp：该任务自己的用户栈顶
+    pt_regs->regs[4]  = (reg_t)pcb;           // tp == current_running
+    pt_regs->regs[1]  = (reg_t)entry_point;   // ra：main 万一返回也有个去处
+    pt_regs->sepc     = (reg_t)entry_point;   // sret 后从程序入口开始执行
+    pt_regs->sstatus  = SR_SPIE;              // SPP=0 回 User 态；SPIE=1 让 sret 后开中断
+
 
     /* TODO: [p2-task1] set sp to simulate just returning from switch_to
      * NOTE: you should prepare a stack, and push some values to
@@ -294,17 +305,18 @@ static void init_pcb_stack(
      *
      * 任务1：新任务没有已保存的现场，所以要手工伪造一个"刚从 switch_to 里
      *   恢复"的 switchto_context_t，按 sched.h 里 regs[14] 的顺序摆：
-     *     regs[0]=ra  —— switch_to 末尾的 jr ra 会跳到这里，即程序入口
-     *     regs[1]=sp  —— 该任务**自己的**用户栈顶（每任务一块，互不重叠）
+     *     regs[0]=ra  —— switch_to 末尾的 jr ra 会跳到这里
+     *     regs[1]=sp  —— 恢复现场时用的 sp
      *     regs[2..13]=s0~s11 —— 新任务没有需要恢复的 callee-saved 变量，清零
-     *   这块现场压在将来要给陷阱帧用的 regs_context_t 下面，任务3 再接上。 */
+     *   任务3 起 ra 改成 ret_from_exception（先恢复陷阱帧、再 sret 进用户态），
+     *   于是 sp 要指向上面那份陷阱帧的基址。 */
     switchto_context_t *pt_switchto =
         (switchto_context_t *)((ptr_t)pt_regs - sizeof(switchto_context_t));
 
-    pt_switchto->regs[0] = (reg_t)entry_point;   /* ra */
-    pt_switchto->regs[1] = (reg_t)user_stack;    /* sp */
+    pt_switchto->regs[0] = (reg_t)ret_from_exception;   /* ra */
+    pt_switchto->regs[1] = (reg_t)pt_regs;              /* sp → 陷阱帧 */
     for (int i = 2; i < 14; ++i)
-        pt_switchto->regs[i] = 0;                /* s0 ~ s11 */
+        pt_switchto->regs[i] = 0;                       /* s0 ~ s11 */
 
     /* PCB 记住"下次被调度时从哪恢复"以及任务自己的栈顶 */
     pcb->kernel_sp = (reg_t)pt_switchto;
@@ -353,6 +365,17 @@ static void init_pcb(void)
 static void init_syscall(void)
 {
     // TODO: [p2-task3] initialize system call table.
+    // 把系统调用号映射到内核函数上（用户侧 invoke_syscall 用 a7 传号）
+    syscall[SYSCALL_SLEEP]        = (long (*)())do_sleep;
+    syscall[SYSCALL_YIELD]        = (long (*)())do_scheduler;
+    syscall[SYSCALL_WRITE]        = (long (*)())screen_write;
+    syscall[SYSCALL_CURSOR]       = (long (*)())screen_move_cursor;
+    syscall[SYSCALL_REFLUSH]      = (long (*)())screen_reflush;
+    syscall[SYSCALL_GET_TIMEBASE] = (long (*)())get_time_base;
+    syscall[SYSCALL_GET_TICK]     = (long (*)())get_ticks;
+    syscall[SYSCALL_LOCK_INIT]    = (long (*)())do_mutex_lock_init;
+    syscall[SYSCALL_LOCK_ACQ]     = (long (*)())do_mutex_lock_acquire;
+    syscall[SYSCALL_LOCK_RELEASE] = (long (*)())do_mutex_lock_release;
 }
 /************************************************************/
 

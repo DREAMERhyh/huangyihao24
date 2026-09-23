@@ -34,4 +34,17 @@ void latency(uint64_t time)
 void check_sleeping(void)
 {
     // TODO: [p2-task3] Pick out tasks that should wake up from the sleep queue
+    /* 扫描睡眠队列，把睡够了的进程唤醒（do_unblock 会把它放回就绪队列）。
+     * 注意先记下后继结点再唤醒：do_unblock 会把这个结点从队列里摘走。 */
+    list_node_t *node = sleep_queue.next;
+
+    while (node != &sleep_queue) {
+        list_node_t *next = node->next;
+        pcb_t *task = list_entry(node, pcb_t, list);
+
+        if (get_timer() >= task->wakeup_time)
+            do_unblock(node);
+
+        node = next;
+    }
 }

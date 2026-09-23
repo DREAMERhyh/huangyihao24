@@ -1,4 +1,5 @@
 #include <os/irq.h>
+#include <csr.h>
 #include <os/time.h>
 #include <os/sched.h>
 #include <os/string.h>
@@ -14,6 +15,15 @@ void interrupt_helper(regs_context_t *regs, uint64_t stval, uint64_t scause)
 {
     // TODO: [p2-task3] & [p2-task4] interrupt handler.
     // call corresponding handler by the value of `scause`
+
+    /* scause 的最高位区分"中断"与"例外"：
+     *   1 → 中断（异步，如时钟中断），低 63 位是中断号
+     *   0 → 例外（同步，如 ecall/env call、缺页），低 63 位是例外号
+     * 两者用不同的入口表分发。 */
+    if (scause & SCAUSE_IRQ_FLAG)
+        irq_table[scause & ~SCAUSE_IRQ_FLAG](regs, stval, scause);
+    else
+        exc_table[scause](regs, stval, scause);
 }
 
 void handle_irq_timer(regs_context_t *regs, uint64_t stval, uint64_t scause)
@@ -26,11 +36,17 @@ void init_exception()
 {
     /* TODO: [p2-task3] initialize exc_table */
     /* NOTE: handle_syscall, handle_other, etc.*/
+    /* 先把所有例外都指向 handle_other（它会把现场打出来并 assert 掉，
+     *   便于定位"踩到没实现的例外"）；只给 ecall 换成正经处理函数。 */
+    for (int i = 0; i < EXCC_COUNT; ++i)
+        exc_table[i] = handle_other;
+    exc_table[EXCC_SYSCALL] = handle_syscall;
 
     /* TODO: [p2-task4] initialize irq_table */
     /* NOTE: handle_int, handle_other, etc.*/
 
     /* TODO: [p2-task3] set up the entrypoint of exceptions */
+    setup_exception();
 }
 
 void handle_other(regs_context_t *regs, uint64_t stval, uint64_t scause)

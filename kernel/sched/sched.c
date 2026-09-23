@@ -25,6 +25,8 @@ pid_t process_id = 1;
 void do_scheduler(void)
 {
     // TODO: [p2-task3] Check sleep queue to wake up PCBs
+    // 每次调度前先看看有没有睡够的进程，把它们放回就绪队列
+    check_sleeping();
 
     /************************************************************/
     /* Do not touch this comment. Reserved for future projects. */
@@ -61,6 +63,12 @@ void do_sleep(uint32_t sleep_time)
     // 1. block the current_running
     // 2. set the wake up time for the blocked task
     // 3. reschedule because the current_running is blocked.
+    /* get_timer() 已经是"秒"（= ticks / timebase），所以直接加上睡眠秒数即可。
+     * 到点与否由 check_sleeping() 在每次 do_scheduler 开头比较。 */
+    current_running->wakeup_time = get_timer() + sleep_time;
+
+    // do_block 内部会置 BLOCKED、挂到睡眠队列并让出 CPU（第 1、3 步）
+    do_block(&current_running->list, &sleep_queue);
 }
 
 void do_block(list_node_t *pcb_node, list_head *queue)
@@ -68,15 +76,11 @@ void do_block(list_node_t *pcb_node, list_head *queue)
     // TODO: [p2-task2] block the pcb task into the block queue
     pcb_t *task = list_entry(pcb_node, pcb_t, list);
 
+    // 先置状态、再入队、最后让出，三步之间即使被时钟中断打断也自洽：
+    // 状态已是 BLOCKED（do_scheduler 不会把本任务再排回就绪队列），
+    // 结点已经在阻塞队列上（唤醒者找得到本任务）。
     task->status = TASK_BLOCKED;
     list_add_tail(pcb_node, queue);
-
-    // ★ 入队已经完成，这里必须**立刻**恢复抢占再让出 CPU：
-    //   调用方（如 do_mutex_lock_acquire）为了把"判断锁状态"和"挂进阻塞队列"
-    //   做成原子操作而临时关了抢占；而 switch_to 只换 GPR，不换 CSR，
-    //   sie 的状态会一路带到下一个任务身上。若在这里不恢复，别的任务就会
-    //   在没有时钟中断的情况下一直跑下去（任务4 的抢占测试会直接卡死）。
-    enable_preempt();
 
     do_scheduler();
 }

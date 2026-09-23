@@ -5,82 +5,87 @@
 
 static const long IGNORE = 0L;
 
+/* 任务3：真系统调用的发起方式。
+ *   RISC-V 的约定：调用号放 a7，参数依次放 a0~a4，然后 ecall 陷入内核；
+ *   内核把返回值写回 a0。这里用 GCC 的"寄存器变量"把 C 变量钉在指定寄存器上，
+ *   ecall 之后再从 a0 读回结果。a0 是输出，所以用 "+r"。
+ *   注意 a0~a7/t0~t6 都是 caller-saved，调用者本来就不指望它们保值；
+ *   而 a0 被声明成输出，编译器不会假设它没变。 */
 static long invoke_syscall(long sysno, long arg0, long arg1, long arg2,
                            long arg3, long arg4)
 {
     /* TODO: [p2-task3] implement invoke_syscall via inline assembly */
-    asm volatile("nop");
+    register long a0 asm("a0") = arg0;
+    register long a1 asm("a1") = arg1;
+    register long a2 asm("a2") = arg2;
+    register long a3 asm("a3") = arg3;
+    register long a4 asm("a4") = arg4;
+    register long a7 asm("a7") = sysno;
 
-    return 0;
+    asm volatile("ecall"
+                 : "+r"(a0)
+                 : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7)
+                 : "memory");
+
+    return a0;
 }
 
-/* 任务1：这几个 API 暂时不是"真系统调用"，而是走内核挂好的跳转表：
- *   用户程序与内核此刻还跑在同一特权级，call_jmptab 直接调到内核函数上。
- *   任务3 实现 ecall 之后，这里会换成 invoke_syscall。 */
+/* 任务1/2 用的跳转表版本已随任务3 退场：现在用户程序跑在 User 态，
+ * 与内核不再同特权级，只能通过 ecall 陷入。 */
+
 void sys_yield(void)
 {
-    /* TODO: [p2-task1] call call_jmptab to implement sys_yield */
-    call_jmptab(YIELD, IGNORE, IGNORE, IGNORE, IGNORE, IGNORE);
-    /* TODO: [p2-task3] call invoke_syscall to implement sys_yield */
+    invoke_syscall(SYSCALL_YIELD, IGNORE, IGNORE, IGNORE, IGNORE, IGNORE);
 }
 
 void sys_move_cursor(int x, int y)
 {
-    /* TODO: [p2-task1] call call_jmptab to implement sys_move_cursor */
-    call_jmptab(MOVE_CURSOR, (long)x, (long)y, IGNORE, IGNORE, IGNORE);
-    /* TODO: [p2-task3] call invoke_syscall to implement sys_move_cursor */
+    invoke_syscall(SYSCALL_CURSOR, (long)x, (long)y, IGNORE, IGNORE, IGNORE);
 }
 
 void sys_write(char *buff)
 {
-    /* TODO: [p2-task1] call call_jmptab to implement sys_write */
-    call_jmptab(PRINT, (long)buff, IGNORE, IGNORE, IGNORE, IGNORE);
-    /* TODO: [p2-task3] call invoke_syscall to implement sys_write */
+    invoke_syscall(SYSCALL_WRITE, (long)buff, IGNORE, IGNORE, IGNORE, IGNORE);
 }
 
 void sys_reflush(void)
 {
-    /* TODO: [p2-task1] call call_jmptab to implement sys_reflush */
-    call_jmptab(SCREEN_REFLUSH, IGNORE, IGNORE, IGNORE, IGNORE, IGNORE);
-    /* TODO: [p2-task3] call invoke_syscall to implement sys_reflush */
+    invoke_syscall(SYSCALL_REFLUSH, IGNORE, IGNORE, IGNORE, IGNORE, IGNORE);
 }
 
 int sys_mutex_init(int key)
 {
-    /* TODO: [p2-task2] call call_jmptab to implement sys_mutex_init */
-    return (int)call_jmptab(MUTEX_INIT, (long)key, IGNORE, IGNORE, IGNORE, IGNORE);
-    /* TODO: [p2-task3] call invoke_syscall to implement sys_mutex_init */
+    return (int)invoke_syscall(SYSCALL_LOCK_INIT, (long)key, IGNORE, IGNORE,
+                               IGNORE, IGNORE);
 }
 
 void sys_mutex_acquire(int mutex_idx)
 {
-    /* TODO: [p2-task2] call call_jmptab to implement sys_mutex_acquire */
-    call_jmptab(MUTEX_ACQ, (long)mutex_idx, IGNORE, IGNORE, IGNORE, IGNORE);
-    /* TODO: [p2-task3] call invoke_syscall to implement sys_mutex_acquire */
+    invoke_syscall(SYSCALL_LOCK_ACQ, (long)mutex_idx, IGNORE, IGNORE, IGNORE,
+                   IGNORE);
 }
 
 void sys_mutex_release(int mutex_idx)
 {
-    /* TODO: [p2-task2] call call_jmptab to implement sys_mutex_release */
-    call_jmptab(MUTEX_RELEASE, (long)mutex_idx, IGNORE, IGNORE, IGNORE, IGNORE);
-    /* TODO: [p2-task3] call invoke_syscall to implement sys_mutex_release */
+    invoke_syscall(SYSCALL_LOCK_RELEASE, (long)mutex_idx, IGNORE, IGNORE,
+                   IGNORE, IGNORE);
 }
 
 long sys_get_timebase(void)
 {
-    /* TODO: [p2-task3] call invoke_syscall to implement sys_get_timebase */
-    return 0;
+    return invoke_syscall(SYSCALL_GET_TIMEBASE, IGNORE, IGNORE, IGNORE, IGNORE,
+                          IGNORE);
 }
 
 long sys_get_tick(void)
 {
-    /* TODO: [p2-task3] call invoke_syscall to implement sys_get_tick */
-    return 0;
+    return invoke_syscall(SYSCALL_GET_TICK, IGNORE, IGNORE, IGNORE, IGNORE,
+                          IGNORE);
 }
 
 void sys_sleep(uint32_t time)
 {
-    /* TODO: [p2-task3] call invoke_syscall to implement sys_sleep */
+    invoke_syscall(SYSCALL_SLEEP, (long)time, IGNORE, IGNORE, IGNORE, IGNORE);
 }
 
 void sys_set_sche_workload(int workload)

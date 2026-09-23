@@ -75,19 +75,32 @@ void do_mutex_lock_acquire(int mlock_idx)
     /* TODO: [p2-task2] acquire mutex lock */
     mutex_lock_t *lock = &mlocks[mlock_idx];
 
-    /* ★ 关抢占把"判断锁状态"和"挂进阻塞队列"锁成一段原子操作。
-     *   否则存在丢唤醒的窗口：本进程刚发现锁被占、还没入队时被打断，
-     *   持有者恰好释放（看到阻塞队列空 → 不唤醒任何人），本进程再去睡就没人叫了。
-     *   do_block 会在入队之后立刻恢复抢占（见 sched.c 的说明）。 */
-    disable_preempt();
+    /* ★ 先入队、再抢锁：这样"入队"与"检查锁状态"之间没有空档，不会丢唤醒。
+     *   如果反过来（先发现被占、再入队），中间被打断而持有者恰好释放
+     *   （它看到队列是空的 → 不唤醒任何人），本进程再去睡就永远没人叫了。
+     *   这段必须关中断：定时器抢占插在中间同样会破坏原子性。
+     *   用 sstatus.SIE 而不是 sie —— sret 会用陷阱帧里的 SPIE 把它恢复，
+     *   所以掩码只作用于这一小段，不会泄漏给别的任务或用户态。 */
+    while (1) {
+        int acquired;
 
-    while (!spin_lock_try_acquire(&lock->lock)) {
-        do_block(&current_running->list, &lock->block_queue);
-        /* 被唤醒后回到循环顶部重新抢：释放者只是把锁置为 UNLOCKED 并
-         * 叫醒队首，真正的占有还是在这里完成的（也顺带容忍虚假唤醒）。 */
+        disable_interrupt();
+
+        list_add_tail(&current_running->list, &lock->block_queue);
+        acquired = spin_lock_try_acquire(&lock->lock);
+        if (acquired)
+            list_del(&current_running->list);   // 抢到了，从等待队列里摘出来
+        current_running->status = acquired ? TASK_RUNNING : TASK_BLOCKED;
+
+        enable_interrupt();
+
+        if (acquired)
+            return;
+
+        /* 没抢到：已经挂在阻塞队列上、状态也是 BLOCKED，让出 CPU 等唤醒。
+         * 醒来后回到循环顶部重抢（也顺带容忍虚假唤醒）。 */
+        do_scheduler();
     }
-
-    enable_preempt();
 }
 
 void do_mutex_lock_release(int mlock_idx)
@@ -95,7 +108,9 @@ void do_mutex_lock_release(int mlock_idx)
     /* TODO: [p2-task2] release mutex lock */
     mutex_lock_t *lock = &mlocks[mlock_idx];
 
-    disable_preempt();
+    /* "置空"和"唤醒队首"必须是一个原子动作：中间被抢占的话，等待者在
+     * 锁已空的情况下却收不到唤醒，就会一直睡下去。 */
+    disable_interrupt();
 
     spin_lock_release(&lock->lock);
 
@@ -103,5 +118,5 @@ void do_mutex_lock_release(int mlock_idx)
     if (!list_empty(&lock->block_queue))
         do_unblock(lock->block_queue.next);
 
-    enable_preempt();
+    enable_interrupt();
 }
