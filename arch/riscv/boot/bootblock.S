@@ -51,19 +51,19 @@ read_loop:
 
 read_done:
 
-	// 任务4/5：把镜像布局参数传给内核（替代内核直接读 0x50200xxx）：
-	//   布局：kernel.img = 扇区 0(bootblock) + 1..K(内核) + 1+K(AppInfo, A=1)；
-	//         apps.img 与之拼接，从扇区 1+K+A 开始连续排列。
+	// 任务5：把镜像布局参数传给内核（内核不直接读 0x50200xxx）。
+	//   布局改为【字节级】：kernel.img = 512(boot) + KB(内核) + 448(AppInfo)，
+	//   apps.img 紧接其后；apps 内部各 app 首尾相接、不补到扇区边界。
 	//   传参约定（head.S 会保存，见 task.h）：
-	//     a0 = AppInfo 区起始扇区号 = 1 + K（t0 循环结束时正好等于 1+K）
-	//     a1 = 用户程序数目（lh 本扇区偏移 0x1f8）
-	//     a2 = apps 区基址 = 1 + K + A（A=1 为 AppInfo 扇区数，即 kernel.img 总扇区数）
+	//     a0 = AppInfo 起始字节偏移（镜像偏移 0x1f0，4 字节）
+	//     a1 = 用户程序数目        （镜像偏移 0x1f8，2 字节）
+	//     a2 = apps 区起始字节偏移（镜像偏移 0x1f4，4 字节）
 	//   这依赖 U-Boot `virtio read 50200000 0 2` 预读前 2 扇区到 0x50200000：
-	//   0x502001fc/0x1f8 才在内存里可读（见 log/task3 前置项 3 的隐藏依赖说明）。
-	move  a0, t0               // a0 = 1 + K（AppInfo 起始扇区）
-	li    t3, os_size_loc - 4  // t3 = 0x502001f8（app 数目字段地址）
-	lh    a1, 0(t3)            // a1 = 用户程序数目
-	addi  a2, t0, 1            // a2 = 1 + K + A（A=1；apps 区基址）
+	//   0x502001f0~0x502001ff 才在内存里可读（见 log/task3 前置项 3）。
+	li    t3, os_size_loc - 12  // t3 = 0x502001f0
+	lw    a0, 0(t3)             // a0 = AppInfo 起始字节偏移
+	lw    a2, 4(t3)             // a2 = apps 区起始字节偏移（0x502001f4）
+	lh    a1, 8(t3)             // a1 = 用户程序数目（0x502001f8）
 
 	// 任务2：跳转到内核入口，启动 UCAS-OS
 	jal   kernel

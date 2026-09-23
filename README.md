@@ -24,9 +24,10 @@ make all
 **构建成功标志**（`make image` 末尾会打印布局核算）：
 
 ```
-[layout] kernel.img : 8 sectors = 1(boot) + 6(kernel) + 1(appinfo)
-[layout] apps.img   : 22 sectors = 22(apps)
-[layout] apps base (SD 扇区) : 8 (= kernel.img 总扇区 = 1+K+A)
+[layout] kernel.img :  4048 bytes = 512(boot) + 3088(kernel) + 448(appinfo)
+[layout] apps.img   : 10800 bytes = 10300(apps) + 500(尾部对齐)
+[layout] apps 区偏移  : 4048 (byte) —— 内核字节数 3088，二者【不补到扇区】
+[layout] total      : 14848 bytes = 29 sectors（末尾补 500 字节）
 ```
 
 ---
@@ -53,7 +54,7 @@ make run
         Please input a task name:
 
 ④ 依次输入（每个名字后按回车）：
-        list         ← 应用信息表（name / start / size / entry）
+        list         ← 应用信息表（name / offset / size / entry，offset 与 size 均为字节）
         auipc        ← [auipc] Info: testpc = 0x5201xxxx
         bss          ← [bss] Info: passed bss check!
         data         ← [data] Info: checking data --- [OK]!
@@ -99,8 +100,8 @@ make minicom                        # sudo minicom -D /dev/ttyUSB1
 | app 共享栈顶 | `0x50400000` |
 | BIOS 跳转表 | `0x51ffff00` |
 | app 窗口 | `0x52000000 + i*0x10000` |
-| 镜像信息字段 | `0x1f8`=app 数、`0x1fc`=内核扇区数、`0x1fe`=`55 aa` |
-| AppInfo 区 | kernel.img 扇区 `1+K`（`start_sector` 为 apps.img 内相对扇区号） |
+| 镜像信息字段 | `0x1f0`=AppInfo 字节偏移、`0x1f4`=apps 区字节偏移、`0x1f8`=app 数、`0x1fc`=内核扇区数、`0x1fe`=`55 aa` |
+| 镜像内部布局 | **字节级紧密**（不补扇区）：bootblock 512B → 内核 → AppInfo(448B) → apps 首尾相接；仅 bootblock 补到 512（`0x1fc/0x1fe` 字段占位所需） |
 
 ## 附二：文档索引
 

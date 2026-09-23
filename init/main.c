@@ -11,12 +11,12 @@
 int version = 2; // version must between 0 and 9
 char buf[VERSION_BUF];
 
-// bootblock 经 head.S 传来的引导参数（Task 4/5）：
-//   a0 = AppInfo 区起始扇区号，a1 = 用户程序数目，a2 = apps 区基址
+// bootblock 经 head.S 传来的引导参数（任务5 起为【字节】语义）：
+//   a0 = AppInfo 起始字节偏移，a1 = 用户程序数目，a2 = apps 区起始字节偏移
 //   定义见 task.h；赋值在 head.S 清完 BSS 后完成
-uint64_t boot_appinfo_sector;
+uint64_t boot_appinfo_off;
 uint64_t boot_appnum;
-uint64_t boot_apps_base;
+uint64_t boot_apps_base_off;
 
 // Task info array
 task_info_t tasks[TASK_MAXNUM];
@@ -48,13 +48,18 @@ static void init_jmptab(void)
 
 static void init_task_info(void)
 {
-    // 任务4：从 AppInfo 区读出 task_info_t 数组，填进 tasks[]。
-    //   位置与数量来自 bootblock 传参（head.S 已存进 boot_appinfo_sector /
+    // 任务5：从 AppInfo 区读出 task_info_t 数组，填进 tasks[]。
+    //   位置与数量来自 bootblock 传参（head.S 已存进 boot_appinfo_off /
     //   boot_appnum），不再直接读 0x50200xxx。
-    //   AppInfo 必须先读到本地 512B 对齐缓冲中转，再拷 task_num*sizeof 字节
-    //   进 tasks[]，不能整扇区直读 tasks[]（会越界覆写 tasks 后面的 .bss）。
-    // NOTE: [p1-task3] 的 taskid 读取已废弃，改按名字加载（见 main 循环）。
-    static uint8_t appinfo_buf[SECTOR_SIZE]
+    //
+    //   ★ 与任务4 的关键差别：AppInfo 在镜像里**不再按扇区对齐**（字节级紧密
+    //   排列），而块设备只能整扇区读、没有偏移参数。所以必须：
+    //     ① 算出 AppInfo 落在哪个扇区、扇区内偏移多少；
+    //     ② 把"覆盖它的若干个整扇区"读进中转缓冲；
+    //     ③ 从缓冲的 offset 处起，拷 APPINFO_BYTES 字节进 tasks[]。
+    //   中转缓冲需 2 个扇区：offset ≤ 511，APPINFO_BYTES = 448，
+    //   故 offset + 448 ≤ 959 < 1024。
+    static uint8_t appinfo_buf[2 * SECTOR_SIZE]
         __attribute__((aligned(SECTOR_SIZE)));
 
     task_num = (int)boot_appnum;
@@ -64,14 +69,24 @@ static void init_task_info(void)
         return;
     }
 
-    // 读出 AppInfo 区（固定 APPINFO_SECTORS = 1 个扇区）
-    if (bios_sd_read((unsigned)(unsigned long)appinfo_buf, APPINFO_SECTORS,
-                     (unsigned)boot_appinfo_sector) != 0) {
+    uint32_t start  = (uint32_t)boot_appinfo_off;
+    uint32_t sector = start / SECTOR_SIZE;              // 从哪块开始读
+    uint32_t offset = start % SECTOR_SIZE;              // 块内偏移多少
+    uint32_t need   = NBYTES2SEC(offset + APPINFO_BYTES);   // 要读几块
+
+    if (need > sizeof(appinfo_buf) / SECTOR_SIZE) {     // 防御（不会发生）
         task_num = 0;
         return;
     }
 
-    memcpy((void *)tasks, (const void *)appinfo_buf,
+    if (bios_sd_read((unsigned)(unsigned long)appinfo_buf, need,
+                     sector) != 0) {
+        task_num = 0;
+        return;
+    }
+
+    // 只拷"有内容的那几行"（task_num × 28 字节），从缓冲的 offset 处起
+    memcpy((void *)tasks, (const void *)(appinfo_buf + offset),
            (size_t)task_num * sizeof(task_info_t));
 }
 
@@ -116,7 +131,8 @@ static void put_hex(unsigned int val)
 // 任务5：显示应用信息（slide 25 可选项；name / start(相对扇区) / size / entry）
 static void show_task_list(void)
 {
-    bios_putstr("name              start size   entry\r\n");
+    // 任务5：offset / size 均为【字节】语义（镜像内部按字节紧密排列）
+    bios_putstr("name              offset size   entry\r\n");
     for (int i = 0; i < task_num; ++i)
     {
         int pad = TASK_NAME_LEN - strlen(tasks[i].name);
@@ -124,9 +140,9 @@ static void show_task_list(void)
         bios_putstr(tasks[i].name);
         while (pad-- > 0)
             bios_putchar(' ');
-        put_uint(tasks[i].start_sector);
+        put_uint(tasks[i].start_byte);
         bios_putstr("    ");
-        put_uint(tasks[i].sector_num);
+        put_uint(tasks[i].byte_size);
         bios_putstr("    ");
         put_hex(tasks[i].vaddr_entry);
         bios_putstr("\r\n");

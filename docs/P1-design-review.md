@@ -91,22 +91,30 @@ a7 = 功能号；a0/a1/a2… = 参数；跳转 0x50150000
 ## ③ 内核加载启动应用的完整链路
 
 ```
-bootblock.lh(0x502001fc)=K
-   │  a0=1+K(AppInfo)  a1=lh(0x502001f8)=app数  a2=1+K+A(apps基址)
+bootblock.lh(0x502001fc)=K（内核扇区数，官方约定不变）
+   │  a0=lw(0x502001f0)=AppInfo 字节偏移
+   │  a1=lh(0x502001f8)=app 数
+   │  a2=lw(0x502001f4)=apps 区字节偏移
    ▼ jal kernel
-head.S: 清 BSS(sd) → sd a0→boot_appinfo_sector / a1→boot_appnum / a2→boot_apps_base
+head.S: 清 BSS(sd) → sd a0→boot_appinfo_off / a1→boot_appnum / a2→boot_apps_base_off
    │    → li sp,0x50500000 → jal main
    ▼
 main:  bss_check → init_jmptab → init_task_info()
-   │    init_task_info: bios_sd_read(512B 对齐缓冲 appinfo_buf, A, 1+K)  [A=自算=1]
-   │                     memcpy(tasks, buf, task_num*28)
+   │    init_task_info（★字节级布局 → 需中转）:
+   │      start = boot_appinfo_off; sector = start/512; offset = start%512
+   │      need  = NBYTES2SEC(offset + 448)             ← 最多 2 块
+   │      bios_sd_read(appinfo_buf[1024B], need, sector)
+   │      memcpy(tasks, appinfo_buf + offset, task_num*28)
    │    打印 "Available tasks: ..." → 主循环：
    ▼
 "auipc\n" → readline()（限长15 / \r\n 双终止 / 退格）
-   │    strcmp(name,"list") → show_task_list()
+   │    strcmp(name,"list") → show_task_list()（列 offset/size 均为字节）
    │    load_task_img(name)：
    │      for i: tasks[i].name 匹配
-   │      bios_sd_read(vaddr_entry, sector_num, boot_apps_base + start_sector(rel))
+   │      abs = boot_apps_base_off + tasks[i].start_byte
+   │      sector = abs/512; offset = abs%512; need = NBYTES2SEC(offset+byte_size)
+   │      bios_sd_read(load_staging[8KB], need, sector)   ← ★中转缓冲
+   │      memcpy((u8*)vaddr_entry, load_staging+offset, byte_size)
    │        └ 只读目标 app（要点 4）
    ▼
 return entry → 显式跳转：
@@ -122,6 +130,10 @@ crt0._start:
    恢复 sp/ra → jr ra                  ← 回到 main 循环回边，提示再现
 ```
 
+> **★ 为什么要"中转"**：镜像内部按**字节**紧密排列（Task 5 修订），AppInfo 与各 app
+> 都可能不在扇区边界上；而块设备只能整扇区读、**没有偏移参数**——
+> 直接整块读会让内容整体错位。所以凡是"不对齐的读取"都走"读整块到缓冲 → 按 offset 拷贝"。
+
 **关键保证**：
 - crt0 全程只用 `ra/sp/t0..t3`，**不碰 s0-s11**（内核 main 的 s 寄存器跨 app 存活，
   -O2 把 task_num/提示串地址 hoist 到 s 寄存器）；
@@ -135,14 +147,21 @@ crt0._start:
 ### 双镜像（Task 5，§4.6"分别做成两个镜像文件"）
 
 ```
-kernel.img = bootblock(1) + 内核(K) + AppInfo(A=1)      = (1+K+A)×512 字节
-apps.img   = 各 app 按实际大小紧凑排列                    = Σ(app_sec)×512 字节
+kernel.img = bootblock(512B，唯一强制补零) + 内核(KB 字节) + AppInfo(448B)
+           = 512 + KB + 448 字节（内部**不补到扇区**）
+apps.img   = 各 app 首尾相接（字节级），末尾补 0 仅为整张 image 落在整扇区
 build/image = kernel.img ∥ apps.img   （Makefile cat 拼接，createimage 不直接写 image）
 ```
 
+- **字节级紧贴的铁证**：`auipc.start_byte == 2048.start_byte + 2048.byte_size`
+  （实测 `4752 == 0 + 4752`；`bss` 5396 = 4752+644；`data` 5764 = 5396+368）——
+  验证脚本已把它做成断言。
+- **为什么 bootblock 仍补到 512**：`0x1fc`（内核扇区数）与 `0x1fe`（签名）两个字段
+  就住在第 0 扇区**最后 4 字节**；内核若从字节 130 起，会被这两个字段写坏。
+  加上 u-boot 按块读第 0 扇区并跳 `0x50200000`——bootblock 独占第 0 扇区是硬性约束。
 - **cat 拼接等价性论证**：image 物理上是连续字节流，BIOS 按扇区号寻址、无文件边界；
   QEMU 侧单 `-drive`（`bios_sd_read` 硬编码 device 0，见声明偏差），故单卡内两分区；
-  板卡上即"两文件写入 SD 卡连续扇区"，offset = `1+K+A`。
+  板卡上即"两文件写入 SD 卡连续扇区"，apps 区起点 = `kernel.img 总字节数`。
 - **floppy**：方案 A（单 dd 写 image，默认）；方案 B（双 dd，kernel.img + apps.img @
   `offset=(1+K+A)*512`，计算式在 Makefile floppy 注释，上板切换用）。
 
@@ -150,15 +169,19 @@ build/image = kernel.img ∥ apps.img   （Makefile cat 拼接，createimage 不
 
 | 偏移 | 内容 | 读取方 |
 |---|---|---|
+| `0x1f0` | **AppInfo 起始字节偏移**（4B LE） | bootblock `lw` → a0 |
+| `0x1f4` | **apps 区起始字节偏移**（4B LE，= kernel.img 总字节数） | bootblock `lw` → a2 |
 | `0x1f8` | app 数目（2B LE） | bootblock `lh` → a1 |
 | `0x1fc` | 内核扇区数 K（2B LE，**实际 p_filesz 口径**） | bootblock `lh` → 读内核循环 |
 | `0x1fe` | 官方签名 `55 aa` | — |
 
-### AppInfo（kernel.img 扇区 K+1，A=1）
+（`0x1f0~0x1f7` 原本空闲，本次修订用来放两个"字节偏移"字段，bootblock 三条指令一次读完。）
 
-`task_info_t{name[16], start_sector, sector_num, vaddr_entry}`（28B），16 槽，未用槽清零。
-**`start_sector` = apps.img 内相对扇区号**（要点 3"用户镜像文件中……的地址"背书）：
-两文件解耦，加载时 `base + rel`。
+### AppInfo（kernel.img 内，紧贴内核末尾，448 字节）
+
+`task_info_t{name[16], start_byte, byte_size, vaddr_entry}`（28B），16 槽，未用槽清零。
+**`start_byte` / `byte_size` 均为【字节】语义**（要点 3"用户镜像文件中……的地址"背书）：
+两文件解耦，加载时 `apps_base_off + start_byte`。
 
 ### 内存映射总表
 
@@ -166,7 +189,7 @@ build/image = kernel.img ∥ apps.img   （Makefile cat 拼接，createimage 不
 |---|---|
 | `0x50000000 – 0x501fffff` | U-Boot(BIOS)；`0x50150000` BIOS 入口（ecall+ret） |
 | `0x50200000` | bootblock 加载地址（镜像第 0 扇区） |
-| `0x502001f8 / 0x502001fc / 0x502001fe` | 信息字段（bootblock 扇区尾部） |
+| `0x502001f0 / 0x502001f4 / 0x502001f8 / 0x502001fc / 0x502001fe` | 信息字段（bootblock 扇区尾部，均为字节语义） |
 | `0x50201000` | 内核入口（head.S `_start`） |
 | `0x50400000` | **app 共享栈顶**（向下生长，内核栈独享 0x50400000–0x50500000） |
 | `0x50500000` | **内核栈顶**（KERNEL_STACK，向下生长，官方指定） |
@@ -182,8 +205,9 @@ build/image = kernel.img ∥ apps.img   （Makefile cat 拼接，createimage 不
 | app 共享栈 `0x50400000` | 任务书建议"每 app 64KB 窗口顶部"，我们改为**全部 app 共享一个栈** | ①内核栈独享 0x50400000–0x50500000，两个向下生长的栈不交叠；②app 串行执行不并发；③任务书允许"可调整但需说明"。早期提案 0x504fffff 被否（与内核栈差 1 字节必撞） |
 | `list` 命令名 | 保留名（验收方确认） | 信息显示命令（slide 25 可选项） |
 | `sd_read` 死约束 | `bios/common.c` 不可改 + U-Boot 硬编码 device 0 → **不能挂第二块盘** | QEMU 上双镜像落地为**单 SD 卡镜像内两分区**（cat 拼接等价）；任务书明言"模拟文件系统的分区管理" |
-| "只读 kernel.img"验证方式与局限 | **代码路径审查级 + 日志证据**：bootblock 唯一 1 处 sd_read（内核加载循环，范围 1..K）；内核启动只多读 AppInfo 扇区 1+K；loader 只在按名匹配后读 `base+rel` | QEMU 无法隔离出判别读 I/O 区域的日志，故按"代码审查 + 行为日志"两层论证，请以验收方要求为准 |
-| A=1 的假设 | bootblock 硬编码 `addi a2, t0, 1`；AppInfo 固定 1 扇区 | `_Static_assert(sizeof*TASK_MAXNUM ≤ SECTOR_SIZE)` 编译期护栏；TASK_MAXNUM 增大时编译器立即报错 |
+| "只读 kernel.img"验证方式与局限 | **代码路径审查级 + 日志证据**：bootblock 唯一 1 处 sd_read（内核加载循环，范围 1..K）；内核启动只多读 AppInfo（≤2 块）；loader 只在按名匹配后读目标 app | QEMU 无法隔离出判别读 I/O 区域的日志，故按"代码审查 + 行为日志"两层论证，请以验收方要求为准 |
+| AppInfo 固定 448 字节（读它最多 2 块） | 内核中转缓冲固定 2 扇区 = 1024B，依赖 `offset(≤511) + 448 ≤ 1023` | `_Static_assert(APPINFO_BYTES == 448)` 编译期护栏；改动结构体或 TASK_MAXNUM 时编译器立即报错 |
+| app 中转缓冲定长 8KB | `loader.c` 的 `load_staging[8192]`；`need*512 > 8192` 时**拒绝加载**（返回 0）而非越界 | 由 `#define LOAD_STAGING_BYTES` 单点控制；app 超过 ~7.6KB 时需调大或改分块搬运 |
 
 ---
 
@@ -218,23 +242,24 @@ $ make image
 
 ```
 cd ./build && ./createimage --extended bootblock main 2048 auipc bss data
-0x50200000: bootblock sec  0 ..  0  (130 bytes, 1 sector)
-0x50201000: main     sec  1 ..  6  (3032 bytes, 6 sectors)
--APPINFO--- appinfo  sec  7 ..  7  (448 bytes, 1 sectors)
-0x52000000: 2048     relsec  0 ..  9  (4752 bytes, 10 sectors)
-0x52010000: auipc    relsec 10 .. 11  (644 bytes, 2 sectors)
-0x52020000: bss     relsec 12 .. 12  (368 bytes, 1 sectors)
-0x52030000: data    relsec 13 .. 21  (4536 bytes, 9 sectors)
-[layout] kernel.img : 8 sectors = 1(boot) + 6(kernel) + 1(appinfo)
-[layout] apps.img   : 22 sectors = 22(apps)
-[layout] apps base (SD 扇区) : 8 (= kernel.img 总扇区 = 1+K+A)
-[layout] app#1 相对扇区 : 0（apps.img 内，无固定空泡）
+0x50200000: bootblock byte     0 ..   511  (132 bytes → 补到 512)
+0x50201000: main     byte   512 ..  3599  (3088 bytes, 7 sectors)
+-APPINFO--- appinfo  byte  3600 ..  4047  (448 bytes)
+0x52000000: 2048     byte     0 ..  4751  (4752 bytes)
+0x52010000: auipc    byte  4752 ..  5395  (644 bytes)
+0x52020000: bss      byte  5396 ..  5763  (368 bytes)
+0x52030000: data     byte  5764 .. 10299  (4536 bytes)
+[layout] kernel.img :  4048 bytes = 512(boot) + 3088(kernel) + 448(appinfo)
+[layout] apps.img   : 10800 bytes = 10300(apps) + 500(尾部对齐)
+[img info] appinfo offset : 3600 @ 0x1f0
+[img info] apps offset    : 4048 @ 0x1f4
+[img info] kernel sectors : 7 @ 0x1fc
 cd ./build && cat kernel.img apps.img > image
 ```
 
-**这一步验证了什么**：双镜像制品形态（kernel.img=8 扇区=1+6+1、apps.img=22=Σapp）、
-AppInfo 相对扇区（2048 rel=0、auipc rel=10…）、apps 基址=8=1+K+A、cat 拼接等价。
-制品断言（扇区整、`image==kernel+apps`）由 `.scratch/verify.sh` 自动核验。
+**这一步验证了什么**：双镜像制品形态（kernel.img=4048B、apps.img=10800B、image=14848B=29 扇区）、
+**镜像内部按字节紧密排列**（`auipc` 从 4752 开始 = `2048` 的起点 0 + 字节数 4752），
+cat 拼接等价。制品断言由 `.scratch/verify.sh` 自动核验（含"字节级紧贴"那条铁证）。
 
 ### 步骤 1：启动（make run）
 
@@ -257,7 +282,7 @@ Available tasks: 2048, auipc, bss, data
 ```
 
 **这一步验证了什么**：U-Boot 预读前 2 扇区 → `loadboot` 跳 0x50200000 → bootblock 打印
-标志串 → 读内核（0x1fc=lh 得 6 扇区）→ head.S 清 BSS（`bss check: t` 过）→ main 出
+标志串 → 读内核（0x1fc=lh 得 7 扇区）→ head.S 清 BSS（`bss check: t` 过）→ main 出
 欢迎信息与任务名列表。
 
 ### 步骤 2：查看应用信息（list）
@@ -266,12 +291,15 @@ Available tasks: 2048, auipc, bss, data
 
 ```
 Please input a task name: list
-name              start size   entry
-2048            0    10    0x52000000
-auipc           10    2    0x52010000
-bss             12    1    0x52020000
-data            13    9    0x52030000
+name              offset size   entry
+2048            0    4752    0x52000000
+auipc           4752    644    0x52010000
+bss             5396    368    0x52020000
+data            5764    4536    0x52030000
 ```
+
+（`offset`/`size` 均为**字节**。四行横向看即知"字节级紧贴"：
+`0 + 4752 = 4752`、`4752 + 644 = 5396`、`5396 + 368 = 5764`。）
 
 **这一步验证了什么**：slide 25 可选项"显示应用信息"命令成立；`start` 为 apps.img
 相对扇区，`entry` 为各 app 的 Elf 入口（=窗口基址）。
@@ -343,12 +371,14 @@ nope         # 未知名
    slide 25 "only the kernel image is loaded"。这是矛盾法推出的**必然性**，不是自由选择
    （依据：`kernel/loader/loader.c`→`init/main.c:init_task_info`；布局论证见
    `log/task5-设计提案.md` §2.2）。
-3. **Q：AppInfo 的 start_sector 为什么用 apps.img 内相对扇区号，而不是 SD 绝对扇区？**
+3. **Q：AppInfo 的 `start_byte` 为什么用 apps.img 内的相对字节偏移，而不是 SD 绝对位置？**
    A：要点 3 原文"标识**用户镜像文件中**各个用户程序的地址"就是相对语义的原文背书；
-   只有相对扇区才能让两文件真正解耦——AppInfo 与 kernel.img 的长度 K、拼接顺序无关，
-   加载时 `bios_sd_read(base + rel)` 的 base 只有一处取值。若存绝对扇区，K 一变全部
-   槽位错（依据：`tools/createimage.c` 填充 `start_sector=app_rel_sec[i]`；
-   `kernel/loader/loader.c` 用 `boot_apps_base + tasks[i].start_sector`）。
+   只有相对位置才能让两文件真正解耦——AppInfo 与 kernel.img 的长度 K、拼接顺序无关，
+   加载时 `apps_base_off + start_byte` 的 base 只有一处取值。若存绝对位置，K 一变全部
+   槽位错（依据：`tools/createimage.c` 填充 `start_byte=app_rel_byte[i]`；
+   `kernel/loader/loader.c` 用 `boot_apps_base_off + tasks[i].start_byte`）。
+   任务5 修订后该字段由"相对扇区号"进一步变为"**相对字节偏移**"，
+   以配合镜像内部按字节紧密排列（读取时经中转缓冲按 offset 精确定位）。
 4. **Q：为什么不能挂第二块盘？"单卡两分区"的等价性怎么讲？**
    A：`arch/riscv/bios/common.c` 属于不可改清单，其中 `sd_read` 经 U-Boot
    `blk_read_devnum(if_type_virtio, 0, …)` **硬编码 device 0**——QEMU 第二块 `-drive`
