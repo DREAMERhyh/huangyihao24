@@ -59,6 +59,13 @@ typedef list_node_t list_head;
 #define list_entry(ptr, type, member) \
     ((type *)((char *)(ptr) - offset_of(type, member)))
 
+/* 把一个裸结点初始化为"自环"的空表头（等价于 LIST_HEAD 的赋值版） */
+static inline void list_init(list_node_t *node)
+{
+    node->next = node;
+    node->prev = node;
+}
+
 /* 把 node 插到 head 之后（头插） */
 static inline void list_add(list_node_t *node, list_head *head)
 {

@@ -1,6 +1,7 @@
 #include <os/list.h>
 #include <os/lock.h>
 #include <os/sched.h>
+#include <os/irq.h>
 #include <os/time.h>
 #include <os/mm.h>
 #include <screen.h>
@@ -65,9 +66,27 @@ void do_sleep(uint32_t sleep_time)
 void do_block(list_node_t *pcb_node, list_head *queue)
 {
     // TODO: [p2-task2] block the pcb task into the block queue
+    pcb_t *task = list_entry(pcb_node, pcb_t, list);
+
+    task->status = TASK_BLOCKED;
+    list_add_tail(pcb_node, queue);
+
+    // ★ 入队已经完成，这里必须**立刻**恢复抢占再让出 CPU：
+    //   调用方（如 do_mutex_lock_acquire）为了把"判断锁状态"和"挂进阻塞队列"
+    //   做成原子操作而临时关了抢占；而 switch_to 只换 GPR，不换 CSR，
+    //   sie 的状态会一路带到下一个任务身上。若在这里不恢复，别的任务就会
+    //   在没有时钟中断的情况下一直跑下去（任务4 的抢占测试会直接卡死）。
+    enable_preempt();
+
+    do_scheduler();
 }
 
 void do_unblock(list_node_t *pcb_node)
 {
     // TODO: [p2-task2] unblock the `pcb` from the block queue
+    pcb_t *task = list_entry(pcb_node, pcb_t, list);
+
+    list_del(pcb_node);
+    task->status = TASK_READY;
+    list_add_tail(pcb_node, &ready_queue);
 }
