@@ -11,6 +11,11 @@ ENTRY(setup_exception)
   csrw CSR_STVEC, t0
 
   /* TODO: [p2-task4] enable interrupts globally */
+  /* 任务4：打开 sstatus.SIE（全局中断使能）。单开 sie 的 STIE 位还不够——
+   *   sie 只是"允许哪类中断"，sstatus.SIE 才是"允不允许被打断"。
+   *   打开后，时钟中断才能在用户态/内核空转时打断进来。 */
+  li   t0, SR_SIE
+  csrs CSR_SSTATUS, t0
 
   /* ENTRY/ENDPROC 只打符号表，不生成返回指令——漏了这句会直接"跌进"
    * 下一个函数继续执行（本次调试踩过：跌进 list_add_tail 报 Store/AMO fault） */

@@ -2,9 +2,33 @@
 #include <os/sched.h>
 #include <os/list.h>
 #include <os/irq.h>
+#include <csr.h>
 #include <atomic.h>
 
 mutex_lock_t mlocks[LOCK_NUM];
+
+/* 临界区用的"是否被打断"开关。
+ *   不能用 disable_interrupt()/enable_interrupt() 直接配一对：后者会把
+ *   sstatus.SIE 无条件置 1。内核里绝大多数临界区都跑在陷阱处理中，那时
+ *   SIE 本该是 0（陷入时硬件清掉的）；一旦被置 1，内核就可能被再次打断，
+ *   而 sscratch 此刻存的是用户 sp，嵌套陷入会把陷阱帧写到用户栈上。
+ *   所以这里"存原值-关-按原值恢复"。 */
+static inline uint64_t irq_save(void)
+{
+    uint64_t sstatus;
+
+    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
+    disable_interrupt();
+    return sstatus;
+}
+
+static inline void irq_restore(uint64_t sstatus)
+{
+    if (sstatus & SR_SIE)
+        enable_interrupt();
+    else
+        disable_interrupt();
+}
 
 /* 空闲槽位的标记：mlocks[i].key == KEY_UNUSED 表示这把锁还没被任何 key 占用。
  * 用户程序用到的 key 必须是别的值（测试用的是 42）。 */
@@ -83,8 +107,7 @@ void do_mutex_lock_acquire(int mlock_idx)
      *   所以掩码只作用于这一小段，不会泄漏给别的任务或用户态。 */
     while (1) {
         int acquired;
-
-        disable_interrupt();
+        uint64_t sstatus = irq_save();
 
         list_add_tail(&current_running->list, &lock->block_queue);
         acquired = spin_lock_try_acquire(&lock->lock);
@@ -92,7 +115,7 @@ void do_mutex_lock_acquire(int mlock_idx)
             list_del(&current_running->list);   // 抢到了，从等待队列里摘出来
         current_running->status = acquired ? TASK_RUNNING : TASK_BLOCKED;
 
-        enable_interrupt();
+        irq_restore(sstatus);
 
         if (acquired)
             return;
@@ -110,7 +133,7 @@ void do_mutex_lock_release(int mlock_idx)
 
     /* "置空"和"唤醒队首"必须是一个原子动作：中间被抢占的话，等待者在
      * 锁已空的情况下却收不到唤醒，就会一直睡下去。 */
-    disable_interrupt();
+    uint64_t sstatus = irq_save();
 
     spin_lock_release(&lock->lock);
 
@@ -118,5 +141,5 @@ void do_mutex_lock_release(int mlock_idx)
     if (!list_empty(&lock->block_queue))
         do_unblock(lock->block_queue.next);
 
-    enable_interrupt();
+    irq_restore(sstatus);
 }

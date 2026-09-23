@@ -413,17 +413,29 @@ int main(void)
     // TODO: [p2-task4] Setup timer interrupt and enable all interrupt globally
     // NOTE: The function of sstatus.sie is different from sie's
 
+    // ① 先给时钟装上第一次触发时间；之后每来一次中断，handle_irq_timer
+    //    都会把下一次推后 TIMER_INTERVAL，所以只需要在这里武装一次。
+    bios_set_timer(get_ticks() + TIMER_INTERVAL);
 
+    // ② 内核自己也要能被中断打断（抢占模式下的"第一次调度"正是由这次时钟
+    //    中断发起的：内核空转时被时钟打断 → handle_irq_timer → do_scheduler
+    //    → 第一个任务被调度上场）。但陷阱入口要靠 sscratch 找内核栈顶，所以
+    //    先给它一页专用的陷阱栈——直接借用 main 现在用的内核栈会和 main 的
+    //    栈帧重叠。
+    asm volatile("csrw sscratch, %0" : : "r"(allocKernelPage(1) + PAGE_SIZE));
+
+    // ② 再打开 sie 的 STIE 位（允许时钟中断）。此时 sstatus.SIE 已经是 1
+    //    （内核态由 setup_exception 打开，用户态由 sret 按陷阱帧的 SPIE 恢复），
+    //    所以中断立刻就会来——抢占模式下的"第一次调度"就由这次时钟中断发起。
+    enable_preempt();
 
     // Infinite while loop, where CPU stays in a low-power state (QAQQQQQQQQQQQ)
     while (1)
     {
-        // If you do non-preemptive scheduling, it's used to surrender control
-        do_scheduler();
-
-        // If you do preemptive scheduling, they're used to enable CSR_SIE and wfi
-        // enable_preempt();
-        // asm volatile("wfi");
+        // 抢占模式下不再需要主动让出 CPU：时钟中断自己会触发 do_scheduler。
+        // 这里是内核（pid0）的空转：wfi 睡到下一次中断，醒来后继续参与调度。
+        // 注意不能用 do_scheduler() 空转——那会让 pid0 白占一个时间片。
+        asm volatile("wfi");
     }
 
     return 0;

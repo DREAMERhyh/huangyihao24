@@ -30,6 +30,15 @@ void handle_irq_timer(regs_context_t *regs, uint64_t stval, uint64_t scause)
 {
     // TODO: [p2-task4] clock interrupt handler.
     // Note: use bios_set_timer to reset the timer and remember to reschedule
+
+    /* 任务4：① 重新定时——RISC-V 的时钟中断不是自动重装的（Sstc 下要把
+     *   stimecmp 推到下一次触发点），不重设就只会来一次；
+     *   ② 借此实现时间片轮转：每次时钟中断都调度一次，抢走当前任务
+     *   对 CPU 的占用。被抢下的任务现场已由 exception_handler_entry 存好，
+     *   下次调度到它时会从 ret_from_exception 原样恢复、sret 回用户态。 */
+    bios_set_timer(get_ticks() + TIMER_INTERVAL);
+
+    do_scheduler();
 }
 
 void init_exception()
@@ -44,6 +53,11 @@ void init_exception()
 
     /* TODO: [p2-task4] initialize irq_table */
     /* NOTE: handle_int, handle_other, etc.*/
+    /* 中断表同理：默认 handle_other（便于抓没实现的中断），
+     *   只给 S 态时钟中断挂上真正的处理函数。 */
+    for (int i = 0; i < IRQC_COUNT; ++i)
+        irq_table[i] = handle_other;
+    irq_table[IRQC_S_TIMER] = handle_irq_timer;
 
     /* TODO: [p2-task3] set up the entrypoint of exceptions */
     setup_exception();
