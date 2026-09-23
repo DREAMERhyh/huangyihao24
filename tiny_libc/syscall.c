@@ -14,27 +14,34 @@ static long invoke_syscall(long sysno, long arg0, long arg1, long arg2,
     return 0;
 }
 
+/* 任务1：这几个 API 暂时不是"真系统调用"，而是走内核挂好的跳转表：
+ *   用户程序与内核此刻还跑在同一特权级，call_jmptab 直接调到内核函数上。
+ *   任务3 实现 ecall 之后，这里会换成 invoke_syscall。 */
 void sys_yield(void)
 {
     /* TODO: [p2-task1] call call_jmptab to implement sys_yield */
+    call_jmptab(YIELD, IGNORE, IGNORE, IGNORE, IGNORE, IGNORE);
     /* TODO: [p2-task3] call invoke_syscall to implement sys_yield */
 }
 
 void sys_move_cursor(int x, int y)
 {
     /* TODO: [p2-task1] call call_jmptab to implement sys_move_cursor */
+    call_jmptab(MOVE_CURSOR, (long)x, (long)y, IGNORE, IGNORE, IGNORE);
     /* TODO: [p2-task3] call invoke_syscall to implement sys_move_cursor */
 }
 
 void sys_write(char *buff)
 {
     /* TODO: [p2-task1] call call_jmptab to implement sys_write */
+    call_jmptab(PRINT, (long)buff, IGNORE, IGNORE, IGNORE, IGNORE);
     /* TODO: [p2-task3] call invoke_syscall to implement sys_write */
 }
 
 void sys_reflush(void)
 {
     /* TODO: [p2-task1] call call_jmptab to implement sys_reflush */
+    call_jmptab(SCREEN_REFLUSH, IGNORE, IGNORE, IGNORE, IGNORE, IGNORE);
     /* TODO: [p2-task3] call invoke_syscall to implement sys_reflush */
 }
 

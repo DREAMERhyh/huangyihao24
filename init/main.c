@@ -50,6 +50,7 @@ static void init_jmptab(void)
     jmptab[MUTEX_INIT]      = (long (*)())do_mutex_lock_init;
     jmptab[MUTEX_ACQ]       = (long (*)())do_mutex_lock_acquire;
     jmptab[MUTEX_RELEASE]   = (long (*)())do_mutex_lock_release;
+    jmptab[SCREEN_REFLUSH]  = (long (*)())screen_reflush;
 
     // TODO: [p2-task1] (S-core) initialize system call table.
 
@@ -290,10 +291,24 @@ static void init_pcb_stack(
     /* TODO: [p2-task1] set sp to simulate just returning from switch_to
      * NOTE: you should prepare a stack, and push some values to
      * simulate a callee-saved context.
-     */
+     *
+     * 任务1：新任务没有已保存的现场，所以要手工伪造一个"刚从 switch_to 里
+     *   恢复"的 switchto_context_t，按 sched.h 里 regs[14] 的顺序摆：
+     *     regs[0]=ra  —— switch_to 末尾的 jr ra 会跳到这里，即程序入口
+     *     regs[1]=sp  —— 该任务**自己的**用户栈顶（每任务一块，互不重叠）
+     *     regs[2..13]=s0~s11 —— 新任务没有需要恢复的 callee-saved 变量，清零
+     *   这块现场压在将来要给陷阱帧用的 regs_context_t 下面，任务3 再接上。 */
     switchto_context_t *pt_switchto =
         (switchto_context_t *)((ptr_t)pt_regs - sizeof(switchto_context_t));
 
+    pt_switchto->regs[0] = (reg_t)entry_point;   /* ra */
+    pt_switchto->regs[1] = (reg_t)user_stack;    /* sp */
+    for (int i = 2; i < 14; ++i)
+        pt_switchto->regs[i] = 0;                /* s0 ~ s11 */
+
+    /* PCB 记住"下次被调度时从哪恢复"以及任务自己的栈顶 */
+    pcb->kernel_sp = (reg_t)pt_switchto;
+    pcb->user_sp = (reg_t)user_stack;
 }
 
 static void init_pcb(void)
@@ -301,10 +316,38 @@ static void init_pcb(void)
     // 本次要跑哪些程序由这里的交互决定（名单见 running_tasks / running_task_num）
     select_tasks();
 
-    /* TODO: [p2-task1] load needed tasks and init their corresponding PCB */
+    for (int i = 0; i < running_task_num; ++i)
+    {
+        pcb_t *task = &pcb[i];
 
-    // 内核自己也得有个 PCB：调度、屏幕光标等都是经由 current_running 访问的
+        // TODO: [p2-task1] load needed tasks and init their corresponding PCB
+        //   内核栈与用户栈各分配一块 4K 页（地址段见任务书表 P2-1）：
+        //   内核栈给"内核态现场"用，用户栈给程序自己的 C 栈用，二者分开
+        ptr_t kernel_stack = allocKernelPage(1) + PAGE_SIZE;
+        ptr_t user_stack   = allocUserPage(1) + PAGE_SIZE;
+
+        // 按名字把 app 从镜像搬进它的加载窗口，返回值就是入口地址
+        uint64_t entry = load_task_img(running_tasks[i]->name);
+        assert(entry != 0);
+
+        task->pid = process_id++;
+        task->status = TASK_READY;
+        task->cursor_x = 0;
+        task->cursor_y = 0;
+        task->wakeup_time = 0;
+
+        init_pcb_stack(kernel_stack, user_stack, (ptr_t)entry, task);
+
+        // TODO: [p2-task1] remember to initialize 'current_running'
+        //   新任务一建好就排进就绪队列，等 do_scheduler 挑它上场
+        list_add_tail(&task->list, &ready_queue);
+    }
+
+    // 内核自己也得有个 PCB：调度、屏幕光标等都是经由 current_running 访问的。
+    //   pid0 是内核的空转任务，让它始终处于 RUNNING，于是它也会进就绪队列，
+    //   在所有用户任务都被阻塞时兜底（任务3 的睡眠唤醒就靠它一直转着）。
     current_running = &pid0_pcb;
+    pid0_pcb.status = TASK_RUNNING;
 }
 
 static void init_syscall(void)

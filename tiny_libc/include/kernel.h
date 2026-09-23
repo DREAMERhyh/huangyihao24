@@ -19,6 +19,7 @@ typedef enum {
     MUTEX_INIT,
     MUTEX_ACQ,
     MUTEX_RELEASE,
+    SCREEN_REFLUSH,     /* 任务1：与内核侧 include/os/kernel.h 的枚举**必须同序** */
     NUM_ENTRIES
 } jmptab_idx_t;
 

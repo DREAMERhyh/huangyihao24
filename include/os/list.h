@@ -50,6 +50,45 @@ typedef list_node_t list_head;
 // LIST_HEAD is used to define the head of a list.
 #define LIST_HEAD(name) struct list_node name = {&(name), &(name)}
 
-/* TODO: [p2-task1] implement your own list API */
+/* 任务1：内核自己的双向循环链表 API。
+ *   用"带哑头结点"的循环链表：head 的 next 是第一个元素、prev 是最后一个，
+ *   空表时 head.next == head.prev == head。这样插入/删除都不需要判空特例。 */
+#define offset_of(type, member) ((size_t) &((type *)0)->member)
+
+/* 由链表结点反查宿主结构体（PCB）的地址 */
+#define list_entry(ptr, type, member) \
+    ((type *)((char *)(ptr) - offset_of(type, member)))
+
+/* 把 node 插到 head 之后（头插） */
+static inline void list_add(list_node_t *node, list_head *head)
+{
+    node->next = head->next;
+    node->prev = head;
+    head->next->prev = node;
+    head->next = node;
+}
+
+/* 把 node 插到 head 之前（即链表尾部，尾插） */
+static inline void list_add_tail(list_node_t *node, list_head *head)
+{
+    node->next = head;
+    node->prev = head->prev;
+    head->prev->next = node;
+    head->prev = node;
+}
+
+/* 把 node 从它所在的链表里摘下来（摘完 node 仍指向原邻居，可安全重插） */
+static inline void list_del(list_node_t *node)
+{
+    node->prev->next = node->next;
+    node->next->prev = node->prev;
+    node->next = node;
+    node->prev = node;
+}
+
+static inline int list_empty(const list_head *head)
+{
+    return head->next == head;
+}
 
 #endif

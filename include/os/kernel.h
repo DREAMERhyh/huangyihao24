@@ -20,6 +20,7 @@ typedef enum {
     MUTEX_INIT,
     MUTEX_ACQ,
     MUTEX_RELEASE,
+    SCREEN_REFLUSH,     /* 任务1：题面给的跳转表没有刷屏项，补一个 */
     NUM_ENTRIES
 } jmptab_idx_t;
 

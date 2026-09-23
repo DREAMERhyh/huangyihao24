@@ -29,11 +29,28 @@ void do_scheduler(void)
     /* Do not touch this comment. Reserved for future projects. */
     /************************************************************/
 
-    // TODO: [p2-task1] Modify the current_running pointer.
+    /* 任务1：时间片轮转（RR）。
+     *   被换下场的任务如果还活着（RUNNING），就排到就绪队列尾部再等下一轮；
+     *   已经被阻塞/退出的任务由 do_block 等自己摘掉，这里不再放回。 */
+    pcb_t *prev = current_running;
 
+    if (prev->status == TASK_RUNNING) {
+        prev->status = TASK_READY;
+        list_add_tail(&prev->list, &ready_queue);
+    }
+
+    // 就绪队列空了（所有任务都在等锁/等时间）：只能继续跑当前这个（pid0 空转）
+    if (list_empty(&ready_queue))
+        return;
+
+    // TODO: [p2-task1] Modify the current_running pointer.
+    pcb_t *next = list_entry(ready_queue.next, pcb_t, list);
+    list_del(&next->list);
+    next->status = TASK_RUNNING;
+    current_running = next;
 
     // TODO: [p2-task1] switch_to current_running
-
+    switch_to(prev, next);
 }
 
 void do_sleep(uint32_t sleep_time)
