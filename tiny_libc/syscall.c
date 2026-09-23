@@ -91,6 +91,8 @@ void sys_sleep(uint32_t time)
 void sys_set_sche_workload(int workload)
 {
     /* TODO: [p2-task5] call invoke_syscall to implement sys_set_sche_workload */
+    invoke_syscall(SYSCALL_SET_WORKLOAD, (long)workload, IGNORE, IGNORE, IGNORE,
+                   IGNORE);
 }
 
 /************************************************************/

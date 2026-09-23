@@ -100,8 +100,18 @@ SRC_LIBC    = $(wildcard ./tiny_libc/*.c)
 OBJ_LIBC    = $(patsubst %.c, %.o, $(foreach file, $(SRC_LIBC), $(DIR_BUILD)/$(notdir $(file))))
 LIB_TINYC   = $(DIR_BUILD)/libtinyc.a
 
-SRC_USER    = $(wildcard $(DIR_TEST_PROJ)/*.c)
+SRC_USER    = $(sort $(wildcard $(DIR_TEST_PROJ)/*.c))
 ELF_USER    = $(patsubst %.c, %, $(foreach file, $(SRC_USER), $(DIR_BUILD)/$(notdir $(file))))
+
+# -----------------------------------------------------------------------
+# 每个 app 的加载窗口 = USER_ENTRYPOINT + (它在排序后列表中的序号) * 0x10000
+#   ★ 必须**按名字**算，绝不能按"本次构建顺序"逐次累加：增量编译时只有改动过
+#   的 app 会重新链接，累加的话它会拿到已经被别的 app 占用的窗口；两个 app 撞进
+#   同一块地址后，后加载的把先加载的覆盖掉，运行时表现为"某个任务跑的是别人的
+#   代码"（改 fly 的 CYCLE_PER_MOVE 时踩过：fly1/fly5 撞地址，看起来像调度出错）。
+# -----------------------------------------------------------------------
+app_addr    = $(shell python3 -c "l='$(basename $(notdir $(SRC_USER)))'.split(); \
+                                 print(hex($(USER_ENTRYPOINT) + l.index('$(1)')*0x10000))")
 
 # -----------------------------------------------------------------------
 # Host Linux Tools Source Files
@@ -168,8 +178,7 @@ $(DIR_BUILD)/%.o: $(DIR_TINYLIBC)/%.c
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 $(DIR_BUILD)/%: $(DIR_TEST_PROJ)/%.c $(OBJ_CRT0) $(LIB_TINYC) riscv.lds
-	$(CC) $(USER_CFLAGS) -o $@ $(OBJ_CRT0) $< $(USER_LDFLAGS) -Wl,--defsym=TEXT_START=$(USER_ENTRYPOINT) -T riscv.lds
-	$(eval USER_ENTRYPOINT := $(shell python3 -c "print(hex(int('$(USER_ENTRYPOINT)', 16) + int('0x10000', 16)))"))
+	$(CC) $(USER_CFLAGS) -o $@ $(OBJ_CRT0) $< $(USER_LDFLAGS) -Wl,--defsym=TEXT_START=$(call app_addr,$*) -T riscv.lds
 
 elf: $(ELF_BOOT) $(ELF_MAIN) $(LIB_TINYC) $(ELF_USER)
 

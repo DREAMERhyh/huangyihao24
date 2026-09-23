@@ -343,6 +343,7 @@ static void init_pcb(void)
         assert(entry != 0);
 
         task->pid = process_id++;
+        task->time_slice = TIMER_INTERVAL;   // 任务5 估出成本前先用默认时间片
         task->status = TASK_READY;
         task->cursor_x = 0;
         task->cursor_y = 0;
@@ -376,6 +377,7 @@ static void init_syscall(void)
     syscall[SYSCALL_LOCK_INIT]    = (long (*)())do_mutex_lock_init;
     syscall[SYSCALL_LOCK_ACQ]     = (long (*)())do_mutex_lock_acquire;
     syscall[SYSCALL_LOCK_RELEASE] = (long (*)())do_mutex_lock_release;
+    syscall[SYSCALL_SET_WORKLOAD] = (long (*)())do_set_sche_workload;
 }
 /************************************************************/
 

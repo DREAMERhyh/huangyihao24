@@ -4,16 +4,25 @@
 #include <os/irq.h>
 #include <os/time.h>
 #include <os/mm.h>
+#include <os/kernel.h>
 #include <screen.h>
 #include <printk.h>
 #include <assert.h>
+
+/* ---- 任务5：时间片取值范围 ----
+ * 平均值取一个时钟节拍；下限保证任何进程（哪怕快到不需要时间片）也拿得到
+ * 实打实的 CPU——题目明确要求"视觉上不能有飞机停下"。 */
+#define SLICE_BASE  TIMER_INTERVAL
+#define SLICE_MIN   (TIMER_INTERVAL / 8)
+#define SLICE_MAX   (TIMER_INTERVAL * 4)
 
 pcb_t pcb[NUM_MAX_TASK];
 const ptr_t pid0_stack = INIT_KERNEL_STACK + PAGE_SIZE;
 pcb_t pid0_pcb = {
     .pid = 0,
     .kernel_sp = (ptr_t)pid0_stack,
-    .user_sp = (ptr_t)pid0_stack
+    .user_sp = (ptr_t)pid0_stack,
+    .time_slice = TIMER_INTERVAL
 };
 
 LIST_HEAD(ready_queue);
@@ -21,6 +30,83 @@ LIST_HEAD(sleep_queue);
 
 /* global process id */
 pid_t process_id = 1;
+
+/* 把"到当下为止"的 CPU 占用折算出来：正在跑的进程 cpu_used 还没结算到此刻 */
+static uint64_t cpu_now(pcb_t *task)
+{
+    if (task == current_running)
+        return task->cpu_used + (get_ticks() - task->last_tick);
+    return task->cpu_used;
+}
+
+/* 任务5：按"每前进一格要烧多少 CPU"重新分配时间片。
+ *   设成本为 c_i，时间片 s_i ∝ c_i，则各进程单位时间前进的格数相等——
+ *   这正是"飞行速度相同"的含义。平均时间片固定为 SLICE_BASE，
+ *   所以 s_i = SLICE_BASE * c_i / (所有成本的均值)。 */
+static void update_time_slices(void)
+{
+    uint64_t sum = 0;
+    int n = 0;
+
+    for (int i = 0; i < NUM_MAX_TASK; ++i) {
+        if (pcb[i].cost > 0) {
+            sum += (uint64_t)pcb[i].cost;
+            n++;
+        }
+    }
+    if (n == 0)
+        return;
+
+    for (int i = 0; i < NUM_MAX_TASK; ++i) {
+        uint64_t s;
+
+        if (pcb[i].cost <= 0)
+            continue;
+
+        s = SLICE_BASE * (uint64_t)pcb[i].cost / (sum / n);
+
+        if (s < SLICE_MIN)
+            s = SLICE_MIN;      // 时间片绝不为 0：宁可多给，也不让飞机停
+        if (s > SLICE_MAX)
+            s = SLICE_MAX;
+
+        pcb[i].time_slice = s;
+    }
+
+}
+
+/* 任务5：fly 程序每前进一格就报一次当前位置。
+ *   内核不知道 CYCLE_PER_MOVE，但两次上报之间的"格数差"与"CPU 差"一比，
+ *   就能反推出这架飞机前进一格平均要花多少 CPU——起点位置不同也不影响，
+ *   因为用的是差分。 */
+void do_set_sche_workload(int workload)
+{
+    pcb_t *task = current_running;
+    uint64_t cpu = cpu_now(task);
+
+    if (task->has_wl && task->wl_pos != workload) {
+        int dpos = task->wl_pos - workload;     /* workload = 60 - 列号：前进则变小 */
+
+        if (dpos > 0) {
+            task->wl_cols += dpos;
+
+            /* 用"自起飞以来的累计平均"：每格的开销差异极大（一格只改几个
+             * 屏幕格子，而每轮收尾要清三行、动上百个格子），单格成本能从
+             * 6k 跳到 290k。累计平均正好等于"每格真正摊销的成本"，而且同一
+             * 轮里的收尾开销会平摊到该轮所有格子上——这正是我们要的。 */
+            task->cost = (int)((cpu - task->wl_start_cpu) /
+                               (uint64_t)task->wl_cols);
+            update_time_slices();
+        }
+    }
+
+    task->wl_pos = workload;
+    if (!task->has_wl) {
+        task->wl_start_cpu = cpu;
+        task->wl_cols = 0;
+    }
+    task->has_wl = 1;
+}
 
 void do_scheduler(void)
 {
@@ -37,20 +123,33 @@ void do_scheduler(void)
      *   已经被阻塞/退出的任务由 do_block 等自己摘掉，这里不再放回。 */
     pcb_t *prev = current_running;
 
+    /* 任务5：把 prev 这一轮占掉的 CPU 结算进它的账上 */
+    prev->cpu_used += get_ticks() - prev->last_tick;
+
     if (prev->status == TASK_RUNNING) {
         prev->status = TASK_READY;
         list_add_tail(&prev->list, &ready_queue);
     }
 
     // 就绪队列空了（所有任务都在等锁/等时间）：只能继续跑当前这个（pid0 空转）
-    if (list_empty(&ready_queue))
+    if (list_empty(&ready_queue)) {
+        prev->last_tick = get_ticks();
+        bios_set_timer(get_ticks() + TIMER_INTERVAL);   // 别让时钟断了，否则再也醒不来
         return;
+    }
 
     // TODO: [p2-task1] Modify the current_running pointer.
     pcb_t *next = list_entry(ready_queue.next, pcb_t, list);
     list_del(&next->list);
     next->status = TASK_RUNNING;
     current_running = next;
+
+    next->last_tick = get_ticks();
+
+
+    /* 任务5：下一次时钟中断就定在"下一个时间片用完"的时刻，
+     *   于是时间片大小直接就是被抢占的间隔（而不是被固定节拍量化）。 */
+    bios_set_timer(get_ticks() + next->time_slice);
 
     // TODO: [p2-task1] switch_to current_running
     switch_to(prev, next);
