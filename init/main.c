@@ -366,6 +366,7 @@ static void init_pcb(void)
     //   在所有用户任务都被阻塞时兜底（任务3 的睡眠唤醒就靠它一直转着）。
     current_running = &pid0_pcb;
     pid0_pcb.status = TASK_RUNNING;
+    init_idle_accounting();     // 对齐 pid0 的时间戳，免得记进"开机以来的全部 tick"
 }
 
 static void init_syscall(void)

@@ -124,6 +124,9 @@ void do_unblock(list_node_t *);
 /* 任务5：接收某个 fly 进程上报的当前位置，据此调整各进程的时间片 */
 void do_set_sche_workload(int workload);
 
+/* 任务5：把内核怠速任务 pid0 的时间戳对齐到当下（它没有正常的"入场"路径） */
+void init_idle_accounting(void);
+
 /************************************************************/
 /* Do not touch this comment. Reserved for future projects. */
 /************************************************************/

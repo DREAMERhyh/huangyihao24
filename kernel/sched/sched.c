@@ -34,6 +34,16 @@ LIST_HEAD(sleep_queue);
 /* global process id */
 pid_t process_id = 1;
 
+/* 任务5：记账前先把 pid0 的时间戳对齐到当下。
+ *   pid0 是静态初始化的（.bss 里 last_tick = 0），第一次 do_scheduler 那句
+ *   cpu_used += now - last_tick 会把"开机以来的全部 tick"（≈1e8）记到它头上。
+ *   对调度无影响（pid0 没有 cost），但任何"打印每进程 CPU 占用"的功能会看到这笔假账。 */
+void init_idle_accounting(void)
+{
+    pid0_pcb.last_tick = get_ticks();
+    pid0_pcb.cpu_used = 0;
+}
+
 /* 把"到当下为止"的 CPU 占用折算出来：正在跑的进程 cpu_used 还没结算到此刻 */
 static uint64_t cpu_now(pcb_t *task)
 {
@@ -141,7 +151,10 @@ void do_scheduler(void)
         prev->status = TASK_READY;
         list_add_tail(&prev->list, &ready_queue);
     } else if (prev == &pid0_pcb) {
-        prev->status = TASK_BLOCKED;   /* 怠速任务平时就是"不可运行" */
+        /* 怠速任务平时就标成"不可运行"。严格说这是借用了 BLOCKED 的语义
+         * （它不是被谁阻塞，只是没活干）——今天没有副作用，但将来若加
+         * ps/kill/wait 这类"按 status 扫全部 PCB"的功能，要记得把 pid0 排除。 */
+        prev->status = TASK_BLOCKED;
     }
 
     pcb_t *next;
