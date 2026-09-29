@@ -13,6 +13,9 @@
  * 平均值取一个时钟节拍；下限保证任何进程（哪怕快到不需要时间片）也拿得到
  * 实打实的 CPU——题目明确要求"视觉上不能有飞机停下"。 */
 #define SLICE_BASE  TIMER_INTERVAL
+
+/* 内核怠速（pid0）的时间片：短一点，免得"有任务被唤醒却要等它睡完" */
+#define IDLE_SLICE  (TIMER_INTERVAL / 8)
 #define SLICE_MIN   (TIMER_INTERVAL / 8)
 #define SLICE_MAX   (TIMER_INTERVAL * 4)
 
@@ -22,7 +25,7 @@ pcb_t pid0_pcb = {
     .pid = 0,
     .kernel_sp = (ptr_t)pid0_stack,
     .user_sp = (ptr_t)pid0_stack,
-    .time_slice = TIMER_INTERVAL
+    .time_slice = IDLE_SLICE
 };
 
 LIST_HEAD(ready_queue);
@@ -126,26 +129,35 @@ void do_scheduler(void)
     /* 任务5：把 prev 这一轮占掉的 CPU 结算进它的账上 */
     prev->cpu_used += get_ticks() - prev->last_tick;
 
-    if (prev->status == TASK_RUNNING) {
+    /* ★ pid0（内核空转）不参与轮转：它只是"没别的任务可跑"时的兜底。
+     *   让它跟着轮转有两个害处：
+     *   ① 白占一个时间片，所有用户进程都少拿 CPU；
+     *   ② 它跑的是 main 里的 wfi，会让 QEMU 在宿主机上真的睡下去——宿主的
+     *      调度延迟会让 guest 的 rdtime 白白流走，而 rdtime 正是我们抢占用的
+     *      时钟；于是"排在 wfi 之后"的任务时间片里混进无谓的流逝，实测能
+     *      让两个完全相同的任务产出差 20%（排在后面的稳定吃亏）。
+     *   所以下面只在就绪队列空的时候把它拎出来怠速。 */
+    if (prev->status == TASK_RUNNING && prev != &pid0_pcb) {
         prev->status = TASK_READY;
         list_add_tail(&prev->list, &ready_queue);
+    } else if (prev == &pid0_pcb) {
+        prev->status = TASK_BLOCKED;   /* 怠速任务平时就是"不可运行" */
     }
 
-    // 就绪队列空了（所有任务都在等锁/等时间）：只能继续跑当前这个（pid0 空转）
-    if (list_empty(&ready_queue)) {
-        prev->last_tick = get_ticks();
-        bios_set_timer(get_ticks() + TIMER_INTERVAL);   // 别让时钟断了，否则再也醒不来
-        return;
+    pcb_t *next;
+    if (!list_empty(&ready_queue)) {
+        // TODO: [p2-task1] Modify the current_running pointer.
+        next = list_entry(ready_queue.next, pcb_t, list);
+        list_del(&next->list);
+    } else if (prev != &pid0_pcb) {
+        next = &pid0_pcb;              /* 兜底：所有任务都阻塞了，让内核上场怠速 */
+    } else {
+        next = prev;                   /* 已经在怠速且没别的事，继续 */
     }
 
-    // TODO: [p2-task1] Modify the current_running pointer.
-    pcb_t *next = list_entry(ready_queue.next, pcb_t, list);
-    list_del(&next->list);
     next->status = TASK_RUNNING;
     current_running = next;
-
     next->last_tick = get_ticks();
-
 
     /* 任务5：下一次时钟中断就定在"下一个时间片用完"的时刻，
      *   于是时间片大小直接就是被抢占的间隔（而不是被固定节拍量化）。 */

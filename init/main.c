@@ -442,6 +442,8 @@ int main(void)
         // 抢占模式下不再需要主动让出 CPU：时钟中断自己会触发 do_scheduler。
         // 这里是内核（pid0）的空转：wfi 睡到下一次中断，醒来后继续参与调度。
         // 注意不能用 do_scheduler() 空转——那会让 pid0 白占一个时间片。
+        /* pid0 只在"没别的任务可跑"时才到这里，所以放心睡等时钟；
+         * 有任务在跑时它根本不参与轮转（见 do_scheduler）。 */
         asm volatile("wfi");
     }
 
