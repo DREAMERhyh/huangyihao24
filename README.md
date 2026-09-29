@@ -26,11 +26,11 @@ make all
 **构建成功标志**（`make image` 末尾会打印布局核算）：
 
 ```
-[layout] kernel.img : 21436 bytes = 512(boot) + 20476(kernel) + 448(appinfo)
-[layout] apps.img   : 64580 bytes = 64252(apps) + 328(尾部对齐)
-[layout] appinfo 偏移 : 20988 (byte)
-[layout] apps 区偏移  : 21436 (byte) —— 内核字节数 20476，二者【不补到扇区】
-[layout] total      : 86016 bytes = 168 sectors（末尾补 328 字节）
+[layout] kernel.img : 22060 bytes = 512(boot) + 21100(kernel) + 448(appinfo)
+[layout] apps.img   : 64468 bytes = 64252(apps) + 216(尾部对齐)
+[layout] appinfo 偏移 : 21612 (byte)
+[layout] apps 区偏移  : 22060 (byte) —— 内核字节数 21100，二者【不补到扇区】
+[layout] total      : 86528 bytes = 169 sectors（末尾补 216 字节）
 ```
 
 > 每个 app 的加载窗口按**名字**（排序后的序号）算，与"本次构建了哪些目标"无关，
@@ -65,7 +65,11 @@ make run
         fly                ← 选中 fly
         (直接敲回车)        ← 空行 = 选完了，开始调度
 
-⑤ 退出 QEMU：
+⑤ 想换一组任务：按 Ctrl+C
+        —— 内核会热重启一次，一秒左右回到 "Available tasks" 提示符，
+           可以直接接着选下一组，不用退出 QEMU、不用重等 U-Boot
+
+⑥ 退出 QEMU：
         Ctrl+a    然后按    x
 ```
 
