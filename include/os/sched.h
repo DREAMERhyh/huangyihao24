@@ -97,6 +97,9 @@ typedef struct pcb
     uint64_t wl_start_cpu; /* 本统计窗口起点的 CPU 累计值 */
     int      wl_cols;      /* 本统计窗口内已经前进的格数 */
     int      has_wl;       /* 是否已经有过一次上报（用于算差分） */
+    uint64_t wl_win_tick;  /* 本测速窗口起点的墙钟时刻 */
+    int      wl_win_cols;  /* 本测速窗口起点的累计格数 */
+    int      speed;        /* 实测飞行速度（格/秒 × 256，平滑值；0 = 还没测出来） */
 
 } pcb_t;
 

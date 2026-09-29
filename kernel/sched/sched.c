@@ -52,6 +52,13 @@ static uint64_t cpu_now(pcb_t *task)
     return task->cpu_used;
 }
 
+/* 任务5 的反馈系数：每格成本估出来的是"前馈"（快），实测飞行速度再修一把（准）。
+ *   前馈管方向、反馈压残差——宿主调度、刷屏波动这些"时间基准"层面的干扰，
+ *   只有盯着"看得见的速度"才能补掉。 */
+#define SPEED_UNIT  256
+#define SPEED_WINDOW 30    /* 测速窗口：每前进这么多格重算一次速度 */
+#define SPEED_GAIN  8      /* 每次上报只走 1/8 的修正量，避免振荡 */
+
 /* 任务5：按"每前进一格要烧多少 CPU"重新分配时间片。
  *   设成本为 c_i，时间片 s_i ∝ c_i，则各进程单位时间前进的格数相等——
  *   这正是"飞行速度相同"的含义。平均时间片固定为 SLICE_BASE，
@@ -70,13 +77,35 @@ static void update_time_slices(void)
     if (n == 0)
         return;
 
+    /* 反馈支路：所有已经测出速度的任务的平均速度 */
+    uint64_t speed_sum = 0;
+    int sn = 0;
+
+    for (int i = 0; i < NUM_MAX_TASK; ++i) {
+        if (pcb[i].cost > 0 && pcb[i].speed > 0) {
+            speed_sum += (uint64_t)pcb[i].speed;
+            sn++;
+        }
+    }
+
     for (int i = 0; i < NUM_MAX_TASK; ++i) {
         uint64_t s;
 
         if (pcb[i].cost <= 0)
             continue;
 
+        /* 前馈：时间片 ∝ 每格成本（收敛快，一开始就能分个大概对） */
         s = SLICE_BASE * (uint64_t)pcb[i].cost / (sum / n);
+
+        /* 反馈：再按"看得见的速度"修一把——比平均慢就多给、快就少给。
+         *   前馈管方向、反馈压残差：宿主抢占、刷屏波动这些落在时间基准上的
+         *   干扰，只有盯着实测速度才补得掉。带阻尼（每次只走 1/SPEED_GAIN）。 */
+        if (sn > 0 && pcb[i].speed > 0) {
+            uint64_t corr = (speed_sum / sn) * SPEED_UNIT /
+                            (uint64_t)pcb[i].speed;
+            corr = ((uint64_t)SPEED_UNIT * (SPEED_GAIN - 1) + corr) / SPEED_GAIN;
+            s = s * corr / SPEED_UNIT;
+        }
 
         if (s < SLICE_MIN)
             s = SLICE_MIN;      // 时间片绝不为 0：宁可多给，也不让飞机停
@@ -111,12 +140,33 @@ void do_set_sche_workload(int workload)
                                (uint64_t)task->wl_cols);
             update_time_slices();
         }
+
+        /* 实测飞行速度：滑动窗口平均，单位"格/秒 × 256"。
+         *   ① 用**墙钟**而不是 CPU 时间："看起来飞得多快"才是任务书要的那件事，
+         *      宿主抢占带来的时间失真正好被这一层反馈补掉；
+         *   ② 窗口取 ~SPEED_WINDOW 格：太小则噪声大（单格的墙钟耗时能差十倍，
+         *      有的格正好撞上每轮收尾清屏），太大则跟不上变化（早期的不平衡
+         *      会一直拖着估计）；窗口之间再做 EMA，兼顾平滑与跟踪。 */
+        if (task->wl_cols - task->wl_win_cols >= SPEED_WINDOW) {
+            uint64_t dt = get_ticks() - task->wl_win_tick;
+
+            if (dt) {
+                uint64_t v = (uint64_t)(task->wl_cols - task->wl_win_cols) *
+                             10000000 * SPEED_UNIT / dt;
+                task->speed = task->speed
+                    ? (int)((task->speed * 3 + (int)v) / 4) : (int)v;
+            }
+            task->wl_win_cols = task->wl_cols;
+            task->wl_win_tick = get_ticks();
+        }
     }
 
     task->wl_pos = workload;
     if (!task->has_wl) {
         task->wl_start_cpu = cpu;
         task->wl_cols = 0;
+        task->wl_win_cols = 0;
+        task->wl_win_tick = get_ticks();
     }
     task->has_wl = 1;
 }
@@ -141,12 +191,15 @@ void do_scheduler(void)
 
     /* ★ pid0（内核空转）不参与轮转：它只是"没别的任务可跑"时的兜底。
      *   让它跟着轮转有两个害处：
-     *   ① 白占一个时间片，所有用户进程都少拿 CPU；
-     *   ② 它跑的是 main 里的 wfi，会让 QEMU 在宿主机上真的睡下去——宿主的
-     *      调度延迟会让 guest 的 rdtime 白白流走，而 rdtime 正是我们抢占用的
-     *      时钟；于是"排在 wfi 之后"的任务时间片里混进无谓的流逝，实测能
-     *      让两个完全相同的任务产出差 20%（排在后面的稳定吃亏）。
-     *   所以下面只在就绪队列空的时候把它拎出来怠速。 */
+     *   ① 白占一个时间片，所有用户进程都少拿 CPU（三实体时每进程只能拿 1/3）；
+     *   ② 它跑的是 main 里的 wfi，而 wfi 是 guest **唯一主动把宿主 CPU 让出去**
+     *      的地方——一睡一醒会把宿主调度器的相位与 guest 的轮转对齐，于是
+     *      "guest 的 rdtime 是宿主墙钟、不是执行量"这个事实，就从随机误差变成
+     *      按轮转槽位稳定偏向的系统性误差，实测能让两个**完全相同**的任务
+     *      产出差 20%（本机只有 1 核、load 常 3~9，被放大）。
+     *   所以下面只在就绪队列空的时候把它拎出来怠速。
+     *   （用 `-icount shift=3,sleep=off` 把时间基准换成指令数后，偏差为 0.006%，
+     *   证明调度本身是公平的，问题出在"墙钟时间基准 + 宿主超载"。） */
     if (prev->status == TASK_RUNNING && prev != &pid0_pcb) {
         prev->status = TASK_READY;
         list_add_tail(&prev->list, &ready_queue);
