@@ -394,6 +394,12 @@ int main(void)
     // Init task information from bootblock-passed AppInfo (〃'▽'〃)
     init_task_info();
 
+    // 任务5 附加：把引导参数另存一份到 .data（Ctrl+C 暖重启时要重新塞回 a0~a2）
+    extern uint64_t boot_saved[3];
+    boot_saved[0] = boot_appinfo_off;
+    boot_saved[1] = boot_appnum;
+    boot_saved[2] = boot_apps_base_off;
+
     // Init Process Control Blocks |•'-'•) ✧
     init_pcb();
     printk("> [INIT] PCB initialization succeeded.\n");
