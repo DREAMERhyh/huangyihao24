@@ -177,6 +177,9 @@ static int readline(char *buf, int cap)
 
         if (ch == '\n' || ch == '\r') {   // 双终止符
             buf[len] = '\0';
+            // 回车本身不会回显，这里补一个换行，否则下一条提示语会粘在本行末尾
+            bios_putchar('\n');
+            bios_putchar('\r');
             return len;
         }
 
@@ -200,6 +203,8 @@ static int readline(char *buf, int cap)
                 if (ch == '\n' || ch == '\r')
                     break;
             }
+            bios_putchar('\n');            // 同上：补换行，免得提示语粘连
+            bios_putchar('\r');
             buf[0] = '\0';
             return 0;
         }
