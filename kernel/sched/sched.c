@@ -102,14 +102,13 @@ void do_set_sche_workload(int workload)
     if (task->has_wl && task->wl_pos != workload) {
         int dpos = task->wl_pos - workload;     /* workload = 60 - 列号：前进则变小 */
 
-        if (dpos > 0) {
-            task->wl_cols += dpos;
-        } else if (dpos < 0) {
-            /* 回卷（一轮飞完又从头开始）：上一轮的**最后一格**（i=59）是在它
-             * 自己的上报之后才飞的，下一次上报已经是新一轮的起点了（dpos<0），
-             * 所以那一格不会被 dpos 统计到。不补这一格，内核就每轮少算 1 格，
-             * 而短轮的任务被少算的比例更大（fly1 每轮 10 格 → 高估成本 11%）。 */
-            task->wl_cols += 1;
+        /* dpos > 0：正常前进；dpos < 0：一轮飞完又从头开始。
+         *   回卷这一支要**补记 1 格**：上一轮最后一格（i=59）是在它自己的上报
+         *   之后才飞的，下一次上报已经是新一轮起点，那一格不会被 dpos 统计到。
+         *   不补的话内核每轮少算 1 格，短轮任务被少算的比例更大（fly1 每轮 10 格
+         *   → 成本高估 11%），"fly1 最慢"的系统性排序就是这么来的。 */
+        if (dpos != 0) {
+            task->wl_cols += (dpos > 0) ? dpos : 1;
 
             /* 用"自起飞以来的累计平均"：每格的开销差异极大（一格只改几个
              * 屏幕格子，而每轮收尾要清三行、动上百个格子），单格成本能从
@@ -119,7 +118,6 @@ void do_set_sche_workload(int workload)
                                (uint64_t)task->wl_cols);
             update_time_slices();
         }
-
     }
 
     task->wl_pos = workload;
