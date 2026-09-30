@@ -91,7 +91,7 @@ typedef struct pcb
      * 上报的位置数出"每架飞了多少格"，调度时让飞得最少的那架先飞（见 pick_next）。 */
     int      wl_pos;       /* 最近一次上报的进度（workload = 60 - 列号，前进则变小） */
     int      wl_cols;      /* 自起飞以来累计前进的格数（回卷那一格也补记） */
-    int      wl_mark;      /* 上次被选中时的 wl_cols（"插队要先证明有前进"的快照） */
+    int      wl_run;       /* 连续被选中、且其间没前进过几次（插队配额，前进即清零） */
     int      has_wl;       /* 是否已经有过一次上报 */
 
 } pcb_t;

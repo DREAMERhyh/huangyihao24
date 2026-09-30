@@ -43,6 +43,7 @@ void do_set_sche_workload(int workload)
          *   不补的话内核每轮少算 1 格，短轮任务被少算的比例更大（fly1 每轮 10 格
          *   → 少算 10%），"谁快谁慢"的排序就会被系统性带偏。 */
         task->wl_cols += (dpos > 0) ? dpos : 1;   /* 外层已保证 dpos != 0 */
+        task->wl_run = 0;                         /* 前进过 → 插队配额刷新 */
     }
 
     task->wl_pos = workload;
@@ -53,15 +54,21 @@ void do_set_sche_workload(int workload)
  *   规则：队首是飞控任务时，在**所有飞控任务**里挑累计前进格数最少的那一架
  *   （"谁飞得少谁先飞"）；队首是普通任务时照旧拿队首——普通任务按轮转拿
  *   自己那份，不会被飞控任务饿死。
- *   ★ 插队资格：只有"上次被选中之后进度真的前进过"（wl_cols != wl_mark）的
- *     任务才能凭落后插队。否则一个**上报位置永远不变**的程序（例如助教把
- *     START_POINT 改成 59：每轮只飞一格、上报值恒为 1）会永远停在最小值上、
- *     永远霸占 CPU，把其余所有任务饿死——"谁落后谁先飞"的前提是它会追上来。
- *     进度不动的任务退回普通轮转；等它下次真的动了，资格自动恢复。
+ *   ★ 插队配额（wl_run < WL_RUN_MAX 才有资格凭落后插队）：
+ *     被选中一次配额 +1，**前进一格就清零**；配额用尽就退回普通轮转。
+ *     两个作用：
+ *     ① 防"进度卡死"霸占 CPU——若某架的上报位置永远不变（助教把 START_POINT
+ *        改成 59：每轮上报值恒为 1），它永远是最小值；没有配额就会永远被选中，
+ *        把其余所有任务饿死（实测：未加护栏时其余四架 2 秒后全冻住）。
+ *        加配额后它最多连占 4 片就被降级为普通轮转，其余任务照常飞。
+ *     ② 让"每格要烧好几片"的慢机也能拿到足额补偿——只要每格需要的时间片
+ *        ≤ 配额，它每次都在完成一格后立刻重获资格，速率照样被拉平。
  *   为什么不估"每格要烧多少 CPU"再分时间片：**进度本身就是最直接的反馈**。
- *   落后的一架下一轮就被优先选中，直到追上；不需要知道 CYCLE_PER_MOVE，
- *   也不怕宿主抢 CPU、时钟抖动这类噪声——它们只会把某架飞机压慢一点，
- *   而那架飞机随后会被自动补回来（实测把累计进度差压在几个格子以内）。 */
+ *   落后的一架会被优先选中直到追上（前进即刷新配额）；不需要知道
+ *   CYCLE_PER_MOVE，也不怕宿主抢 CPU、时钟抖动这类噪声——它们只会把某架
+ *   压慢一点，而那架随后会被自动补回来（实测累计进度差 ≤5 格）。 */
+#define WL_RUN_MAX 4
+
 static pcb_t *pick_next(void)
 {
     pcb_t *head = list_entry(ready_queue.next, pcb_t, list);
@@ -72,13 +79,14 @@ static pcb_t *pick_next(void)
     pcb_t *best = head;
     for (list_node_t *n = head->list.next; n != &ready_queue; n = n->next) {
         pcb_t *t = list_entry(n, pcb_t, list);
-        if (!t->has_wl || t->wl_cols == t->wl_mark)
-            continue;                       /* 进度没动过：不许凭"落后"插队 */
+        if (!t->has_wl || t->wl_run >= WL_RUN_MAX)
+            continue;                       /* 配额用尽：退回普通轮转 */
         if (t->wl_cols < best->wl_cols)
             best = t;
     }
 
-    best->wl_mark = best->wl_cols;          /* 记快照：下次要先证明"有前进" */
+    if (best->has_wl)
+        best->wl_run++;                     /* 用掉一格配额（前进时在下方清零） */
     return best;
 }
 
