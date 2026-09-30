@@ -23,14 +23,15 @@ make image                          # createimage 产出 kernel.img + apps.img�
 make all
 ```
 
-**构建成功标志**（`make image` 末尾会打印布局核算）：
+**构建成功标志**（`make image` 末尾会打印布局核算；下面是本分支当前的实际输出，
+数字会随源码改动小幅变化，核对要点是各项自洽、没有 error）：
 
 ```
-[layout] kernel.img : 22060 bytes = 512(boot) + 21100(kernel) + 448(appinfo)
-[layout] apps.img   : 64468 bytes = 64252(apps) + 216(尾部对齐)
-[layout] appinfo 偏移 : 21612 (byte)
-[layout] apps 区偏移  : 22060 (byte) —— 内核字节数 21100，二者【不补到扇区】
-[layout] total      : 86528 bytes = 169 sectors（末尾补 216 字节）
+[layout] kernel.img : 22172 bytes = 512(boot) + 21212(kernel) + 448(appinfo)
+[layout] apps.img   : 64356 bytes = 64252(apps) + 104(尾部对齐)
+[layout] appinfo 偏移 : 21724 (byte)
+[layout] apps 区偏移  : 22172 (byte) —— 内核字节数 21212，二者【不补到扇区】
+[layout] total      : 86528 bytes = 169 sectors（末尾补 104 字节）
 ```
 
 > 每个 app 的加载窗口按**名字**（排序后的序号）算，与"本次构建了哪些目标"无关，
@@ -78,7 +79,7 @@ make run
 | 任务 | 输入的任务名 | 期望看到 |
 |---|---|---|
 | 1 PCB 与轮转调度（图 P2-2） | `print1` `print2` `fly` | 前两行计数基本同步增长，飞机在 5~11 行自左向右移动并循环 |
-| 2 互斥锁（图 P2-3） | `lock1` `lock2` | 两行严格交替：一方 `Has acquired lock and running.(0)~(4)` 跑完临界区，另一方整段时间停在 `Applying for a lock.` |
+| 2 互斥锁（图 P2-3） | `lock1` `lock2` | 互斥成立；换手是**相位粒度**：一方连续跑 1~16 次 `(0)~(4)` 才轮到对方（不是每完成一次就换），等待方绝大多数时间停在 `Applying for a lock.` |
 | 3 真系统调用（图 P2-8） | `print1` `print2` `lock1` `lock2` `sleep` `timer` | 六行分别是两个计数、锁的一持一等、`test sleep. (n)`、`timing! (秒数/ticks)` |
 | 4 抢占式调度 | 同任务 3 | 输出与任务 3 一致。六个测试程序里已按任务书要求**注释掉全部 `sys_yield`**，全靠时钟中断推进 |
 | 5 自适应调度 | `fly1` `fly2` `fly3` `fly4` `fly5` | 五架飞机始终编队同速飞行；各机 `[flyN] cycles:` 除以自己的 `CYCLE_PER_MOVE` 应基本相等 |
@@ -105,8 +106,8 @@ python3 .scratch/emu.py <日志> --watch 3,4      # 第 3、4 行的内容变化
 QEMU_EXTRA="-icount shift=3,sleep=off" .scratch/p2-run.sh <日志> "30|loadbootd" "30|print1" "3|print2" "3|" "60|"
 ```
 
-实测 print1/print2 = 34570 / 34568（差 0.006%）。注意 icount 下 guest 变慢，
-注入延时要比平时放大几倍。
+实测 print1/print2 的相对差 ~0.006%（绝对计数随宿主窗口浮动，不必和某一组具体
+数字逐字对上）。注意 icount 下 guest 变慢，注入延时要比平时放大几倍。
 
 ---
 

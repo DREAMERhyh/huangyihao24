@@ -175,7 +175,7 @@ ENTRY(switch_to)
 
   /* 任务1：从 next 的 PCB 里恢复现场。
    *   新任务第一次被调度时，这块现场是 init_pcb_stack 伪造的：
-   *   ra = 程序入口，sp = 该任务自己的用户栈顶。 */
+   *   任务3 起 ra = ret_from_exception、sp = 陷阱帧基址（入口在帧的 sepc 里）。 */
   ld sp, PCB_KERNEL_SP(a1)
   ld ra,  SWITCH_TO_RA(sp)
   ld s0,  SWITCH_TO_S0(sp)

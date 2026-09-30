@@ -18,7 +18,7 @@ ENTRY(_start)
    *   起止地址取自 riscv.lds 定义的符号 __bss_start 与 __BSS_END__，
    *   由链接器按本内核实际的段布局赋值，无需硬编码。
    *   镜像里只有已初始化的数据（PT_LOAD 的 p_filesz 部分），
-   *   BSS 不在镜像中，必须在这里清零，否则 main 里的 bss_check 会失败。 */
+   *   BSS 不在镜像中，必须在这里清零，否则全局变量会读到垃圾值。 */
   la    t0, __bss_start
   la    t1, __BSS_END__
 clear_loop:

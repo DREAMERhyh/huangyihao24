@@ -66,7 +66,7 @@ static inline void list_init(list_node_t *node)
     node->prev = node;
 }
 
-/* 把 node 插到 head 之后（头插） */
+/* 把 node 插到 head 之后（头插）；对称原语，本工程内当前无调用 */
 static inline void list_add(list_node_t *node, list_head *head)
 {
     node->next = head->next;

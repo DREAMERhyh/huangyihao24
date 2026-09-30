@@ -362,8 +362,8 @@ static void init_pcb(void)
     }
 
     // 内核自己也得有个 PCB：调度、屏幕光标等都是经由 current_running 访问的。
-    //   pid0 是内核的空转任务，让它始终处于 RUNNING，于是它也会进就绪队列，
-    //   在所有用户任务都被阻塞时兜底（任务3 的睡眠唤醒就靠它一直转着）。
+    //   pid0 是内核的空转任务，初始置 RUNNING 只为对齐 current_running；它不参与
+    //   轮转、也不进就绪队列，只在就绪队列为空时被拎回来怠速（睡眠唤醒靠它的时钟中断）。
     current_running = &pid0_pcb;
     pid0_pcb.status = TASK_RUNNING;
     init_idle_accounting();     // 对齐 pid0 的时间戳，免得记进"开机以来的全部 tick"
@@ -427,8 +427,8 @@ int main(void)
     // TODO: [p2-task4] Setup timer interrupt and enable all interrupt globally
     // NOTE: The function of sstatus.sie is different from sie's
 
-    // ① 先给时钟装上第一次触发时间；之后每来一次中断，handle_irq_timer
-    //    都会把下一次推后 TIMER_INTERVAL，所以只需要在这里武装一次。
+    // ① 先给时钟装上第一次触发时间，只需要在这里武装一次；之后每次调度
+    //    （do_scheduler）都会按下一个任务的时间片重设下一次触发时刻。
     bios_set_timer(get_ticks() + TIMER_INTERVAL);
 
     // ② 内核自己也要能被中断打断（抢占模式下的"第一次调度"正是由这次时钟

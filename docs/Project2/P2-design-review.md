@@ -33,7 +33,7 @@
 
 ### A2. 初始化 PCB 和内核栈时要做哪些事？
 
-代码：[init/main.c:326-364](../init/main.c#L326-L364)（`init_pcb`）
+代码：[init/main.c:331-362](../init/main.c#L331-L362)（`init_pcb`）
 
 对每个被选中的 app：
 
@@ -51,8 +51,8 @@
 7. 最后 `current_running = &pid0_pcb`，并把 pid0 置成 `TASK_RUNNING`。
 
 > 为什么 pid0 也要有 PCB：屏幕光标（`screen_write_ch` 里的 `current_running->cursor_x/y`）、
-> 调度都要经由 `current_running`；pid0 是内核自己的空转任务，留在就绪队列里可以在
-> 所有用户进程都被阻塞时兜底（任务3 靠它持续转着才能把睡眠进程唤醒）。
+> 调度都要经由 `current_running`；pid0 是内核自己的空转任务，**不参与轮转**，只在
+> 就绪队列为空时被拎回来怠速兜底（睡眠进程由它的时钟中断驱动 `check_sleeping` 唤醒）。
 
 ### A3. `switchto_context_t` 里会保存哪些内容？为什么？
 
@@ -68,7 +68,7 @@
 
 ### A4. 你设计的内核调度器（`do_scheduler`）的工作流程？
 
-代码：[kernel/sched/sched.c:111-156](../kernel/sched/sched.c#L111-L156)
+代码：[kernel/sched/sched.c:131-191](../kernel/sched/sched.c#L131-L191)
 
 ```
 1. check_sleeping()              —— 先把睡够的进程放回就绪队列
@@ -95,24 +95,34 @@
 > 证明公平性本身没问题，问题在时间基准）。
 
 调度的触发点有三个：抢占模式下**时钟中断** `handle_irq_timer`、进程主动
-`sys_yield`、以及阻塞时的 `do_block`。
+`sys_yield`、以及阻塞让出（`do_block`，或互斥锁抢不到时的 `do_scheduler`）。
 
 ### A5. 当一个进程被阻塞时，内核会进行哪些处理？
 
-以互斥锁为例（[kernel/sched/sched.c:173-197](../kernel/sched/sched.c#L173-L197)、
-[kernel/locking/lock.c:97-127](../kernel/locking/lock.c#L97-L127)）：
+以互斥锁为例（[kernel/locking/lock.c:97-127](../kernel/locking/lock.c#L97-L127)、
+[kernel/sched/sched.c:193-230](../kernel/sched/sched.c#L193-L230)）：
 
-1. 抢不到锁 → `do_block(&current_running->list, &lock->block_queue)`；
-2. `do_block`：把 PCB 的 `status` 置 `TASK_BLOCKED`、用**同一个 list 结点**
-   挂到该锁的阻塞队列上，然后调 `do_scheduler`；
-3. `do_scheduler` 看到 prev 不是 RUNNING，就不再把它排回就绪队列 → 它从 CPU 上消失。
+1. `do_mutex_lock_acquire` 用**先入队再抢锁**的无窗口设计：关中断 →
+   `list_add_tail(&current_running->list, &lock->block_queue)` →
+   `spin_lock_try_acquire(&lock->lock)`。抢到就 `list_del` 把结点从等待队列摘回、
+   置 `TASK_RUNNING` 后直接返回；抢不到就置 `TASK_BLOCKED`，恢复中断后**直接调
+   `do_scheduler()`**——互斥锁的阻塞路径不经过 `do_block`（后者现在只被 `do_sleep` 用）；
+2. `do_scheduler` 看到 prev 不是 RUNNING，就不再把它排回就绪队列 → 它从 CPU 上消失。
    注意：**它的用户态现场早就存在自己内核栈的陷阱帧里了**（它是通过 ecall 进来的），
    所以在队列里睡着的只是一个 PCB 结点；
-4. 唤醒：持有者 `do_mutex_lock_release` → `do_unblock(队首)` → `list_del` +
-   `status = READY` + 挂回就绪队列 → 下一次调度它时从陷阱帧恢复、`sret` 回用户态，
-   对用户程序而言就是"`sys_mutex_acquire` 返回了"。
+3. 唤醒：持有者 `do_mutex_lock_release`（关中断里）置锁为空 + `do_unblock(队首)`
+   → `list_del` + `status = READY` + 挂回就绪队列；
+4. 下一次调度到它时，`switch_to` 从它的内核栈恢复，落回 `do_scheduler()` 的返回处，
+   回到 `while(1)` 顶部重抢锁——**抢到才真正从 `sys_mutex_acquire` 返回**
+   （这个循环顺带容忍了虚假唤醒）。
 
-> 睡眠（`do_sleep`）走的是同一条路，只是挂在 `sleep_queue` 上并记了 `wakeup_time`。
+> 睡眠（`do_sleep`）是同一套机制的另一个使用者：走 `do_block` 挂到 `sleep_queue`
+> 并记下 `wakeup_time`，到点由 `check_sleeping` → `do_unblock` 唤醒；它被唤醒后
+> 从陷阱帧恢复、`sret` 回用户态，对用户程序而言就是"系统调用返回了"。
+>
+> 覆盖面：数据结构天然支持"一个进程同时持多把锁""≥3 个进程抢同一把锁"（每把锁
+> 一条独立的等待队列、`mlocks[16]`、`do_unblock` 每次只唤醒队首）——课程验收实测
+> 的是双进程单锁这一组。
 
 ---
 
@@ -161,7 +171,7 @@ ecall
 | `sstatus.SIE` | 1 | 同上。`sie` 只说"允许哪类中断"，`sstatus.SIE` 才是"允不允许被打断"，缺一不可 |
 | `sie`（SIE 全 1） | `enable_preempt()` | [entry.S:126](../arch/riscv/kernel/entry.S#L126)，`main` 里调用 |
 | 时钟触发时刻 | `get_ticks() + TIMER_INTERVAL` | [init/main.c](../init/main.c) 里装第一次；**之后每次中断由 `do_scheduler` 按下一个任务的时间片重设**（Sstc 下就是写 stimecmp，RISC-V 的时钟中断不自动重装） |
-| `irq_table[IRQC_S_TIMER]` | `handle_irq_timer` | [irq.c:43](../kernel/irq/irq.c#L43)，其余进 `handle_other` |
+| `irq_table[IRQC_S_TIMER]` | `handle_irq_timer` | [irq.c:95](../kernel/irq/irq.c#L95)，其余进 `handle_other` |
 | `exc_table[EXCC_SYSCALL]` | `handle_syscall` | 同上，其余进 `handle_other`（打印现场 + assert，便于抓没实现的例外） |
 | 新任务的 `sstatus` | `SR_SPIE`(0x20) | `init_pcb_stack`：SPP=0 让 sret 回 **User** 态，SPIE=1 让 sret 后中断使能 |
 
@@ -183,7 +193,7 @@ ecall
 
 ### B4. 开发任务 3 时，`init_pcb_stack` 需要完成哪些初始化？
 
-代码：[init/main.c:278-324](../init/main.c#L278-L324)
+代码：[init/main.c:283-329](../init/main.c#L283-L329)
 
 它要在任务的内核栈上**伪造两块现场**（因为新任务从没跑过，没有已保存的现场）：
 
@@ -218,8 +228,9 @@ ecall
   （`handle_irq_timer` → `do_scheduler`），于是每到一个时间片结束就会检查一次睡眠
   队列 —— 即使所有用户进程都在睡，时钟照样响、照样唤醒。
 
-> 实现细节：就绪队列为空时 `do_scheduler` 会提前 return，但它**先重设了 timer**，
-> 所以时钟不会断，`check_sleeping` 仍会被下一次中断触发。
+> 实现细节：就绪队列为空时 `do_scheduler` 会换成 pid0 上场怠速（内核在 `wfi` 里
+> 睡等下一次时钟中断），timer 照常重设——时钟不会断，`check_sleeping` 仍会被下一次
+> 中断触发。
 
 ---
 
@@ -227,7 +238,7 @@ ecall
 
 ### C1. 任务 5 的自适应调度算法
 
-代码：[kernel/sched/sched.c:35-109](../kernel/sched/sched.c#L35-L109)
+代码：[kernel/sched/sched.c:60-129](../kernel/sched/sched.c#L60-L129)
 
 - **内核先验知识为零**：不知道 `CYCLE_PER_MOVE`，也不知道起始位置，只能靠
   `set_sche_workload` 上报的位置。
@@ -244,10 +255,16 @@ ecall
   ∝ `s_i`，单位时间前进的格数 = 份额 / `c_i` = 常数 —— 对所有进程相同。
 - **落地**：`do_scheduler` 把 timer 定在 `next->time_slice` 之后，时间片直接就是
   被抢占的间隔，不再被固定节拍量化。
-- **实测**：`-icount shift=3,sleep=off`（固定时间基准，宿主影响不了）下内核侧口径差
-  **4.7%**；正常时钟下同一次运行里两个测法给出 4.7%~15.8%，说明在 1 核超载宿主上
-  **宿主噪声已经大于策略差异**——这也是我把闭环删掉、只留一层的前提。
-  极端场景（`CYCLE_PER_MOVE` 5 vs 250、起始位置也从 10 改到 45）实测 3.8%。
+- **时间片表多久重算一次**：`do_set_sche_workload` **每收到一格位置上报就重算成本并
+  立刻重分配**（`update_time_slices`），响应粒度是"每格"而不是"每轮"。
+  （这里踩过一个隐藏坑：一次括号落位错误把重算吞进了"回卷"分支，变成每轮才刷新一次、
+  分配响应变迟钝——修在 9333e58。）
+- **实测**：`-icount shift=3,sleep=off`（固定时间基准，宿主影响不了）下五机差
+  **2.8%**（复跑：五机分别前进 9670/9480/9660/9720/9750 格）；正常时钟下 5~15%——
+  在 1 核超载宿主上**宿主噪声已经大于策略差异**，这也是我把闭环删掉、只留一层的前提。
+  极端场景（`CYCLE_PER_MOVE` 5 vs 250、起点也改动）复测差 **4.5%**（正常时钟、
+  宿主负载 0.62 的低噪声窗口；内核账本里五机每格成本 27.4k~30.0k、时间片按此比例
+  分配——本平台每格的屏幕刷新开销占大头，CPM 差异只体现在 ~10% 上）。
 - **答辩演示建议**：这台 1 核宿主的噪声底是 ±5~10%，**逐次跑出来的数字不可互相比较**
   （同一份代码能从 5.8% 飘到 15.8%）。要留档就加 `-icount shift=3,sleep=off` 把时间
   基准固定成指令数再跑（那份数据可复现）；现场演示时先说明"噪声底 ±5~10%"，被追问
@@ -287,5 +304,17 @@ ecall
    未修复的代码也 Δ≤0.2%）—— 根因确认是"**guest 的 rdtime 是宿主墙钟、不是执行量**，
    而宿主只有 1 核且常超载"，`wfi` 是 guest 里唯一主动让出宿主 CPU 的地方，一睡一醒
    把宿主调度器的相位与 guest 的轮转对齐，误差就从"随机"变成"按槽位稳定偏向"；
-   ⑦ 修法：pid0 退出轮转、只做兜底怠速 —— print1/print2 从 20% 降到 1~5%，
-   五机从 ±15% 降到 ±5%（`-icount` 下 0.006%）。
+   ⑦ 修法：pid0 退出轮转、只做兜底怠速 —— print1/print2 从 20% 降到 1~5%
+   （`-icount` 下 Δ0.006%）；五机同速的残差与两种口径见 C1。
+
+### C4. 为什么 printf 每次直接刷屏，而不是像附录 §6.1 说的"在时钟中断里统一刷"？
+
+因为**这就是课程 start code 自己的设计**：上游 `tiny_libc/printf.c` 的 `vprintf`
+末尾就是 `sys_write(buff); sys_reflush();`（该文件相对 start code 零改动，逐字节一致），
+而 `sys_reflush` 正是任务书点名要我们实现的 `TODO`（题面给的跳转表里没有刷屏项，
+我们按名补了一项，见 `init/main.c` 与 `include/os/kernel.h` 的注释）。附录 §6.1
+自我声明"并不会介绍新的任务，只是便于同学们理解 start code 中的相关代码"，且它
+描述的"printf 只写显存"与 start code 的实际行为并不一致——所以答辩按"与 start code
+保持一致、并实现它留的 `sys_reflush` TODO"回答即可。性能上没问题：`sys_reflush`
+是**差分刷新**（只写变化过的格子，见 `drivers/screen.c`），五机同屏时每格的刷屏
+开销就是任务 5 测的"每格成本"的组成部分。
