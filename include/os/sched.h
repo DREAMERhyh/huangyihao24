@@ -86,17 +86,12 @@ typedef struct pcb
     uint64_t wakeup_time;
 
     /* ---- 任务5（C-core 自适应调度）----
-     * 5 架飞机的 CYCLE_PER_MOVE 不同，"前进一格"要烧的 CPU 差好几倍，
-     * 公平轮转下它们就会飞得不一样快。内核事先并不知道谁快谁慢，只能靠
-     * set_sche_workload 上报的位置，边飞边估"每格成本"，再按成本分配时间片。 */
-    uint64_t time_slice;   /* 本轮时间片（ticks）—— 绝对不能为 0，否则飞机会停 */
-    uint64_t cpu_used;     /* 累计占用过的 CPU ticks */
-    uint64_t last_tick;    /* 本次上场的时刻，用于把 cpu_used 结算到当下 */
-    int      cost;         /* 每前进一格平均要烧的 CPU ticks（0 = 还没估出来） */
+     * 5 架飞机的 CYCLE_PER_MOVE 不同，"前进一格"要烧的 CPU 不一样，公平轮转下
+     * 它们就会飞得不一样快。内核不需要知道 CYCLE_PER_MOVE：靠 set_sche_workload
+     * 上报的位置数出"每架飞了多少格"，调度时让飞得最少的那架先飞（见 pick_next）。 */
     int      wl_pos;       /* 最近一次上报的进度（workload = 60 - 列号，前进则变小） */
-    uint64_t wl_start_cpu; /* 本统计窗口起点的 CPU 累计值 */
-    int      wl_cols;      /* 自起飞以来累计前进的格数 */
-    int      has_wl;       /* 是否已经有过一次上报（用于算差分） */
+    int      wl_cols;      /* 自起飞以来累计前进的格数（回卷那一格也补记） */
+    int      has_wl;       /* 是否已经有过一次上报 */
 
 } pcb_t;
 
@@ -121,11 +116,8 @@ void do_sleep(uint32_t);
 void do_block(list_node_t *, list_head *queue);
 void do_unblock(list_node_t *);
 
-/* 任务5：接收某个 fly 进程上报的当前位置，据此调整各进程的时间片 */
+/* 任务5：接收某个 fly 进程上报的当前位置，累计它飞过的格数（调度按此挑人） */
 void do_set_sche_workload(int workload);
-
-/* 任务5：把内核怠速任务 pid0 的时间戳对齐到当下（它没有正常的"入场"路径） */
-void init_idle_accounting(void);
 
 /************************************************************/
 /* Do not touch this comment. Reserved for future projects. */

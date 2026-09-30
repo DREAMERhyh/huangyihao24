@@ -348,7 +348,6 @@ static void init_pcb(void)
         assert(entry != 0);
 
         task->pid = process_id++;
-        task->time_slice = TIMER_INTERVAL;   // 任务5 估出成本前先用默认时间片
         task->status = TASK_READY;
         task->cursor_x = 0;
         task->cursor_y = 0;
@@ -366,7 +365,6 @@ static void init_pcb(void)
     //   轮转、也不进就绪队列，只在就绪队列为空时被拎回来怠速（睡眠唤醒靠它的时钟中断）。
     current_running = &pid0_pcb;
     pid0_pcb.status = TASK_RUNNING;
-    init_idle_accounting();     // 对齐 pid0 的时间戳，免得记进"开机以来的全部 tick"
 }
 
 static void init_syscall(void)

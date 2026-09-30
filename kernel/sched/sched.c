@@ -9,23 +9,18 @@
 #include <printk.h>
 #include <assert.h>
 
-/* ---- 任务5：时间片取值范围 ----
- * 平均值取一个时钟节拍；下限保证任何进程（哪怕快到不需要时间片）也拿得到
- * 实打实的 CPU——题目明确要求"视觉上不能有飞机停下"。 */
-#define SLICE_BASE  TIMER_INTERVAL
-
-/* 内核怠速（pid0）的时间片：短一点，免得"有任务被唤醒却要等它睡完" */
-#define IDLE_SLICE  (TIMER_INTERVAL / 8)
-#define SLICE_MIN   (TIMER_INTERVAL / 8)
-#define SLICE_MAX   (TIMER_INTERVAL * 4)
+/* 任务5：所有任务共用同一个时间片。"让落后飞机多飞"靠调度时的挑选顺序实现
+ *   （见 pick_next），不靠改时间片大小——题目要求的"任何时间片不得为 0"
+ *   于是天然成立。取 1/4 个时钟节拍（~3.75ms）：5 架飞机轮流时，每架每次
+ *   上场只前进两三格，编队看着更连续（15ms 节拍下每批要跳 9 格）。 */
+#define SLICE_LEN   (TIMER_INTERVAL / 4)
 
 pcb_t pcb[NUM_MAX_TASK];
 const ptr_t pid0_stack = INIT_KERNEL_STACK + PAGE_SIZE;
 pcb_t pid0_pcb = {
     .pid = 0,
     .kernel_sp = (ptr_t)pid0_stack,
-    .user_sp = (ptr_t)pid0_stack,
-    .time_slice = IDLE_SLICE
+    .user_sp = (ptr_t)pid0_stack
 };
 
 LIST_HEAD(ready_queue);
@@ -34,98 +29,49 @@ LIST_HEAD(sleep_queue);
 /* global process id */
 pid_t process_id = 1;
 
-/* 任务5：记账前先把 pid0 的时间戳对齐到当下。
- *   pid0 是静态初始化的（.bss 里 last_tick = 0），第一次 do_scheduler 那句
- *   cpu_used += now - last_tick 会把"开机以来的全部 tick"（≈1e8）记到它头上。
- *   对调度无影响（pid0 没有 cost），但任何"打印每进程 CPU 占用"的功能会看到这笔假账。 */
-void init_idle_accounting(void)
-{
-    pid0_pcb.last_tick = get_ticks();
-    pid0_pcb.cpu_used = 0;
-}
-
-/* 把"到当下为止"的 CPU 占用折算出来：正在跑的进程 cpu_used 还没结算到此刻 */
-static uint64_t cpu_now(pcb_t *task)
-{
-    if (task == current_running)
-        return task->cpu_used + (get_ticks() - task->last_tick);
-    return task->cpu_used;
-}
-
-
-/* 任务5：按"每前进一格要烧多少 CPU"重新分配时间片。
- *   设成本为 c_i，时间片 s_i ∝ c_i，则各进程单位时间前进的格数相等——
- *   这正是"飞行速度相同"的含义。平均时间片固定为 SLICE_BASE，
- *   所以 s_i = SLICE_BASE * c_i / (所有成本的均值)。 */
-static void update_time_slices(void)
-{
-    uint64_t sum = 0;
-    int n = 0;
-
-    for (int i = 0; i < NUM_MAX_TASK; ++i) {
-        if (pcb[i].cost > 0) {
-            sum += (uint64_t)pcb[i].cost;
-            n++;
-        }
-    }
-    if (n == 0)
-        return;
-
-    for (int i = 0; i < NUM_MAX_TASK; ++i) {
-        uint64_t s;
-
-        if (pcb[i].cost <= 0)
-            continue;
-
-        /* 前馈：时间片 ∝ 每格成本（收敛快，一开始就能分个大概对） */
-        s = SLICE_BASE * (uint64_t)pcb[i].cost / (sum / n);
-
-        if (s < SLICE_MIN)
-            s = SLICE_MIN;      // 时间片绝不为 0：宁可多给，也不让飞机停
-        if (s > SLICE_MAX)
-            s = SLICE_MAX;
-
-        pcb[i].time_slice = s;
-    }
-
-}
-
-/* 任务5：fly 程序每前进一格就报一次当前位置。
- *   内核不知道 CYCLE_PER_MOVE，但两次上报之间的"格数差"与"CPU 差"一比，
- *   就能反推出这架飞机前进一格平均要花多少 CPU——起点位置不同也不影响，
- *   因为用的是差分。 */
+/* 任务5：fly 程序每前进一格就报一次"当前位置"（workload = 60 - 列号，前进则变小）。
+ *   内核不猜 CYCLE_PER_MOVE 是多少，只数一件事：这架飞机到目前一共飞了多少格。 */
 void do_set_sche_workload(int workload)
 {
     pcb_t *task = current_running;
-    uint64_t cpu = cpu_now(task);
 
     if (task->has_wl && task->wl_pos != workload) {
-        int dpos = task->wl_pos - workload;     /* workload = 60 - 列号：前进则变小 */
+        int dpos = task->wl_pos - workload;     /* >0：前进；<0：一轮飞完从头开始 */
 
-        /* dpos > 0：正常前进；dpos < 0：一轮飞完又从头开始。
-         *   回卷这一支要**补记 1 格**：上一轮最后一格（i=59）是在它自己的上报
+        /* 回卷这一支要**补记 1 格**：上一轮最后一格（i=59）是在它自己的上报
          *   之后才飞的，下一次上报已经是新一轮起点，那一格不会被 dpos 统计到。
          *   不补的话内核每轮少算 1 格，短轮任务被少算的比例更大（fly1 每轮 10 格
-         *   → 成本高估 11%），"fly1 最慢"的系统性排序就是这么来的。 */
-        if (dpos != 0) {
+         *   → 少算 10%），"谁快谁慢"的排序就会被系统性带偏。 */
+        if (dpos != 0)
             task->wl_cols += (dpos > 0) ? dpos : 1;
-
-            /* 用"自起飞以来的累计平均"：每格的开销差异极大（一格只改几个
-             * 屏幕格子，而每轮收尾要清三行、动上百个格子），单格成本能从
-             * 6k 跳到 290k。累计平均正好等于"每格真正摊销的成本"，而且同一
-             * 轮里的收尾开销会平摊到该轮所有格子上——这正是我们要的。 */
-            task->cost = (int)((cpu - task->wl_start_cpu) /
-                               (uint64_t)task->wl_cols);
-            update_time_slices();
-        }
     }
 
     task->wl_pos = workload;
-    if (!task->has_wl) {
-        task->wl_start_cpu = cpu;
-        task->wl_cols = 0;
-    }
     task->has_wl = 1;
+}
+
+/* 任务5：从就绪队列里挑"下一架飞"的飞机。
+ *   规则：队首是飞控任务时，在**所有飞控任务**里挑累计前进格数最少的那一架
+ *   （"谁飞得少谁先飞"）；队首是普通任务时照旧拿队首——普通任务按轮转拿
+ *   自己那份，不会被飞控任务饿死。
+ *   为什么不估"每格要烧多少 CPU"再分时间片：**进度本身就是最直接的反馈**。
+ *   落后的一架下一轮就被优先选中，直到追上；不需要知道 CYCLE_PER_MOVE，
+ *   也不怕宿主抢 CPU、时钟抖动这类噪声——它们只会把某架飞机压慢一点，
+ *   而那架飞机随后会被自动补回来（实测把累计进度差压在几个格子以内）。 */
+static pcb_t *pick_next(void)
+{
+    pcb_t *head = list_entry(ready_queue.next, pcb_t, list);
+
+    if (!head->has_wl)
+        return head;
+
+    pcb_t *best = head;
+    for (list_node_t *n = head->list.next; n != &ready_queue; n = n->next) {
+        pcb_t *t = list_entry(n, pcb_t, list);
+        if (t->has_wl && t->wl_cols < best->wl_cols)
+            best = t;
+    }
+    return best;
 }
 
 void do_scheduler(void)
@@ -142,9 +88,6 @@ void do_scheduler(void)
      *   被换下场的任务如果还活着（RUNNING），就排到就绪队列尾部再等下一轮；
      *   已经被阻塞/退出的任务由 do_block 等自己摘掉，这里不再放回。 */
     pcb_t *prev = current_running;
-
-    /* 任务5：把 prev 这一轮占掉的 CPU 结算进它的账上 */
-    prev->cpu_used += get_ticks() - prev->last_tick;
 
     /* ★ pid0（内核空转）不参与轮转：它只是"没别的任务可跑"时的兜底。
      *   让它跟着轮转有两个害处：
@@ -170,7 +113,7 @@ void do_scheduler(void)
     pcb_t *next;
     if (!list_empty(&ready_queue)) {
         // TODO: [p2-task1] Modify the current_running pointer.
-        next = list_entry(ready_queue.next, pcb_t, list);
+        next = pick_next();            /* 任务5：飞得最少的先飞；普通任务照旧拿队首 */
         list_del(&next->list);
     } else if (prev != &pid0_pcb) {
         next = &pid0_pcb;              /* 兜底：所有任务都阻塞了，让内核上场怠速 */
@@ -180,11 +123,9 @@ void do_scheduler(void)
 
     next->status = TASK_RUNNING;
     current_running = next;
-    next->last_tick = get_ticks();
 
-    /* 任务5：下一次时钟中断就定在"下一个时间片用完"的时刻，
-     *   于是时间片大小直接就是被抢占的间隔（而不是被固定节拍量化）。 */
-    bios_set_timer(get_ticks() + next->time_slice);
+    /* 时间片统一为 1/4 个时钟节拍——绝不为 0，飞机不会"停下"。 */
+    bios_set_timer(get_ticks() + SLICE_LEN);
 
     // TODO: [p2-task1] switch_to current_running
     switch_to(prev, next);
