@@ -42,8 +42,7 @@ void do_set_sche_workload(int workload)
          *   之后才飞的，下一次上报已经是新一轮起点，那一格不会被 dpos 统计到。
          *   不补的话内核每轮少算 1 格，短轮任务被少算的比例更大（fly1 每轮 10 格
          *   → 少算 10%），"谁快谁慢"的排序就会被系统性带偏。 */
-        if (dpos != 0)
-            task->wl_cols += (dpos > 0) ? dpos : 1;
+        task->wl_cols += (dpos > 0) ? dpos : 1;   /* 外层已保证 dpos != 0 */
     }
 
     task->wl_pos = workload;
@@ -54,6 +53,11 @@ void do_set_sche_workload(int workload)
  *   规则：队首是飞控任务时，在**所有飞控任务**里挑累计前进格数最少的那一架
  *   （"谁飞得少谁先飞"）；队首是普通任务时照旧拿队首——普通任务按轮转拿
  *   自己那份，不会被飞控任务饿死。
+ *   ★ 插队资格：只有"上次被选中之后进度真的前进过"（wl_cols != wl_mark）的
+ *     任务才能凭落后插队。否则一个**上报位置永远不变**的程序（例如助教把
+ *     START_POINT 改成 59：每轮只飞一格、上报值恒为 1）会永远停在最小值上、
+ *     永远霸占 CPU，把其余所有任务饿死——"谁落后谁先飞"的前提是它会追上来。
+ *     进度不动的任务退回普通轮转；等它下次真的动了，资格自动恢复。
  *   为什么不估"每格要烧多少 CPU"再分时间片：**进度本身就是最直接的反馈**。
  *   落后的一架下一轮就被优先选中，直到追上；不需要知道 CYCLE_PER_MOVE，
  *   也不怕宿主抢 CPU、时钟抖动这类噪声——它们只会把某架飞机压慢一点，
@@ -68,9 +72,13 @@ static pcb_t *pick_next(void)
     pcb_t *best = head;
     for (list_node_t *n = head->list.next; n != &ready_queue; n = n->next) {
         pcb_t *t = list_entry(n, pcb_t, list);
-        if (t->has_wl && t->wl_cols < best->wl_cols)
+        if (!t->has_wl || t->wl_cols == t->wl_mark)
+            continue;                       /* 进度没动过：不许凭"落后"插队 */
+        if (t->wl_cols < best->wl_cols)
             best = t;
     }
+
+    best->wl_mark = best->wl_cols;          /* 记快照：下次要先证明"有前进" */
     return best;
 }
 

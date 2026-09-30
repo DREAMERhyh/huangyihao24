@@ -67,7 +67,7 @@
 
 ### A4. 你设计的内核调度器（`do_scheduler`）的工作流程？
 
-代码：[kernel/sched/sched.c:76-131](../kernel/sched/sched.c#L76-L131)
+代码：[kernel/sched/sched.c:85-141](../kernel/sched/sched.c#L85-L141)
 
 ```
 1. check_sleeping()              —— 先把睡够的进程放回就绪队列
@@ -98,7 +98,7 @@
 ### A5. 当一个进程被阻塞时，内核会进行哪些处理？
 
 以互斥锁为例（[kernel/locking/lock.c:97-127](../kernel/locking/lock.c#L97-L127)、
-[kernel/sched/sched.c:193-230](../kernel/sched/sched.c#L193-L230)）：
+[kernel/sched/sched.c:142-179](../kernel/sched/sched.c#L142-L179)）：
 
 1. `do_mutex_lock_acquire` 用**先入队再抢锁**的无窗口设计：关中断 →
    `list_add_tail(&current_running->list, &lock->block_queue)` →
@@ -236,7 +236,7 @@ ecall
 
 ### C1. 任务 5 的自适应调度算法
 
-代码：[kernel/sched/sched.c:33-131](../kernel/sched/sched.c#L33-L131)
+代码：[kernel/sched/sched.c:33-84](../kernel/sched/sched.c#L33-L84)
 
 - **内核先验知识为零**：不知道 `CYCLE_PER_MOVE`，也不知道起始位置，只能靠
   `set_sche_workload` 上报的位置。
@@ -249,6 +249,13 @@ ecall
   任务则照旧拿队首——普通任务按 RR 拿自己那份，**不会被飞控任务饿死**。
   这就是任务书原话的直译："根据实时飞行位置调整优先级，让进度较慢的进程能拥有
   更大或更多的时间片"：落后的一架下一轮就被优先选中，直到追上。
+- **★ 插队资格护栏**（代码审查抓出来的坑）：只有"上次被选中之后进度真的前进过"的
+  任务（`wl_cols != wl_mark`）才能凭"落后"插队；进度不动的任务退回普通轮转。
+  没有这条护栏时，一个**上报位置永远不变**的程序（助教现场把 `START_POINT` 改成 59：
+  每轮只飞一格、上报值恒为 1）会永远停在最小值上、永远霸占 CPU——实测未加护栏时
+  其余四架 2 秒后就全部冻住（位置变化次数只剩 6~8 次）；加护栏后同一场景 3248/3251 次，
+  五架都在飞。正常五机场景不受影响（复跑差 0.66%，还是在宿主负载 1.65 + 另一 QEMU
+  同跑的噪声下）。
 - **时间片统一为 1/4 个时钟节拍**（`SLICE_LEN = TIMER_INTERVAL/4` ≈ 3.75ms），
   **绝不为 0**（题目要求"不能有飞机停下"——同一个常数对谁都非零，天然成立；
   取 1/4 节拍是为了让每架每次上场只前进两三格，编队看着更连续）。
