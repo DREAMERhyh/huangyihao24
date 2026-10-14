@@ -69,9 +69,20 @@ void do_mutex_lock_release(int mlock_idx);
 extern mutex_lock_t mlocks[LOCK_NUM];
 
 /************************************************************/
+/* ================ 任务2：同步原语（barrier / condition / mailbox）================
+ * 三者共用同一条内核纪律（实现见 kernel/locking/lock.c）：
+ *   「判条件 → 挂等待队列 → 置 BLOCKED」必须在一段关中断窗口里一次完成，
+ *   恢复中断之后才允许让出 CPU；唤醒方一律"全唤醒"，醒来者自己重查。
+ * 结构里的 spin_lock_t 是为任务3 的双核互斥预留的（单核阶段靠关中断就够），
+ * 字段风格与 mutex_lock_t 保持一致。 */
+
 typedef struct barrier
 {
-    // TODO [P3-TASK2 barrier]
+    spin_lock_t lock;
+    list_head wait_list;    /* 已到达、但还没凑齐 goal 的进程（等最后一人放行） */
+    int goal;               /* 需要同时到达的进程数（init 时给定，测试是 3） */
+    int arrived;            /* 本轮已到达的个数；凑满 goal 时由最后一人清零 */
+    int key;                /* 空闲槽位标记：KEY_UNUSED（同 mlocks） */
 } barrier_t;
 
 #define BARRIER_NUM 16
@@ -83,7 +94,9 @@ void do_barrier_destroy(int bar_idx);
 
 typedef struct condition
 {
-    // TODO [P3-TASK2 condition]
+    spin_lock_t lock;
+    list_head wait_list;    /* 在条件上等待的进程（cond_wait 挂上，signal/broadcast 叫醒） */
+    int key;                /* 空闲槽位标记：KEY_UNUSED */
 } condition_t;
 
 #define CONDITION_NUM 16
@@ -109,10 +122,19 @@ void do_semaphore_down(int sema_idx);
 void do_semaphore_destroy(int sema_idx);
 
 #define MAX_MBOX_LENGTH (64)
+#define MBOX_NAME_LEN (32)
 
 typedef struct mailbox
 {
-    // TODO [P3-TASK2 mailbox]
+    spin_lock_t lock;
+    list_head send_wait;        /* 空间不足而阻塞的发送者 */
+    list_head recv_wait;        /* 数据不足而阻塞的接收者 */
+    char name[MBOX_NAME_LEN];   /* 信箱名字（按名共享）；name[0]=='\0' 表示槽位空闲 */
+    char buffer[MAX_MBOX_LENGTH];   /* 环形字节缓冲（有界缓冲 + FIFO，任务书 §4.5） */
+    int head;                   /* 读指针：下一个要取出的字节 */
+    int tail;                   /* 写指针：下一个要写入的位置 */
+    int count;                  /* 当前存了多少字节（判空间/判取走的依据） */
+    int refcount;               /* open 引用计数；减到 0 才释放槽位 */
 } mailbox_t;
 
 #define MBOX_NUM 16

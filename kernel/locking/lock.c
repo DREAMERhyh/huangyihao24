@@ -2,6 +2,7 @@
 #include <os/sched.h>
 #include <os/list.h>
 #include <os/irq.h>
+#include <os/string.h>
 #include <csr.h>
 #include <atomic.h>
 
@@ -43,6 +44,12 @@ void init_locks(void)
         list_init(&mlocks[i].block_queue);
         mlocks[i].owner = 0;
     }
+
+    /* 任务2 的三种原语槽位也在这里初始化——main.c 已经在调 init_locks()，
+     * 不必往那份文件里再加三行（避免和主会话的改动交错）。重复初始化无害。 */
+    init_barriers();
+    init_conditions();
+    init_mbox();
 }
 
 void spin_lock_init(spin_lock_t *lock)
@@ -147,4 +154,347 @@ void do_mutex_lock_release(int mlock_idx)
         do_unblock(lock->block_queue.next);
 
     irq_restore(sstatus);
+}
+
+/* =====================================================================
+ * 任务2：同步原语实现（barrier / condition / mailbox）
+ *
+ * 三种原语共用同一条"阻塞-唤醒"骨架，纪律展开成三句：
+ *   ① 「判条件、改状态、（必要时）挂进等待队列」必须在**同一段关中断
+ *      窗口**里完成——定时器抢占不能插在中间。否则或者丢唤醒（挂队
+ *      之前发生 wakeup，没人记得我们），或者出现"同挂在两个队列上"的
+ *      双重身份（pcb 只有一个 list 结点，链表会被串坏）；
+ *   ② 恢复中断之后才允许让出（do_scheduler）——关着中断切换任务会把
+ *      SIE=0 带进下一个任务的执行流；
+ *   ③ 被唤醒后回到循环开头重新判条件（容忍虚假唤醒）。唤醒方一律
+ *      "全唤醒"，不做精确点名：测试规模下最省心，也绝不丢唤醒。
+ * ===================================================================== */
+
+/* 把自己挂上 q 并置 BLOCKED，恢复中断后让出 CPU。
+ *   调用者必须已 irq_save()，并把那次保存的 sstatus 传进来——"挂队 +
+ *   置状态"必须和调用处的"判条件"处在同一段关中断窗口里，中间不留空档。 */
+static void block_on_queue(list_head *q, uint64_t sstatus)
+{
+    current_running->status = TASK_BLOCKED;
+    list_add_tail(&current_running->list, q);
+
+    irq_restore(sstatus);
+    do_scheduler();
+}
+
+/* ------------------------------- barrier ------------------------------- */
+
+barrier_t barriers[BARRIER_NUM];
+
+void init_barriers(void)
+{
+    for (int i = 0; i < BARRIER_NUM; ++i) {
+        spin_lock_init(&barriers[i].lock);
+        list_init(&barriers[i].wait_list);
+        barriers[i].goal = 0;
+        barriers[i].arrived = 0;
+        barriers[i].key = KEY_UNUSED;
+    }
+}
+
+int do_barrier_init(int key, int goal)
+{
+    /* 与 do_mutex_lock_init 同款：同一个 key 复用同一个 handle（= 下标） */
+    uint64_t sstatus = irq_save();
+
+    for (int i = 0; i < BARRIER_NUM; ++i) {
+        if (barriers[i].key == key) {
+            irq_restore(sstatus);
+            return i;
+        }
+    }
+
+    for (int i = 0; i < BARRIER_NUM; ++i) {
+        if (barriers[i].key == KEY_UNUSED) {
+            spin_lock_init(&barriers[i].lock);
+            list_init(&barriers[i].wait_list);
+            barriers[i].goal = goal;
+            barriers[i].arrived = 0;
+            barriers[i].key = key;
+            irq_restore(sstatus);
+            return i;
+        }
+    }
+
+    irq_restore(sstatus);
+    return -1;   // 屏障槽位用光
+}
+
+void do_barrier_wait(int bar_idx)
+{
+    barrier_t *b = &barriers[bar_idx];
+
+    uint64_t sstatus = irq_save();
+
+    /* 到达计数 +1；凑满 goal 的"最后一人"不睡，由它放行所有人：
+     *   · 清零 arrived，为下一轮做准备（测试是 10 轮循环）；
+     *   · 把等待队列上的进程全部唤醒。
+     * 于是三个 test_barrier 打印的循环计数必然是"一起增长"的。 */
+    b->arrived++;
+    if (b->arrived == b->goal) {
+        b->arrived = 0;
+        while (!list_empty(&b->wait_list))
+            do_unblock(b->wait_list.next);
+        irq_restore(sstatus);
+        return;
+    }
+
+    /* 还没凑齐：挂到等待队列上睡，被最后一人唤醒后直接返回
+     * （计数已被清好，本进程下一轮重新计数）。 */
+    block_on_queue(&b->wait_list, sstatus);
+}
+
+void do_barrier_destroy(int bar_idx)
+{
+    barrier_t *b = &barriers[bar_idx];
+
+    /* 测试在所有参与者退出后才 destroy（barrier.c 先 waitpid 三个孩子），
+     * 正常不会有等待者；万一有也一并唤醒——总比睡死强。 */
+    uint64_t sstatus = irq_save();
+
+    while (!list_empty(&b->wait_list))
+        do_unblock(b->wait_list.next);
+    b->arrived = 0;
+    b->goal = 0;
+    b->key = KEY_UNUSED;
+
+    irq_restore(sstatus);
+}
+
+/* ------------------------------ condition ------------------------------ */
+
+condition_t conditions[CONDITION_NUM];
+
+void init_conditions(void)
+{
+    for (int i = 0; i < CONDITION_NUM; ++i) {
+        spin_lock_init(&conditions[i].lock);
+        list_init(&conditions[i].wait_list);
+        conditions[i].key = KEY_UNUSED;
+    }
+}
+
+int do_condition_init(int key)
+{
+    uint64_t sstatus = irq_save();
+
+    for (int i = 0; i < CONDITION_NUM; ++i) {
+        if (conditions[i].key == key) {
+            irq_restore(sstatus);
+            return i;
+        }
+    }
+
+    for (int i = 0; i < CONDITION_NUM; ++i) {
+        if (conditions[i].key == KEY_UNUSED) {
+            spin_lock_init(&conditions[i].lock);
+            list_init(&conditions[i].wait_list);
+            conditions[i].key = key;
+            irq_restore(sstatus);
+            return i;
+        }
+    }
+
+    irq_restore(sstatus);
+    return -1;   // 条件变量槽位用光
+}
+
+void do_condition_wait(int cond_idx, int mutex_idx)
+{
+    condition_t *c = &conditions[cond_idx];
+
+    /* ★ 全过程在一段关中断窗口里：挂上条件队列 → 放开互斥锁 → 置 BLOCKED。
+     *   任何两步之间留空档都会出事：
+     *   · "先放锁、后挂队"：广播可能在空档里发生——我们还不在队列上，
+     *     叫不到我们，而我们随后照睡不误，永久卡死（丢唤醒）；
+     *   · "挂好队、还没置 BLOCKED"：若空档里被调度走，状态还是 RUNNING，
+     *     do_scheduler 会把我们当就绪任务再排进就绪队列——pcb 只有一个
+     *     list 结点，同时在两个队列上链表就串坏了。
+     *   窗口里同时把锁放了：consumer 是持锁进来等的，不放锁生产者进不来。
+     *   do_mutex_lock_release 内部再关一次中断，嵌套安全（存/恢复同值）。
+     *   丢唤醒的另一半证明：生产者要改共享条件必须先拿到这把锁，而锁
+     *   在我们手里直到这一步——"检查条件为假 → 挂上队"之间条件不可能变。 */
+    uint64_t sstatus = irq_save();
+
+    list_add_tail(&current_running->list, &c->wait_list);
+    do_mutex_lock_release(mutex_idx);
+    current_running->status = TASK_BLOCKED;
+
+    irq_restore(sstatus);
+    do_scheduler();
+
+    /* 被唤醒后按条件变量的语义重新持有互斥锁再返回（测试里 consumer
+     * 回到 while 循环、持锁重新检查计数）。 */
+    do_mutex_lock_acquire(mutex_idx);
+}
+
+void do_condition_signal(int cond_idx)
+{
+    condition_t *c = &conditions[cond_idx];
+
+    uint64_t sstatus = irq_save();
+    if (!list_empty(&c->wait_list))
+        do_unblock(c->wait_list.next);      /* 叫醒一个；它醒来自己去抢锁 */
+    irq_restore(sstatus);
+}
+
+void do_condition_broadcast(int cond_idx)
+{
+    condition_t *c = &conditions[cond_idx];
+
+    uint64_t sstatus = irq_save();
+    while (!list_empty(&c->wait_list))
+        do_unblock(c->wait_list.next);      /* 全体叫醒；醒来各自重查条件 */
+    irq_restore(sstatus);
+}
+
+void do_condition_destroy(int cond_idx)
+{
+    condition_t *c = &conditions[cond_idx];
+
+    uint64_t sstatus = irq_save();
+    while (!list_empty(&c->wait_list))
+        do_unblock(c->wait_list.next);
+    c->key = KEY_UNUSED;
+    irq_restore(sstatus);
+}
+
+/* ------------------------------- mailbox ------------------------------- */
+
+mailbox_t mboxes[MBOX_NUM];
+
+void init_mbox(void)
+{
+    for (int i = 0; i < MBOX_NUM; ++i) {
+        spin_lock_init(&mboxes[i].lock);
+        list_init(&mboxes[i].send_wait);
+        list_init(&mboxes[i].recv_wait);
+        mboxes[i].name[0] = '\0';
+        mboxes[i].head = mboxes[i].tail = mboxes[i].count = 0;
+        mboxes[i].refcount = 0;
+    }
+}
+
+int do_mbox_open(char *name)
+{
+    char key[MBOX_NAME_LEN];
+
+    /* 名字来自用户态指针：先拷进内核缓冲、限长、补 '\0'，再拿去比对 */
+    strncpy(key, name, MBOX_NAME_LEN - 1);
+    key[MBOX_NAME_LEN - 1] = '\0';
+
+    uint64_t sstatus = irq_save();
+
+    for (int i = 0; i < MBOX_NUM; ++i) {
+        if (mboxes[i].name[0] != '\0' && strcmp(mboxes[i].name, key) == 0) {
+            mboxes[i].refcount++;       /* 同名共享：引用计数 +1，返回同一个 */
+            irq_restore(sstatus);
+            return i;
+        }
+    }
+
+    for (int i = 0; i < MBOX_NUM; ++i) {
+        if (mboxes[i].name[0] == '\0') {
+            spin_lock_init(&mboxes[i].lock);
+            list_init(&mboxes[i].send_wait);
+            list_init(&mboxes[i].recv_wait);
+            strncpy(mboxes[i].name, key, MBOX_NAME_LEN - 1);
+            mboxes[i].name[MBOX_NAME_LEN - 1] = '\0';
+            mboxes[i].head = mboxes[i].tail = mboxes[i].count = 0;
+            mboxes[i].refcount = 1;
+            irq_restore(sstatus);
+            return i;
+        }
+    }
+
+    irq_restore(sstatus);
+    return -1;   // 信箱槽位用光
+}
+
+void do_mbox_close(int mbox_idx)
+{
+    mailbox_t *m = &mboxes[mbox_idx];
+
+    uint64_t sstatus = irq_save();
+    if (m->name[0] != '\0' && m->refcount > 0 && --m->refcount == 0) {
+        /* 引用计数归零才真正释放。能走到这里说明没有其他持有者，
+         * 也就不可能有阻塞者——阻塞者必然还持有该信箱的引用。 */
+        m->name[0] = '\0';
+        m->head = m->tail = m->count = 0;
+    }
+    irq_restore(sstatus);
+}
+
+int do_mbox_send(int mbox_idx, void *msg, int msg_length)
+{
+    mailbox_t *m = &mboxes[mbox_idx];
+    int blocked = 0;
+
+    /* 单条比整个缓冲还大：剩余空间永远凑不够，直接拒绝（测试不会出现） */
+    if (msg_length > MAX_MBOX_LENGTH)
+        return -1;
+
+    while (1) {
+        uint64_t sstatus = irq_save();
+
+        /* 阻塞判据（任务书 §4.5 原文）：msg_length > 剩余空间。
+         * 注意是严格大于——恰好放得下不算阻塞。 */
+        if (msg_length <= MAX_MBOX_LENGTH - m->count) {
+            for (int i = 0; i < msg_length; ++i) {
+                m->buffer[m->tail] = ((char *)msg)[i];
+                m->tail = (m->tail + 1) % MAX_MBOX_LENGTH;
+            }
+            m->count += msg_length;
+
+            /* 有新数据：把接收方全部叫醒（它们醒来重查"够不够整段取走"） */
+            while (!list_empty(&m->recv_wait))
+                do_unblock(m->recv_wait.next);
+
+            irq_restore(sstatus);
+            return blocked;     /* 返回值 = 本次是否阻塞过（0/1，测试累加成计数） */
+        }
+
+        /* 空间不足：记下 blocked、挂到发送等待队列，醒来回循环重查 */
+        blocked = 1;
+        block_on_queue(&m->send_wait, sstatus);
+    }
+}
+
+int do_mbox_recv(int mbox_idx, void *msg, int msg_length)
+{
+    mailbox_t *m = &mboxes[mbox_idx];
+    int blocked = 0;
+
+    if (msg_length > MAX_MBOX_LENGTH)
+        return -1;
+
+    while (1) {
+        uint64_t sstatus = irq_save();
+
+        /* 字节流语义：凑够 msg_length 字节才整段取走。
+         * server 对一次 send 分两次 recv（先 12B 的 MsgHeader_t、再正文），
+         * 靠的就是"不到量就继续等"——先到的字节先出（FIFO）。 */
+        if (m->count >= msg_length) {
+            for (int i = 0; i < msg_length; ++i) {
+                ((char *)msg)[i] = m->buffer[m->head];
+                m->head = (m->head + 1) % MAX_MBOX_LENGTH;
+            }
+            m->count -= msg_length;
+
+            /* 腾出空间：把发送方全部叫醒 */
+            while (!list_empty(&m->send_wait))
+                do_unblock(m->send_wait.next);
+
+            irq_restore(sstatus);
+            return blocked;
+        }
+
+        blocked = 1;
+        block_on_queue(&m->recv_wait, sstatus);
+    }
 }
