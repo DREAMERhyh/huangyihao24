@@ -132,6 +132,21 @@ static void init_syscall(void)
     syscall[SYSCALL_LOCK_RELEASE] = (long (*)())do_mutex_lock_release;
     syscall[SYSCALL_SET_WORKLOAD] = (long (*)())do_set_sche_workload;
 
+    // P3 任务2：barrier / condition / mailbox 三类同步原语
+    //   （内核实现见 kernel/locking/lock.c，用户侧封装见 tiny_libc/syscall.c）
+    syscall[SYSCALL_BARR_INIT]       = (long (*)())do_barrier_init;
+    syscall[SYSCALL_BARR_WAIT]       = (long (*)())do_barrier_wait;
+    syscall[SYSCALL_BARR_DESTROY]    = (long (*)())do_barrier_destroy;
+    syscall[SYSCALL_COND_INIT]       = (long (*)())do_condition_init;
+    syscall[SYSCALL_COND_WAIT]       = (long (*)())do_condition_wait;
+    syscall[SYSCALL_COND_SIGNAL]     = (long (*)())do_condition_signal;
+    syscall[SYSCALL_COND_BROADCAST]  = (long (*)())do_condition_broadcast;
+    syscall[SYSCALL_COND_DESTROY]    = (long (*)())do_condition_destroy;
+    syscall[SYSCALL_MBOX_OPEN]       = (long (*)())do_mbox_open;
+    syscall[SYSCALL_MBOX_CLOSE]      = (long (*)())do_mbox_close;
+    syscall[SYSCALL_MBOX_SEND]       = (long (*)())do_mbox_send;
+    syscall[SYSCALL_MBOX_RECV]       = (long (*)())do_mbox_recv;
+
     // P3 任务1：进程管理 + 终端
     syscall[SYSCALL_EXEC]         = (long (*)())do_exec;
     syscall[SYSCALL_EXIT]         = (long (*)())do_exit;
