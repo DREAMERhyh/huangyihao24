@@ -141,6 +141,8 @@ static void cmd_exec(int argc, char **argv)
         return;
     }
 
+    printf("Info: execute %s successfully, pid = %d ...\n", argv[1], pid);
+
     if (!background)
         sys_waitpid(pid);
 }
@@ -158,6 +160,88 @@ static void cmd_kill(int argc, char **argv)
     int pid = atoi(argv[1]);
     if (sys_kill(pid) == 0)
         printf("Error: cannot find process %d\n", pid);
+}
+
+/* ---------------------------------------------------------------------
+ * parse_mask：解析核亲和掩码，形如 0x1 / 3（十六进制或十进制） */
+static uint64_t parse_mask(const char *s)
+{
+    uint64_t v = 0;
+    int hex = (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'));
+
+    if (hex)
+        s += 2;
+    for (; *s != '\0'; ++s)
+    {
+        int d;
+        if (*s >= '0' && *s <= '9')
+            d = *s - '0';
+        else if (hex && *s >= 'a' && *s <= 'f')
+            d = *s - 'a' + 10;
+        else if (hex && *s >= 'A' && *s <= 'F')
+            d = *s - 'A' + 10;
+        else
+            return 0;                      /* 有非法字符：视作无效掩码 */
+        v = v * (hex ? 16 : 10) + d;
+    }
+    return v;
+}
+
+/* ---------------------------------------------------------------------
+ * taskset <mask> <task> [args...] [&]   以指定核亲和掩码启动任务
+ * taskset -p <mask> <pid>               修改已存在进程的掩码
+ *   mask 的 bit i = 允许在第 i 号核上运行；掩码 0 视为非法。
+ *   不带 -p 时行为与 exec 相同（参数透传、& 后台），只是给新任务
+ *   指定掩码——affinity 的子任务靠 exec 继承拿到同一个掩码。 */
+static void cmd_taskset(int argc, char **argv)
+{
+    /* taskset -p <mask> <pid> */
+    if (argc >= 4 && strcmp(argv[1], "-p") == 0)
+    {
+        uint64_t mask = parse_mask(argv[2]);
+        int pid = atoi(argv[3]);
+
+        if (mask == 0 || sys_set_affinity(pid, mask) == 0)
+            printf("Error: cannot set affinity of process %d\n", pid);
+        else
+            printf("taskset -p %s %d.\n", argv[2], pid);
+        return;
+    }
+
+    /* taskset <mask> <task> [args...] [&] */
+    if (argc < 3)
+    {
+        printf("Usage: taskset <mask> <task> [args...] [&]\n");
+        return;
+    }
+
+    uint64_t mask = parse_mask(argv[1]);
+    if (mask == 0)
+    {
+        printf("Error: invalid mask \"%s\"\n", argv[1]);
+        return;
+    }
+
+    int end = argc;
+    int background = 0;
+    if (strcmp(argv[argc - 1], "&") == 0)
+    {
+        background = 1;
+        end--;
+    }
+
+    pid_t pid = sys_exec_mask(argv[2], end - 2, &argv[2], mask);
+    if (pid == 0)
+    {
+        printf("Error: cannot load task \"%s\"\n", argv[2]);
+        return;
+    }
+
+    printf("taskset %s %s.\n", argv[1], argv[2]);
+    /* 官图 P3-8 的时序：taskset 启动后 shell 立即回来，不等子进程
+     *   （affinity 还在跑时用户就接着输入 taskset -p / ps 了）。
+     *   所以这里不带 & 也不 waitpid；& 只作兼容被吃掉。 */
+    (void)background;
 }
 
 /* ---------------------------------------------------------------------
@@ -181,9 +265,13 @@ static void run_command(int argc, char **argv)
     {
         cmd_kill(argc, argv);
     }
+    else if (strcmp(argv[0], "taskset") == 0)
+    {
+        cmd_taskset(argc, argv);
+    }
     else if (strcmp(argv[0], "help") == 0)
     {
-        printf("Commands: ps | clear | exec <task> [args...] [&] | kill <pid> | help\n");
+        printf("Commands: ps | clear | exec <task> [args...] [&] | kill <pid> | taskset ... | help\n");
     }
     else
     {

@@ -30,6 +30,10 @@ int  sys_getchar(void);
 pid_t  sys_exec(int id, int argc, uint64_t arg0, uint64_t arg1, uint64_t arg2);
 #else
 pid_t  sys_exec(char *name, int argc, char **argv);
+/* P3 任务4：核亲和（taskset）。sys_exec_mask 的第 4 参 = 掩码（0=继承父）；
+ *   sys_set_affinity 改已存在进程的掩码，成功返回非 0。 */
+pid_t  sys_exec_mask(char *name, int argc, char **argv, uint64_t mask);
+int    sys_set_affinity(pid_t pid, uint64_t mask);
 #endif
 
 void sys_exit(void);

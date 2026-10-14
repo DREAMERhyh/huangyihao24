@@ -84,6 +84,11 @@ typedef struct pcb
      * ★ 槽位空闲的判据：name[0] == '\0'（pcb[] 静态零初始化天然如此）。 */
     char name[TASK_NAME_LEN];
 
+    /* P3 任务4：核亲和掩码——bit i = 允许在第 i 号核上运行。
+     *   exec 默认继承父进程；taskset 可启动时指定、或对已存在进程修改。
+     *   调度器 pick_next 只从"掩码允许本核"的任务里挑（见 sched.c）。 */
+    uint64_t cpu_mask;
+
     /* BLOCK | READY | RUNNING */
     task_status_t status;
 
@@ -141,11 +146,14 @@ void do_set_sche_workload(int workload);
 #ifdef S_CORE
 extern pid_t do_exec(int id, int argc, uint64_t arg0, uint64_t arg1, uint64_t arg2);
 #else
-extern pid_t do_exec(char *name, int argc, char *argv[]);
+/* 任务4：第 4 参 = 核亲和掩码（0 = 继承父进程；taskset 启动时传非 0） */
+extern pid_t do_exec(char *name, int argc, char *argv[], uint64_t mask);
 #endif
 extern void do_exit(void);
 extern int do_kill(pid_t pid);
 extern int do_waitpid(pid_t pid);
+/* 任务4：修改已存在进程的核亲和掩码，成功返回 1（找不到进程返回 0） */
+extern int do_taskset_p(pid_t pid, uint64_t mask);
 extern void do_process_show();
 extern pid_t do_getpid();
 /* shell 的串口轮询：读一个字符，无输入返回 -1（P3 任务1 加） */

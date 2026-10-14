@@ -39,4 +39,7 @@
 /* P2 任务5 的自适应调度上报：P3 号表占用了 43，原 43 挪到 56（P3 最大号 55） */
 #define SYSCALL_SET_WORKLOAD 56
 
+/* P3 任务4：修改进程的核亲和掩码（与内核侧 asm/unistd.h 同号） */
+#define SYSCALL_TASKSET 57
+
 #endif

@@ -33,6 +33,7 @@ void smp_init()
     pid0_pcb[1].pid = 0;
     pid0_pcb[1].kernel_sp = SECONDARY_TRAP_STACK;
     pid0_pcb[1].user_sp = SECONDARY_TRAP_STACK;
+    pid0_pcb[1].cpu_mask = CPU_MASK_ALL;
     /* 从核还没启动（等 wakeup_other_hart），它的 idle 先标为 BLOCKED；
      *   从核自己在 main 的从核路径里置 RUNNING。单核模式下它一直
      *   BLOCKED，ps 里如实反映"这核没在跑"。 */

@@ -39,4 +39,8 @@
 /* P2 任务5 的自适应调度上报：P3 号表占用了 43，原 43 挪到 56（P3 最大号 55） */
 #define SYSCALL_SET_WORKLOAD 56
 
+/* P3 任务4：修改已存在进程的核亲和掩码（taskset -p mask pid）。
+ * 任务书未给号，自定 57（避让 P3 官方全部号段）。 */
+#define SYSCALL_TASKSET 57
+
 #endif

@@ -23,7 +23,8 @@ pcb_t pid0_pcb[NR_CPUS] = {
     {
         .pid = 0,
         .kernel_sp = (ptr_t)pid0_stack,
-        .user_sp = (ptr_t)pid0_stack
+        .user_sp = (ptr_t)pid0_stack,
+        .cpu_mask = CPU_MASK_ALL,   /* 任务4：idle 不受亲和性过滤（它不走 pick_next） */
     },
 };
 /* 每核"正在运行"的 PCB（do_scheduler 在大锁内维护，见 sched.h 注释） */
@@ -77,16 +78,40 @@ void do_set_sche_workload(int workload)
  *   即"每格耗时不超过大约 8 个时间片（≈30ms）"的慢机都能被拉平。 */
 #define WL_RUN_MAX 8
 
+/* P3 任务4：任务是否允许在本核（cpu）上运行。
+ *   亲和掩码的约定：bit(cpu) == 1 才允许。掩码为 0 的进程谁都跑不了，
+ *   永远留在就绪队列里（壳里不允许构造出这种状态：taskset 传入的
+ *   掩码由 shell 检查非 0；exec 继承来的至少有一个核）。 */
+static int cpu_allows(pcb_t *t, int cpu)
+{
+    return (t->cpu_mask >> cpu) & 1UL;
+}
+
+/* 从全局就绪队列里挑下一个跑的任务（队首 RR + 任务5 的 pick-min）。
+ *   返回 NULL：队列为空、或队列里的任务掩码都不允许本核——由调用者
+ *   让本核 idle 怠速。 */
 static pcb_t *pick_next(void)
 {
-    pcb_t *head = list_entry(ready_queue.next, pcb_t, list);
+    int cpu = get_current_cpu_id();
+    pcb_t *best = 0;
 
-    if (!head->has_wl)
-        return head;
-
-    pcb_t *best = head;
-    for (list_node_t *n = head->list.next; n != &ready_queue; n = n->next) {
+    /* 取"第一个掩码允许本核"的任务当候选（等价于原来"选队首"的 RR 语义） */
+    for (list_node_t *n = ready_queue.next; n != &ready_queue; n = n->next) {
         pcb_t *t = list_entry(n, pcb_t, list);
+        if (cpu_allows(t, cpu)) {
+            best = t;
+            break;
+        }
+    }
+
+    if (best == 0 || !best->has_wl)
+        return best;                        /* 没候选或普通任务：直接选它 */
+
+    /* 任务5 自适应：在"允许本核"的任务之间挑飞得最少的（配额防饿死） */
+    for (list_node_t *n = best->list.next; n != &ready_queue; n = n->next) {
+        pcb_t *t = list_entry(n, pcb_t, list);
+        if (!cpu_allows(t, cpu))
+            continue;
         if (!t->has_wl || t->wl_run >= WL_RUN_MAX)
             continue;                       /* 配额用尽：退回普通轮转 */
         if (t->wl_cols < best->wl_cols)
@@ -135,13 +160,16 @@ void do_scheduler(void)
         prev->status = TASK_BLOCKED;
     }
 
-    pcb_t *next;
-    if (!list_empty(&ready_queue)) {
-        // TODO: [p2-task1] Modify the current_running pointer.
-        next = pick_next();            /* 任务5：飞得最少的先飞；普通任务照旧拿队首 */
+    pcb_t *next = 0;
+    if (!list_empty(&ready_queue))
+        next = pick_next();            /* 任务5：飞得最少的先飞；任务4：只挑允许本核的 */
+
+    if (next != 0) {
         list_del(&next->list);
     } else if (prev != idle) {
-        next = idle;                   /* 兜底：所有任务都阻塞了，让本核内核上场怠速 */
+        /* 本核没活干（队列空，或里面全是"掩码不含本核"的任务）→ 本核怠速。
+         * 那些任务留给别的核：全局就绪队列 + 按掩码过滤天然支持跨核迁移。 */
+        next = idle;
     } else {
         next = prev;                   /* 已经在怠速且没别的事，继续 */
     }

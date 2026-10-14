@@ -3,6 +3,10 @@
 
 #define NR_CPUS 2
 
+/* P3 任务4：核亲和掩码的"全允许"值（低 NR_CPUS 位全 1）。
+ *   idle 任务与初始进程用它；新进程默认继承父进程的掩码。 */
+#define CPU_MASK_ALL ((1UL << NR_CPUS) - 1)
+
 /* P3 任务3：从核的两张固定栈（与 arch/riscv/kernel/head.S 同一字面量；
  * bootblock.S 的 secondary 段用 0x50301000 作为其启动栈）。
  * 选址避开一切已用内存：0x50_2xxx_xxxx 内核镜像、0x504F-0x5050 主核

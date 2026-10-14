@@ -222,7 +222,7 @@ static void init_pcb_stack(ptr_t kernel_stack, ptr_t user_stack,
  *   成功返回新进程 pid（≥1），失败返回 0（题目约定）。
  * ===================================================================== */
 #ifndef S_CORE
-pid_t do_exec(char *name, int argc, char **argv)
+pid_t do_exec(char *name, int argc, char **argv, uint64_t mask)
 {
     if (name == 0 || argc < 0 || argc > EXEC_MAX_ARGC)
         return 0;
@@ -273,6 +273,10 @@ pid_t do_exec(char *name, int argc, char **argv)
     task->kernel_stack_base = kstack_base;
     task->user_stack_base = ustack_base;
     task->status = TASK_READY;
+    /* P3 任务4：核亲和掩码。taskset 启动时显式给（mask != 0）；
+     *   否则继承父进程——affinity 的 5 个 test_affinity 子任务
+     *   正是靠继承拿到 taskset 指定的掩码。 */
+    task->cpu_mask = (mask != 0) ? mask : current_running->cpu_mask;
     task->cursor_x = 0;
     task->cursor_y = 0;
     task->wakeup_time = 0;
@@ -403,21 +407,79 @@ static const char *task_status_str(task_status_t st)
 
 void do_process_show(void)
 {
-    printk("PID  NAME              STATUS\n");
-    printk("%3d  %16s  %s\n", 0, "idle", task_status_str(pid0_pcb[0].status));
-    printk("%3d  %16s  %s\n", 0, "idle", task_status_str(pid0_pcb[1].status));
+    /* 输出格式对齐官方参考图（任务书图 P3-8）：
+     *   [Process Table]:
+     *   [i] PID : n  STATUS : RUNNING mask: 0x3 Running on core 1
+     * 细节：
+     *   · [i] 从 0 起的行号；不列 idle（官图没有）；EXITED 的进程如实列出；
+     *   · STATUS 域定宽 7（RUNNING/BLOCKED 满宽，READY 补 3 空格——与官图
+     *     "READY   mask" 的对齐一致）；
+     *   · mask 小写十六进制（0x3 / 0x1）；
+     *   · "Running on core N" 只对 RUNNING 打，N 从 core_running[] 反查
+     *     （RUNNING 的任务必然只被它所在核登记）。 */
+    printk("[Process Table]:\n");
 
+    int row = 0;
     for (int i = 0; i < NUM_MAX_TASK; ++i) {
         if (pcb[i].name[0] == '\0')
             continue;
-        printk("%3d  %16s  %s\n", pcb[i].pid, pcb[i].name,
-               task_status_str(pcb[i].status));
+
+        int core = -1;
+        if (pcb[i].status == TASK_RUNNING) {
+            for (int c = 0; c < NR_CPUS; ++c) {
+                if (core_running[c] == &pcb[i]) {
+                    core = c;
+                    break;
+                }
+            }
+        }
+
+        /* 状态列定宽 7（READY 右补 3 空格与官图对齐）——内核 printk
+         *   只认 %s/%d/%x 等基本转换、没有 %-7s 宽度修饰，手工补空格。 */
+        char st[8];
+        const char *ss = task_status_str(pcb[i].status);
+        int n = 0;
+        while (ss[n] != '\0' && n < 7) {
+            st[n] = ss[n];
+            ++n;
+        }
+        while (n < 7)
+            st[n++] = ' ';
+        st[n] = '\0';
+
+        printk("[%d] PID : %d  STATUS : %s mask: 0x%lx",
+               row, pcb[i].pid, st, pcb[i].cpu_mask);
+        if (core >= 0)
+            printk(" Running on core %d", core);
+        printk("\n");
+
+        ++row;
     }
 }
 
 pid_t do_getpid(void)
 {
     return current_running->pid;
+}
+
+/* =====================================================================
+ * 任务4：taskset -p <mask> <pid> 的内核实现
+ *   改已存在进程的亲和掩码。改完不需要立刻搬人：若目标正跑在
+ *   "不合掩码"的核上，当前时间片照跑；下次调度它被放回【全局】就绪
+ *   队列后，只有掩码允许的核会从队列里挑走它——跨核迁移自然发生。
+ *   拒绝 mask==0：没有核能跑的进程等于永久挂死（也不接受 0x0 输入）。
+ * ===================================================================== */
+int do_taskset_p(pid_t pid, uint64_t mask)
+{
+    if (mask == 0)
+        return 0;
+
+    pcb_t *task = find_pcb_by_pid(pid);
+    if (task == 0 || is_idle_pcb(task))
+        return 0;               /* 找不到进程，或想改 idle（不许） */
+
+    task->cpu_mask = mask;
+    return 1;
 }
 
 /* shell 轮询串口读一个字符；无输入时 BIOS 返回 -1 */

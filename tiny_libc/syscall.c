@@ -109,6 +109,21 @@ pid_t  sys_exec(char *name, int argc, char **argv)
     return (pid_t)invoke_syscall(SYSCALL_EXEC, (long)name, (long)argc,
                                  (long)argv, IGNORE, IGNORE);
 }
+
+/* 任务4：以指定核亲和掩码启动（taskset <mask> <name> 走这条；
+ *   普通 exec 的封装把第 4 参传 0 = 内核侧继承父进程掩码） */
+pid_t  sys_exec_mask(char *name, int argc, char **argv, uint64_t mask)
+{
+    return (pid_t)invoke_syscall(SYSCALL_EXEC, (long)name, (long)argc,
+                                 (long)argv, (long)mask, IGNORE);
+}
+
+/* 任务4：修改已存在进程的核亲和掩码（taskset -p <mask> <pid>） */
+int  sys_set_affinity(pid_t pid, uint64_t mask)
+{
+    return (int)invoke_syscall(SYSCALL_TASKSET, (long)pid, (long)mask,
+                               IGNORE, IGNORE, IGNORE);
+}
 #endif
 
 void sys_exit(void)

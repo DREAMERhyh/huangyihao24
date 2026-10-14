@@ -111,7 +111,7 @@ static void init_pcb(void)
     // P3 任务1：内核初始化完成后，直接启动 shell，让它作为 pid 号为 1 的
     //   第一个用户态进程（任务书约定）。shell 负责从串口读命令、用 exec
     //   启动所有其余任务——内核不再提供"选任务"的交互界面。
-    pid_t shell_pid = do_exec("shell", 0, 0);
+    pid_t shell_pid = do_exec("shell", 0, 0, 0);   /* 掩码 0 = 继承 idle 的全核掩码 */
     assert(shell_pid == 1);
 }
 
@@ -155,6 +155,9 @@ static void init_syscall(void)
     syscall[SYSCALL_PS]           = (long (*)())do_process_show;
     syscall[SYSCALL_GETPID]       = (long (*)())do_getpid;
     syscall[SYSCALL_READCH]       = (long (*)())do_getchar;
+
+    // P3 任务4：taskset -p（改进程核亲和掩码）
+    syscall[SYSCALL_TASKSET]      = (long (*)())do_taskset_p;
 }
 /************************************************************/
 
