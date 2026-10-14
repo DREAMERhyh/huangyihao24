@@ -15,6 +15,8 @@
 main:
 	// fence on all memory and I/O
 	fence
+    // a0 is mhartid
+	bnez a0, secondary
 
 	// 任务1：调用 BIOS 的 bios_putstr 打印 bootblock 标志串
 	//   调用约定：a0 = 字符串首地址，a7 = 功能号，然后跳转到 bios_func_entry
@@ -69,7 +71,17 @@ read_done:
 	jal   kernel
 
 	/************************************************************/
-	/* Do not touch this comment. Reserved for future projects. */
+secondary:
+	/* TODO [P3-task3]: 
+	 * 1. Mask all interrupts
+	 * 2. let stvec pointer to kernel_main
+	 * 3. enable software interrupt for ipi
+	 */
+
+wait_for_wakeup:
+	wfi
+	j wait_for_wakeup
+
 	/************************************************************/
 // while(1) --> stop here
 stop:

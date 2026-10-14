@@ -20,7 +20,21 @@ typedef enum {
     MUTEX_ACQ,
     MUTEX_RELEASE,
     SCREEN_REFLUSH,     /* 任务1：与内核侧 include/os/kernel.h 的枚举**必须同序** */
-    NUM_ENTRIES
+    NUM_ENTRIES,
+    /* P3 框架预留项（与内核侧保持同序；当前所有服务都走 ecall，
+     * 这些项不经过跳转表调用，保留仅为与 upstream 结构一致） */
+    WRITE,
+    CLEAR,
+    REFLUSH,
+    EXEC,
+    EXIT,
+    KILL,
+    WAITPID,
+    PS,
+    GETPID,
+    BARRIER_INIT,
+    BARRIER_WAIT,
+    BARRIER_DESTROY
 } jmptab_idx_t;
 
 

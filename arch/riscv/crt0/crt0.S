@@ -29,7 +29,7 @@ clear_done:
     call  main
 
     /************************************************************/
-    /* Do not touch this comment. Reserved for future projects. */
+    /* TODO: [P3] call sys_exit */
     /************************************************************/
 // while(1) loop, unreachable here
 loop:

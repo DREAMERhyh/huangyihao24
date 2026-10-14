@@ -2,7 +2,7 @@
 # Project Information
 # -----------------------------------------------------------------------
 
-PROJECT_IDX	= 2
+PROJECT_IDX	= 3
 
 # -----------------------------------------------------------------------
 # Host Linux Variables
@@ -52,6 +52,7 @@ QEMU_OPTS       = -nographic -machine virt -m 256M -kernel $(UBOOT) -bios none \
                      -monitor telnet::45454,server,nowait -serial mon:stdio \
                      -D $(QEMU_LOG_FILE) -d oslab
 QEMU_DEBUG_OPT  = -s -S
+QEMU_SMP_OPT	= -smp 2
 
 # -----------------------------------------------------------------------
 # UCAS-OS Entrypoints and Variables
@@ -100,7 +101,12 @@ SRC_LIBC    = $(wildcard ./tiny_libc/*.c)
 OBJ_LIBC    = $(patsubst %.c, %.o, $(foreach file, $(SRC_LIBC), $(DIR_BUILD)/$(notdir $(file))))
 LIB_TINYC   = $(DIR_BUILD)/libtinyc.a
 
-SRC_USER    = $(sort $(wildcard $(DIR_TEST_PROJ)/*.c))
+# P3：shell 在 test/ 下（不在 test_project3/），单独列出；
+# fly 留在 test_project2/ 下不动（任务5 细粒度锁实验的干扰负载），
+# 用 $(sort) 固定 app 名单顺序（窗口地址按名字算，见下方 app_addr）。
+SRC_SHELL   = $(DIR_TEST)/shell.c
+SRC_FLY     = $(DIR_TEST)/test_project2/fly.c
+SRC_USER    = $(sort $(SRC_SHELL) $(SRC_FLY) $(wildcard $(DIR_TEST_PROJ)/*.c))
 ELF_USER    = $(patsubst %.c, %, $(foreach file, $(SRC_USER), $(DIR_BUILD)/$(notdir $(file))))
 
 # -----------------------------------------------------------------------
@@ -150,13 +156,19 @@ gdb:
 run:
 	$(QEMU) $(QEMU_OPTS)
 
+run-smp:
+	$(QEMU) $(QEMU_OPTS) $(QEMU_SMP_OPT)
+
 debug:
 	$(QEMU) $(QEMU_OPTS) $(QEMU_DEBUG_OPT)
+
+debug-smp:
+	$(QEMU) $(QEMU_OPTS) $(QEMU_SMP_OPT) $(QEMU_DEBUG_OPT)
 
 minicom:
 	sudo $(MINICOM) -D $(TTYUSB1)
 
-.PHONY: all dirs clean floppy asm gdb run debug minicom
+.PHONY: all dirs clean floppy asm gdb run debug viewlog minicom
 
 # -----------------------------------------------------------------------
 # UCAS-OS Rules
@@ -179,6 +191,15 @@ $(DIR_BUILD)/%.o: $(DIR_TINYLIBC)/%.c
 
 $(DIR_BUILD)/%: $(DIR_TEST_PROJ)/%.c $(OBJ_CRT0) $(LIB_TINYC) riscv.lds
 	$(CC) $(USER_CFLAGS) -o $@ $(OBJ_CRT0) $< $(USER_LDFLAGS) -Wl,--defsym=TEXT_START=$(call app_addr,$*) -T riscv.lds
+
+$(DIR_BUILD)/%: $(DIR_TEST)/%.c $(OBJ_CRT0) $(LIB_TINYC) riscv.lds
+	$(CC) $(USER_CFLAGS) -o $@ $(OBJ_CRT0) $< $(USER_LDFLAGS) -Wl,--defsym=TEXT_START=$(call app_addr,$*) -T riscv.lds
+
+# fly 用静态规则：pattern 规则 $(DIR_TEST)/%.c 与 $(DIR_TEST)/test_project2/%.c
+# 都能匹配 build/fly（stem 同长、取先定义者），歧义行为依赖 make 的规则选择细节，
+# 静态规则没有这层不确定性。
+$(DIR_BUILD)/fly: $(DIR_TEST)/test_project2/fly.c $(OBJ_CRT0) $(LIB_TINYC) riscv.lds
+	$(CC) $(USER_CFLAGS) -o $@ $(OBJ_CRT0) $< $(USER_LDFLAGS) -Wl,--defsym=TEXT_START=$(call app_addr,fly) -T riscv.lds
 
 elf: $(ELF_BOOT) $(ELF_MAIN) $(LIB_TINYC) $(ELF_USER)
 
