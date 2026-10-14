@@ -32,6 +32,7 @@
 #include <type.h>
 #include <os/list.h>
 #include <os/task.h>
+#include <os/smp.h>
 
 #define NUM_MAX_TASK 16
 
@@ -115,8 +116,15 @@ register pcb_t * current_running asm("tp");
 extern pid_t process_id;
 
 extern pcb_t pcb[NUM_MAX_TASK];
-extern pcb_t pid0_pcb;
+/* P3 任务3：每个核一份空转任务（idle）PCB：pid0_pcb[hartid]。
+ *   主核 [0] 的初值见 sched.c；从核 [1] 的形式初值在 smp_init 里填。 */
+extern pcb_t pid0_pcb[NR_CPUS];
 extern const ptr_t pid0_stack;
+
+/* P3 任务3：每核"正在运行"的 PCB（do_scheduler 在大锁内维护）。
+ *   用途：找一个"没有任何核正在使用"的 PCB 槽位来复用（alloc_pcb）。
+ *   本核自己的可以直接读 current_running（tp 寄存器），别的核只能查这里。 */
+extern pcb_t *core_running[NR_CPUS];
 
 extern void switch_to(pcb_t *prev, pcb_t *next);
 void do_scheduler(void);

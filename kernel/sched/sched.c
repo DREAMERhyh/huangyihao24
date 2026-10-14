@@ -17,11 +17,17 @@
 
 pcb_t pcb[NUM_MAX_TASK];
 const ptr_t pid0_stack = INIT_KERNEL_STACK + PAGE_SIZE;
-pcb_t pid0_pcb = {
-    .pid = 0,
-    .kernel_sp = (ptr_t)pid0_stack,
-    .user_sp = (ptr_t)pid0_stack
+/* P3 任务3：每核一份 idle PCB。主核 [0] 用 INIT_KERNEL_STACK 页当"内核空转栈"；
+ *   从核 [1] 的两张固定栈见 smp.h（其形式初值由 smp_init 填）。 */
+pcb_t pid0_pcb[NR_CPUS] = {
+    {
+        .pid = 0,
+        .kernel_sp = (ptr_t)pid0_stack,
+        .user_sp = (ptr_t)pid0_stack
+    },
 };
+/* 每核"正在运行"的 PCB（do_scheduler 在大锁内维护，见 sched.h 注释） */
+pcb_t *core_running[NR_CPUS];
 
 LIST_HEAD(ready_queue);
 LIST_HEAD(sleep_queue);
@@ -106,6 +112,7 @@ void do_scheduler(void)
      *   被换下场的任务如果还活着（RUNNING），就排到就绪队列尾部再等下一轮；
      *   已经被阻塞/退出的任务由 do_block 等自己摘掉，这里不再放回。 */
     pcb_t *prev = current_running;
+    pcb_t *idle = &pid0_pcb[get_current_cpu_id()];   /* 本核的空转任务 */
 
     /* ★ pid0（内核空转）不参与轮转：它只是"没别的任务可跑"时的兜底。
      *   让它跟着轮转有两个害处：
@@ -118,10 +125,10 @@ void do_scheduler(void)
      *   所以下面只在就绪队列空的时候把它拎出来怠速。
      *   （用 `-icount shift=3,sleep=off` 把时间基准换成指令数后，偏差为 0.006%，
      *   证明调度本身是公平的，问题出在"墙钟时间基准 + 宿主超载"。） */
-    if (prev->status == TASK_RUNNING && prev != &pid0_pcb) {
+    if (prev->status == TASK_RUNNING && prev != idle) {
         prev->status = TASK_READY;
         list_add_tail(&prev->list, &ready_queue);
-    } else if (prev == &pid0_pcb) {
+    } else if (prev == idle) {
         /* 怠速任务平时就标成"不可运行"。严格说这是借用了 BLOCKED 的语义
          * （它不是被谁阻塞，只是没活干）——今天没有副作用，但将来若加
          * ps/kill/wait 这类"按 status 扫全部 PCB"的功能，要记得把 pid0 排除。 */
@@ -133,20 +140,28 @@ void do_scheduler(void)
         // TODO: [p2-task1] Modify the current_running pointer.
         next = pick_next();            /* 任务5：飞得最少的先飞；普通任务照旧拿队首 */
         list_del(&next->list);
-    } else if (prev != &pid0_pcb) {
-        next = &pid0_pcb;              /* 兜底：所有任务都阻塞了，让内核上场怠速 */
+    } else if (prev != idle) {
+        next = idle;                   /* 兜底：所有任务都阻塞了，让本核内核上场怠速 */
     } else {
         next = prev;                   /* 已经在怠速且没别的事，继续 */
     }
 
     next->status = TASK_RUNNING;
     current_running = next;
+    core_running[get_current_cpu_id()] = next;   /* 每核 current_running 表（PCB 复用要查） */
 
     /* 时间片统一为 1/4 个时钟节拍——绝不为 0，飞机不会"停下"。 */
     bios_set_timer(get_ticks() + SLICE_LEN);
 
     // TODO: [p2-task1] switch_to current_running
+    /* P3 任务3：大内核锁在"切换缝隙"里交接（与 entry.S 的 new_task_entry、
+     *   trap 入口/出口的 lock/unlock 共同维持不变式，详见 kernel/smp/smp.c）：
+     *   · unlock 后本执行流处于"不持锁"状态，另一核才能进内核；
+     *   · 被切回的老任务从 switch_to 之后继续（重新 lock）；
+     *   · 新任务从 new_task_entry 进（那里先 lock 再走 ret_from_exception）。 */
+    unlock_kernel();
     switch_to(prev, next);
+    lock_kernel();
 }
 
 void do_sleep(uint32_t sleep_time)

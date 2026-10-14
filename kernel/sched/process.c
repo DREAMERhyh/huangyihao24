@@ -11,6 +11,8 @@
 #include <assert.h>
 
 extern void ret_from_exception();
+/* P3 任务3：新任务的首次上场入口（entry.S）——先补拿大内核锁再走公共返回路径 */
+extern void new_task_entry();
 
 /* =====================================================================
  * P3 任务1：进程管理（exec / exit / kill / waitpid / ps / getpid）
@@ -61,13 +63,29 @@ static void task_stack_free(ptr_t base, int is_kernel)
 
 /* ---------------------------------------------------------------------
  * PCB 定位 / 分配 */
+static int is_idle_pcb(pcb_t *t)
+{
+    return t >= &pid0_pcb[0] && t < &pid0_pcb[NR_CPUS];
+}
+
 static pcb_t *find_pcb_by_pid(pid_t pid)
 {
     if (pid == 0)
-        return &pid0_pcb;
+        return &pid0_pcb[get_current_cpu_id()];   /* pid0：返回本核的 idle */
     for (int i = 0; i < NUM_MAX_TASK; ++i) {
         if (pcb[i].name[0] != '\0' && pcb[i].pid == pid)
             return &pcb[i];
+    }
+    return 0;
+}
+
+/* 是否有任何核"正在使用"这个 PCB（被切出中的任务状态可能已是 EXITED，
+ *   但它的现场还在核上被 switch_to 引用，不能回收复用） */
+static int on_any_cpu(pcb_t *t)
+{
+    for (int c = 0; c < NR_CPUS; ++c) {
+        if (core_running[c] == t)
+            return 1;
     }
     return 0;
 }
@@ -80,13 +98,12 @@ static pcb_t *alloc_pcb(void)
             return &pcb[i];
     }
 
-    /* ② 池满：复用"已经退出、没人还在 wait 它"的 PCB。
+    /* ② 池满：复用"已经退出、没人还在 wait 它、且不在任何核上被使用"的 PCB。
      *   数组顺序即近似 FIFO，优先复用最早退出的——刚退出的先留存一会儿，
-     *   给 waitpid 留出观察窗口。
-     *   TODO(任务3)：多核下要排除"别的核正在运行"的 PCB（每核 current_running）。 */
+     *   给 waitpid 留出观察窗口。多核下用 core_running[] 排除全部核。 */
     for (int i = 0; i < NUM_MAX_TASK; ++i) {
         if (pcb[i].status == TASK_EXITED && list_empty(&pcb[i].wait_list)
-            && &pcb[i] != current_running)
+            && !on_any_cpu(&pcb[i]))
             return &pcb[i];
     }
 
@@ -189,7 +206,9 @@ static void init_pcb_stack(ptr_t kernel_stack, ptr_t user_stack,
     switchto_context_t *pt_switchto =
         (switchto_context_t *)((ptr_t)pt_regs - sizeof(switchto_context_t));
 
-    pt_switchto->regs[0] = (reg_t)ret_from_exception;   /* ra */
+    /* P3 任务3：新任务首次上场不走 switch_to 的返回点（那里有"重拿大锁"），
+     *   所以伪造的 ra 指向 new_task_entry：先补 lock 再走公共返回路径。 */
+    pt_switchto->regs[0] = (reg_t)new_task_entry;       /* ra */
     pt_switchto->regs[1] = (reg_t)pt_regs;              /* sp → 陷阱帧 */
     for (int i = 2; i < 14; ++i)
         pt_switchto->regs[i] = 0;
@@ -311,7 +330,7 @@ int do_kill(pid_t pid)
 {
     pcb_t *task = find_pcb_by_pid(pid);
 
-    if (task == 0 || task == &pid0_pcb || task->status == TASK_EXITED)
+    if (task == 0 || is_idle_pcb(task) || task->status == TASK_EXITED)
         return 0;
 
     /* ① 替它释放持有的互斥锁 */
@@ -385,7 +404,8 @@ static const char *task_status_str(task_status_t st)
 void do_process_show(void)
 {
     printk("PID  NAME              STATUS\n");
-    printk("%3d  %16s  %s\n", 0, "idle", task_status_str(pid0_pcb.status));
+    printk("%3d  %16s  %s\n", 0, "idle", task_status_str(pid0_pcb[0].status));
+    printk("%3d  %16s  %s\n", 0, "idle", task_status_str(pid0_pcb[1].status));
 
     for (int i = 0; i < NUM_MAX_TASK; ++i) {
         if (pcb[i].name[0] == '\0')

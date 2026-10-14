@@ -4,6 +4,7 @@
 #include <os/loader.h>
 #include <os/irq.h>
 #include <os/sched.h>
+#include <os/smp.h>
 #include <os/lock.h>
 #include <os/kernel.h>
 #include <os/task.h>
@@ -102,8 +103,10 @@ static void init_pcb(void)
     // 内核自己也得有个 PCB：调度、屏幕光标等都是经由 current_running 访问的。
     //   pid0 是内核的空转任务，初始置 RUNNING 只为对齐 current_running；它不参与
     //   轮转、也不进就绪队列，只在就绪队列为空时被拎回来怠速（睡眠唤醒靠它的时钟中断）。
-    current_running = &pid0_pcb;
-    pid0_pcb.status = TASK_RUNNING;
+    //   P3 任务3：pid0_pcb 每核一份，主核用 [0]；core_running[] 同步登记。
+    current_running = &pid0_pcb[0];
+    core_running[0] = &pid0_pcb[0];
+    pid0_pcb[0].status = TASK_RUNNING;
 
     // P3 任务1：内核初始化完成后，直接启动 shell，让它作为 pid 号为 1 的
     //   第一个用户态进程（任务书约定）。shell 负责从串口读命令、用 exec
@@ -142,8 +145,37 @@ static void init_syscall(void)
 
 int main(void)
 {
+    /* P3 任务3：从核（mhartid != 0）走从核路径。
+     *   主核已完成全部全局初始化（BSS/任务表/锁/异常/屏幕），从核只做
+     *   本核必要设置：陷阱入口、陷阱栈、自己的 idle PCB、第一个时钟，
+     *   然后进 idle 循环——时钟中断会把它带进 do_scheduler 开始参与调度。
+     *   顺序要点：先关 sie（防 bootblock 阶段的挂起软中断在 stvec 未换前
+     *   再 trap 进 _start）、再备 sscratch、再 setup_exception（它开 SIE，
+     *   但此刻 sie=0 无中断可来）、备 timer，最后 enable_preempt 放开一切。 */
+    if (get_current_cpu_id() != 0) {
+        asm volatile("csrw sie, zero");
+        asm volatile("csrw sscratch, %0" ::"r"(SECONDARY_TRAP_STACK));
+        setup_exception();              /* stvec = 陷阱入口；sstatus.SIE = 1 */
+        current_running = &pid0_pcb[1];
+        core_running[1] = &pid0_pcb[1];
+        pid0_pcb[1].status = TASK_RUNNING;
+        printl("[SMP] hart %d idle ready, entering scheduler loop\n",
+               get_current_cpu_id());
+        bios_set_timer(get_ticks() + TIMER_INTERVAL);
+        enable_preempt();               /* sie 全开：从核时钟开始节拍 */
+        while (1)
+            asm volatile("wfi");
+    }
+
     // Init jump table provided by kernel and bios(ΦωΦ)
     init_jmptab();
+
+    /* P3 任务3 验收证据（任务书 5.1：两个核都要进入内核 main）。
+     *   走 printl（QEMU -D 日志，不依赖 current_running、不会被屏幕覆盖）。
+     *   ★ 必须等 init_jmptab 之后：printl 经 call_jmptab(QEMU_LOGGING)
+     *   查跳转表，表未填就 jalr 0（踩过）。从核的 printl（见从核路径）
+     *   天然安全：主核填表后才写标志唤醒它。 */
+    printl("[SMP] hart %d entered kernel main\n", get_current_cpu_id());
 
     // Init task information from bootblock-passed AppInfo (〃'▽'〃)
     init_task_info();
@@ -158,6 +190,10 @@ int main(void)
     // Init lock mechanism o(´^｀)o
     init_locks();
     printk("> [INIT] Lock mechanism initialization succeeded.\n");
+
+    // Init SMP（大内核锁 + 从核 idle PCB 的形式初值）(๑•̀ㅂ•́)و✧
+    smp_init();
+    printk("> [INIT] SMP initialization succeeded.\n");
 
     // Init interrupt (^_^)
     init_exception();
@@ -189,6 +225,10 @@ int main(void)
     //    （内核态由 setup_exception 打开，用户态由 sret 按陷阱帧的 SPIE 恢复），
     //    所以中断立刻就会来——抢占模式下的"第一次调度"就由这次时钟中断发起。
     enable_preempt();
+
+    // P3 任务3：全部初始化完毕，唤醒从核（写唤醒标志；从核在 bootblock
+    //   自旋轮询到后直接跳 head.S 从核入口 → main 从核路径 → 参与全局调度）
+    wakeup_other_hart();
 
     // Infinite while loop, where CPU stays in a low-power state (QAQQQQQQQQQQQ)
     while (1)

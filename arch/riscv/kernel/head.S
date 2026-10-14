@@ -8,11 +8,30 @@
 
 #define KERNEL_STACK		0x50500000
 
+/* P3 任务3：从核的两张固定栈（避开所有已用内存区：
+ *   0x50000000-0x50200000 U-Boot/bios、0x50200000-0x50228800 内核镜像、
+ *   0x504Fxxxx-0x5050xxxx 主核内核栈/mm 动态区、0x52... app 窗口）
+ *   · BootStack  —— head.S 从核分支 → main 从核路径 → idle wfi 循环
+ *   · TrapStack  —— 从核的陷阱栈（sscratch），与主核"陷阱栈"对应
+ *   bootblock.S 的 secondary 段用同一字面量 0x50301000 作为启动栈。 */
+#define SECONDARY_BOOT_STACK	0x50301000
+#define SECONDARY_TRAP_STACK	0x50302000
+
 .section ".entry_function","ax"
 ENTRY(_start)
   /* Mask all interrupts */
   csrw CSR_SIE, zero
   csrw CSR_SIP, zero
+
+  /* P3 任务3：从核（mhartid != 0）走独立入口。
+   *   从核是被主核 IPI 唤醒后 trap 到这里的，此刻：
+   *     ① 内核 BSS 已由主核清过并正在使用，从核【绝不能】再清；
+   *     ② a0~a2 是 trap 时的寄存器残值，不是 bootblock 的引导参数，
+   *        不能写进 boot_appinfo_off 等全局量。
+   *   从核只需建立自己的 C 运行环境（独立启动栈）后进 main，
+   *   由 main 的从核分支做本核设置。 */
+  csrr  t0, CSR_MHARTID
+  bnez  t0, SecondaryStart
 
   /* 任务2：清零 BSS 段
    *   起止地址取自 riscv.lds 定义的符号 __bss_start 与 __BSS_END__，
@@ -49,5 +68,19 @@ clear_done:
 loop:
   wfi
   j loop
+
+/* P3 任务3：从核入口——跳过 BSS/引导参数，用独立栈进 main。
+ *   此时处于"被 IPI trap 进 S 态"的上下文：sepc=wfi 的 PC、scause=软中断，
+ *   但 main 的从核分支不返回（进 idle 循环），不依赖任何 trap 返回路径。 */
+SecondaryStart:
+  /* 消费掉唤醒用的 S 态软中断：U-Boot 转发过来的 mip.SSIP 在 trap 进入后
+   * 仍是挂起位（硬件不自动清）。现在不清，等 main 从核路径
+   * enable_preempt() 重开 SSIE 时会触发一次"幽灵 trap"。 */
+  csrw  CSR_SIP, zero
+  li    sp, SECONDARY_BOOT_STACK
+  call  main
+1:
+  wfi
+  j 1b
 
 END(_start)

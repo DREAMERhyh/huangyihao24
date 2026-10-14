@@ -72,15 +72,42 @@ read_done:
 
 	/************************************************************/
 secondary:
-	/* TODO [P3-task3]: 
-	 * 1. Mask all interrupts
-	 * 2. let stvec pointer to kernel_main
-	 * 3. enable software interrupt for ipi
-	 */
+	/* [P3-task3] 从核启动路径（U-Boot mret 时 a0=mhartid 非 0 即到此）。
+	 *   从核在此【自旋轮询】主核的"初始化完成"内存标志，读到后直接
+	 *   跳内核入口 _start（head.S 用 mhartid 分出从核分支接管）。
+	 *
+	 *   ★ 为什么不用 IPI 唤醒（踩坑记录，试过三种死法）：
+	 *   · 主核 send_ipi 经 U-Boot 发出的是 CLINT MSIP（M 态软中断），
+	 *     U-Boot 的 M 态 trap 有"MSIP→SSIP 转发"（interrupts.c 的
+	 *     IRQ_M_SOFT 分支），但 MSIP 要进 M 态 trap 需要 mstatus.MIE=1；
+	 *   · 而从核由 U-Boot 的 enter_supervisor_mode mret 进来，MPIE 被
+	 *     置 0（→MIE=0），【S 态无权改 MIE】：写 mie/mstatus 是非法
+	 *     指令（实测 epc=5020007c 炸进 U-Boot 的 hang）。
+	 *   即"到得了的使能位改不了（S 态），改得了的门触发不了（M 态）"。
+	 *   内存标志没有特权级/使能门依赖，且 QEMU 多核内存一致，
+	 *   是最可靠的核间唤醒通道。
+	 *
+	 *   1. 清中断环境（都是 S 态 CSR）：从核不指望任何中断，纯自旋 */
+	csrw  sie, zero
+	csrw  sip, zero
+	csrci sstatus, 2          /* 清 SR_SIE */
 
+	/*   2. 独立启动栈（任务书 5.1：主从核栈空间必须相互独立；
+	 *   与 head.S 的 SECONDARY_BOOT_STACK 同一字面量）。
+	 *   本段只用寄存器（jal 写 ra），不压栈，设上是防御性。 */
+	li    sp, 0x50301000
+
+	/*   3. 轮询唤醒标志（主核在全部初始化完成后写 1 并 fence，
+	 *   见 kernel/smp/smp.c 的 wakeup_other_hart 与 smp.h 的
+	 *   SMP_WAKEUP_ADDR——同一字面量）。 */
 wait_for_wakeup:
-	wfi
-	j wait_for_wakeup
+	li    t0, 0x50300000
+	ld    t1, 0(t0)
+	beqz  t1, wait_for_wakeup
+	fence
+
+	/*   4. 跳内核入口 _start（与主核的 jal kernel 同一路径） */
+	jal   kernel
 
 	/************************************************************/
 // while(1) --> stop here

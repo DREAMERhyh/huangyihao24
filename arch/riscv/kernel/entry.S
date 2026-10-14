@@ -200,15 +200,33 @@ ENTRY(ret_from_exception)
   /* HINT: remember to check your sp, does it point to the right address? */
   /* 任务3：进 here 时 sp 指向本任务内核栈上的 traps 帧（可能是刚从 sret
    *   返回用户态前的最后一站，也可以是新任务第一次被调度的终点：新任务的
-   *   switch_to 现场里 ra 就被伪造成了 ret_from_exception）。 */
+   *   switch_to 现场里 ra 就被伪造成了 new_task_entry → 补锁后跳到这里）。 */
+  /* P3 任务3：出内核前释放大内核锁（与 trap 入口 / new_task_entry 的
+   *   lock 配对，维持"内核中执行 ⇒ 持锁"的不变式）。
+   *   放在 RESTORE 之前：jal 不压栈；unlock_kernel 自己的栈帧压在陷阱帧
+   *   基址【之下】（本任务内核栈的保留区），不碰陷阱帧。 */
+  jal  unlock_kernel
   RESTORE_CONTEXT
   sret
 ENDPROC(ret_from_exception)
+
+/* P3 任务3：新任务的第一次上场入口（init_pcb_stack 伪造的 ra）。
+ *   老任务被切回时从 switch_to 的返回点继续（do_scheduler 里那里有
+ *   lock_kernel()）；新任务不经过那里，在这里补上同一个 lock。 */
+ENTRY(new_task_entry)
+  jal  lock_kernel
+  j    ret_from_exception
+ENDPROC(new_task_entry)
 
 ENTRY(exception_handler_entry)
 
   /* TODO: [p2-task3] save context via the provided macro */
   SAVE_CONTEXT
+
+  /* P3 任务3：进内核立刻拿大内核锁（trap 入口硬件已清 SIE，临界区
+   *   不会被本核中断打断；自旋只等另一个核放锁）。
+   *   jal 不压栈；被覆盖的 ra 下面立刻会重设。 */
+  jal  lock_kernel
 
   /* TODO: [p2-task3] load ret_from_exception into $ra so that we can return to
    * ret_from_exception when interrupt_help complete.
