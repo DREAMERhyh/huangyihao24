@@ -20,9 +20,12 @@
 
 /* task_info_t，与 include/os/task.h 完全一致（必须保持同步）。
  * 任务5 起字段改为【字节】语义：镜像内部按字节紧密排列，不再按扇区对齐。
- * 大小 16+4+4+4 = 28 字节（不变），16 × 28 = 448 字节。 */
+ * 大小 16+4+4+4 = 28 字节（不变），32 × 28 = 896 字节。 */
 #define TASK_NAME_LEN 16
-#define TASK_MAXNUM   16
+/* 与内核 include/os/task.h 的 TASK_MAXNUM 保持一致。
+ * 任务5 从 16 提到 32：app 总数已达 18（16 个测试 + shell + fly），
+ *   16 会栈溢出 taskinfo[]（实测 "stack smashing detected"）。 */
+#define TASK_MAXNUM   32
 typedef struct {
     char     name[TASK_NAME_LEN];
     uint32_t start_byte;    /* 该 app 在 apps.img 内的【字节偏移】 */
@@ -31,7 +34,7 @@ typedef struct {
 } task_info_t;
 static task_info_t taskinfo[TASK_MAXNUM];
 
-/* AppInfo 区的字节数（16 × 28 = 448，不再是"1 扇区"的概念） */
+/* AppInfo 区的字节数（32 × 28 = 896，不再是"1 扇区"的概念） */
 #define APPINFO_BYTES (TASK_MAXNUM * sizeof(task_info_t))
 
 /* 镜像信息区（位于第 0 扇区尾部，任务5 起全部按【字节】语义）：
@@ -141,8 +144,8 @@ static void create_image(int nfiles, char *files[])
      *                          内核若从 130 开始会被这两个字段改坏；
      *                        · u-boot 也是按块读第 0 扇区并跳到 0x50200000）
      *   字节 512 ..          内核（KB = 内核字节数，**不补**）
-     *   紧接其后             AppInfo（APPINFO_BYTES = 448 字节，**不补**）
-     *   => kernel.img 总字节 = 512 + KB + 448
+     *   紧接其后             AppInfo（APPINFO_BYTES = 896 字节，**不补**）
+     *   => kernel.img 总字节 = 512 + KB + 896
      *
      * apps.img:
      *   各 app 首尾相接：app i 从"app i-1 的最后一个字节 + 1"开始（**不补**）

@@ -54,7 +54,7 @@ read_loop:
 read_done:
 
 	// 任务5：把镜像布局参数传给内核（内核不直接读 0x50200xxx）。
-	//   布局改为【字节级】：kernel.img = 512(boot) + KB(内核) + 448(AppInfo)，
+	//   布局改为【字节级】：kernel.img = 512(boot) + KB(内核) + 896(AppInfo)，
 	//   apps.img 紧接其后；apps 内部各 app 首尾相接、不补到扇区边界。
 	//   传参约定（head.S 会保存，见 task.h）：
 	//     a0 = AppInfo 起始字节偏移（镜像偏移 0x1f0，4 字节）

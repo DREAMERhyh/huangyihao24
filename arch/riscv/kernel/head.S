@@ -60,7 +60,13 @@ clear_done:
 
   /* 任务2：建立 C 运行环境
    *   栈顶 0x50500000（KERNEL_STACK），向下生长；
-   *   然后跳转到 init/main.c 的 main 函数。 */
+   *   然后跳转到 init/main.c 的 main 函数。
+   *   P3 任务5（路线A）：a0 = 本核 mhartid，作为 main(boot_cpu) 的参数。
+   *   这是【启动期唯一一次】读核号（由上面的 bnez 已保证此路径 = 0，
+   *   这里重读一次只为把"我是哪个核"显式传给 main）；此后全内核核号
+   *   都从 current_running->running_cpu 取，不再有运行时 csrr mhartid
+   *   （细粒度版双核高频 syscall 下它偶发被判非法指令 → 崩溃）。 */
+  csrr  a0, CSR_MHARTID
   li    sp, KERNEL_STACK
   call  main
 
@@ -77,6 +83,9 @@ SecondaryStart:
    * 仍是挂起位（硬件不自动清）。现在不清，等 main 从核路径
    * enable_preempt() 重开 SSIE 时会触发一次"幽灵 trap"。 */
   csrw  CSR_SIP, zero
+  /* P3 任务5（路线A）：同上——t0 还是入口处的 mhartid，
+   *   作为 main(boot_cpu) 的参数传下去（启动期读一次，此后不读）。 */
+  mv    a0, t0
   li    sp, SECONDARY_BOOT_STACK
   call  main
 1:

@@ -79,17 +79,6 @@ static pcb_t *find_pcb_by_pid(pid_t pid)
     return 0;
 }
 
-/* 是否有任何核"正在使用"这个 PCB（被切出中的任务状态可能已是 EXITED，
- *   但它的现场还在核上被 switch_to 引用，不能回收复用） */
-static int on_any_cpu(pcb_t *t)
-{
-    for (int c = 0; c < NR_CPUS; ++c) {
-        if (core_running[c] == t)
-            return 1;
-    }
-    return 0;
-}
-
 static pcb_t *alloc_pcb(void)
 {
     /* ① 全新的空槽位 */
@@ -100,11 +89,20 @@ static pcb_t *alloc_pcb(void)
 
     /* ② 池满：复用"已经退出、没人还在 wait 它、且不在任何核上被使用"的 PCB。
      *   数组顺序即近似 FIFO，优先复用最早退出的——刚退出的先留存一会儿，
-     *   给 waitpid 留出观察窗口。多核下用 core_running[] 排除全部核。 */
+     *   给 waitpid 留出观察窗口。多核下用 task_on_cpu 排除全部核。
+     *   ★ 到这一刻才归还它的两张栈：以前在 do_exit 里就还，等于把自己的
+     *     立足之地提前交给下一个 exec 去踩（做完 exit 的最后一段调度与
+     *     switch_to 全踩在内核栈上）。task_on_cpu 为假 = 已完整下核——
+     *     细粒度版整个 switch_to 都在 sched_lock 内（交棒），本函数也在锁内。 */
     for (int i = 0; i < NUM_MAX_TASK; ++i) {
         if (pcb[i].status == TASK_EXITED && list_empty(&pcb[i].wait_list)
-            && !on_any_cpu(&pcb[i]))
+            && !task_on_cpu(&pcb[i])) {
+            task_stack_free(pcb[i].kernel_stack_base, 1);
+            task_stack_free(pcb[i].user_stack_base, 0);
+            pcb[i].kernel_stack_base = 0;
+            pcb[i].user_stack_base = 0;
             return &pcb[i];
+        }
     }
 
     return 0;   /* 都在用：exec 失败 */
@@ -239,15 +237,23 @@ pid_t do_exec(char *name, int argc, char **argv, uint64_t mask)
         return 0;
 
     /* ② 按名加载代码（同一个程序加载多次＝共享同一份代码窗口，
-     *   各进程有自己的内核栈/用户栈——任务4 的测试正依赖这一点） */
+     *   各进程有自己的内核栈/用户栈——任务4 的测试正依赖这一点）。
+     *   任务5：细粒度版用 loader_lock 包住加载（staging 缓冲与地址表
+     *   全局共享，两核同时 exec 会踩）；加载完就放锁，与 sched_lock
+     *   不嵌套——两把锁分属不同域，无需遵守锁序。 */
+    FINE_LOCK(&loader_lock);
     uint64_t entry = load_task_img(kname);
+    FINE_UNLOCK(&loader_lock);
     if (entry == 0)
         return 0;
 
-    /* ③ PCB 与两张栈 */
+    /* ③ PCB 与两张栈（从这里到入队是一个 sched_lock 事务：
+     *   pcb 池与栈池的空闲链表都归 sched_lock 保护，见 smp.h 纪律） */
+    FINE_LOCK(&sched_lock);
+
     pcb_t *task = alloc_pcb();
     if (task == 0)
-        return 0;
+        goto fail;
 
     ptr_t kstack_base = task_stack_alloc(1);
     ptr_t ustack_base = task_stack_alloc(0);
@@ -260,11 +266,8 @@ pid_t do_exec(char *name, int argc, char **argv, uint64_t mask)
     uint64_t argv_va = 0;
     ptr_t user_sp_init = ustack_top;
     if (argc > 0 && argv != 0) {
-        if (!pack_args(ustack_top, argc, argv, &argv_va, &user_sp_init)) {
-            task_stack_free(kstack_base, 1);
-            task_stack_free(ustack_base, 0);
-            return 0;
-        }
+        if (!pack_args(ustack_top, argc, argv, &argv_va, &user_sp_init))
+            goto fail_free;
     }
 
     /* ⑤ 填 PCB */
@@ -291,14 +294,24 @@ pid_t do_exec(char *name, int argc, char **argv, uint64_t mask)
                    (ptr_t)argv_va);
     list_add_tail(&task->list, &ready_queue);
 
+    FINE_UNLOCK(&sched_lock);
+
     return task->pid;
+
+fail_free:
+    task_stack_free(kstack_base, 1);
+    task_stack_free(ustack_base, 0);
+fail:
+    FINE_UNLOCK(&sched_lock);
+    return 0;
 }
 #endif /* !S_CORE */
 
 /* =====================================================================
  * do_exit：结束当前进程
  *   进程执行完 crt0 里的 sys_exit（或显式调）后走这里：标记 EXITED、
- *   唤醒所有 waitpid 本进程者、归还内核栈/用户栈，然后让出 CPU。
+ *   唤醒所有 waitpid 本进程者，然后让出 CPU；两张栈留到 PCB 被真正
+ *   复用（alloc_pcb）时才归还。
  *   EXITED 的 PCB 不进任何队列，do_scheduler 不会再选它；PCB 槽位与
  *   栈空间由后续 exec 复用（见 alloc_pcb / task_stack_alloc）。
  * ===================================================================== */
@@ -306,13 +319,22 @@ void do_exit(void)
 {
     pcb_t *task = current_running;
 
+    /* 任务5：状态迁移/唤醒等待者在一个 sched_lock 临界段里完成；
+     *   放锁之后才让出。 */
+    FINE_LOCK(&sched_lock);
+
     task->status = TASK_EXITED;
 
     while (!list_empty(&task->wait_list))
         do_unblock(task->wait_list.next);
 
-    task_stack_free(task->kernel_stack_base, 1);
-    task_stack_free(task->user_stack_base, 0);
+    /* ★ 两张栈不在这里归还（以前在这里还，是重磅 bug）：本任务此刻还
+     *   踩着自己的内核栈执行——下面还有调度决策、M 态定时器和 switch_to。
+     *   把栈放进空闲池，别的核一次 exec 就可能把这块内存装成新任务，
+     *   两边现场当场互相踩烂（实测症状：活任务的 kernel_sp 指向被
+     *   call_bios 代码覆写的内存）。改在 alloc_pcb 真正复用时归还。 */
+
+    FINE_UNLOCK(&sched_lock);
 
     do_scheduler();     /* 切走；此后本 PCB 不会被再选中 */
     while (1)           /* 不可达 */
@@ -332,10 +354,19 @@ void do_exit(void)
  * ===================================================================== */
 int do_kill(pid_t pid)
 {
-    pcb_t *task = find_pcb_by_pid(pid);
+    int ret = 0;
+    pcb_t *task;
+
+    /* 任务5：mlocks 的 owner 属 sync 域、队列/状态属 sched 域——按锁序
+     *   sync→sched 双锁齐拿，把"释放锁 + 摘队 + 置终态 + 唤醒"做成一个
+     *   跨核原子事务；do_scheduler 挪到放锁之后（自己杀自己时用）。 */
+    FINE_LOCK(&sync_lock);
+    FINE_LOCK(&sched_lock);
+
+    task = find_pcb_by_pid(pid);
 
     if (task == 0 || is_idle_pcb(task) || task->status == TASK_EXITED)
-        return 0;
+        goto out;
 
     /* ① 替它释放持有的互斥锁 */
     for (int i = 0; i < LOCK_NUM; ++i) {
@@ -356,15 +387,27 @@ int do_kill(pid_t pid)
     while (!list_empty(&task->wait_list))
         do_unblock(task->wait_list.next);
 
-    /* ④ 归还栈 */
-    task_stack_free(task->kernel_stack_base, 1);
-    task_stack_free(task->user_stack_base, 0);
+    /* ④ 归还栈：只有它已完整下核才能动。还在核上的（正在跑、切换中、
+     *   或处在 block 与 do_scheduler 之间的几步里）留给 alloc_pcb 复用时
+     *   归还——那里同样以 task_on_cpu 为闸。 */
+    if (!task_on_cpu(task)) {
+        task_stack_free(task->kernel_stack_base, 1);
+        task_stack_free(task->user_stack_base, 0);
+        task->kernel_stack_base = 0;
+        task->user_stack_base = 0;
+    }
 
-    /* ⑤ 杀到自己头上：也走一次让出 */
-    if (task == current_running)
+    ret = 1;
+
+out:
+    FINE_UNLOCK(&sched_lock);
+    FINE_UNLOCK(&sync_lock);
+
+    /* ⑤ 杀到自己头上：放锁后也走一次让出 */
+    if (ret && task == current_running)
         do_scheduler();
 
-    return 1;
+    return ret;
 }
 
 /* =====================================================================
@@ -374,16 +417,31 @@ int do_kill(pid_t pid)
  * ===================================================================== */
 int do_waitpid(pid_t pid)
 {
+    /* 任务5：细粒度版把"判子进程状态"和"挂到它的 wait_list"放进同一个
+     *   sched_lock 临界段——否则子进程在核 1 上退出（改状态+唤醒等待者）
+     *   可能插在我们的两次操作之间，我们随后照睡不误，永久卡死。
+     *   大锁版宏为空（BKL 本来就在 trap 入口持有，天然互斥），等价原逻辑。 */
+    FINE_LOCK(&sched_lock);
+
     pcb_t *task = find_pcb_by_pid(pid);
 
-    if (task == 0)
+    if (task == 0) {
+        FINE_UNLOCK(&sched_lock);
         return 0;
+    }
 
-    if (task->status == TASK_EXITED)
+    if (task->status == TASK_EXITED) {
+        FINE_UNLOCK(&sched_lock);
         return pid;
+    }
 
     /* 挂到对方的 wait_list 上睡觉；对方 exit/kill 时会被唤醒 */
-    do_block(&current_running->list, &task->wait_list);
+    current_running->status = TASK_BLOCKED;
+    list_add_tail(&current_running->list, &task->wait_list);
+
+    FINE_UNLOCK(&sched_lock);
+
+    do_scheduler();
 
     return pid;
 }
@@ -417,6 +475,10 @@ void do_process_show(void)
      *   · mask 小写十六进制（0x3 / 0x1）；
      *   · "Running on core N" 只对 RUNNING 打，N 从 core_running[] 反查
      *     （RUNNING 的任务必然只被它所在核登记）。 */
+    /* 任务5：整表在 sched_lock 下读（两核可能同时在 exec/exit 改 pcb）；
+     *   期间会 printk（嵌套拿 console_lock，锁序 sched→console 合法）。 */
+    FINE_LOCK(&sched_lock);
+
     printk("[Process Table]:\n");
 
     int row = 0;
@@ -455,6 +517,8 @@ void do_process_show(void)
 
         ++row;
     }
+
+    FINE_UNLOCK(&sched_lock);
 }
 
 pid_t do_getpid(void)
@@ -474,16 +538,30 @@ int do_taskset_p(pid_t pid, uint64_t mask)
     if (mask == 0)
         return 0;
 
-    pcb_t *task = find_pcb_by_pid(pid);
-    if (task == 0 || is_idle_pcb(task))
-        return 0;               /* 找不到进程，或想改 idle（不许） */
+    int ret = 0;
 
-    task->cpu_mask = mask;
-    return 1;
+    FINE_LOCK(&sched_lock);     /* cpu_mask 被别的核的 pick_next 读 */
+
+    pcb_t *task = find_pcb_by_pid(pid);
+    if (task != 0 && !is_idle_pcb(task)) {
+        task->cpu_mask = mask;
+        ret = 1;
+    }                           /* 找不到进程，或想改 idle（不许） */
+
+    FINE_UNLOCK(&sched_lock);
+    return ret;
 }
 
 /* shell 轮询串口读一个字符；无输入时 BIOS 返回 -1 */
 int do_getchar(void)
 {
-    return bios_getchar();
+    /* 任务5：UART 读写同属 console 域（与屏幕缓冲一起，防 fly 刷屏
+     *   期间把键盘轮询与光标操作交错）。大锁版宏为空。 */
+    int c;
+
+    FINE_LOCK(&console_lock);
+    c = bios_getchar();
+    FINE_UNLOCK(&console_lock);
+
+    return c;
 }

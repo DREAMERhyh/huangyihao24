@@ -14,6 +14,8 @@ char new_screen[SCREEN_HEIGHT * SCREEN_WIDTH] = {0};
 char old_screen[SCREEN_HEIGHT * SCREEN_WIDTH] = {0};
 
 /* cursor position */
+static void screen_reflush_locked(void);   /* 任务5：定义见文件后部 */
+
 static void vt100_move_cursor(int x, int y)
 {
     // \033[y;xH
@@ -104,6 +106,11 @@ void init_screen(void)
 void screen_clear(void)
 {
     int i, j;
+
+    /* 任务5：整个"清缓冲+刷屏"在 console_lock 下（内部用 _locked
+     *   变体，避免同一把自旋锁二次获取——不可重入）。 */
+    FINE_LOCK(&console_lock);
+
 	vt100_clear();
     for (i = 0; i < SCREEN_HEIGHT; i++)
     {
@@ -115,11 +122,15 @@ void screen_clear(void)
     }
     current_running->cursor_x = 0;
     current_running->cursor_y = 0;
-    screen_reflush();
+    screen_reflush_locked();
+
+    FINE_UNLOCK(&console_lock);
 }
 
 void screen_move_cursor(int x, int y)
 {
+    FINE_LOCK(&console_lock);
+
     if (x >= SCREEN_WIDTH)
         x = SCREEN_WIDTH - 1;
     else if (x < 0)
@@ -131,6 +142,8 @@ void screen_move_cursor(int x, int y)
     current_running->cursor_x = x;
     current_running->cursor_y = y;
     vt100_move_cursor(x + 1, y + 1);
+
+    FINE_UNLOCK(&console_lock);
 }
 
 
@@ -140,10 +153,15 @@ void screen_write(char *buff)
     int i = 0;
     int l = strlen(buff);
 
+    /* 任务5：一次锁住整个字符串的写入（fly 刷屏与内核打印互斥） */
+    FINE_LOCK(&console_lock);
+
     for (i = 0; i < l; i++)
     {
         screen_write_ch(buff[i]);
     }
+
+    FINE_UNLOCK(&console_lock);
 }
 
 /*
@@ -151,8 +169,10 @@ void screen_write(char *buff)
  * interrupt is triggered. However, we need to pay attention to
  * the fact that in order to speed up printing, we only refresh
  * the characters that have been modified since this time.
+ * 任务5：拆出 _locked 变体——screen_clear 在自己的临界段里也要刷屏，
+ *   直接调完整版会重复拿 console_lock（自旋锁不可重入）。
  */
-void screen_reflush(void)
+static void screen_reflush_locked(void)
 {
     int i, j;
 
@@ -173,4 +193,11 @@ void screen_reflush(void)
 
     /* recover cursor position */
     vt100_move_cursor(current_running->cursor_x + 1, current_running->cursor_y + 1);
+}
+
+void screen_reflush(void)
+{
+    FINE_LOCK(&console_lock);
+    screen_reflush_locked();
+    FINE_UNLOCK(&console_lock);
 }

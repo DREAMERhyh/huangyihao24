@@ -63,9 +63,10 @@ static void init_task_info(void)
     //     ① 算出 AppInfo 落在哪个扇区、扇区内偏移多少；
     //     ② 把"覆盖它的若干个整扇区"读进中转缓冲；
     //     ③ 从缓冲的 offset 处起，拷 APPINFO_BYTES 字节进 tasks[]。
-    //   中转缓冲需 2 个扇区：offset ≤ 511，APPINFO_BYTES = 448，
-    //   故 offset + 448 ≤ 959 < 1024。
-    static uint8_t appinfo_buf[2 * SECTOR_SIZE]
+    //   中转缓冲需 3 个扇区：offset ≤ 511，APPINFO_BYTES = 32×28 = 896，
+    //   故 offset + 896 ≤ 1407 < 1536（任务5 把 TASK_MAXNUM 从 16 提到 32，
+    //   缓冲同步从 2 扇区加到 3 扇区）。
+    static uint8_t appinfo_buf[3 * SECTOR_SIZE]
         __attribute__((aligned(SECTOR_SIZE)));
 
     task_num = (int)boot_appnum;
@@ -161,24 +162,33 @@ static void init_syscall(void)
 }
 /************************************************************/
 
-int main(void)
+/* P3 任务5（路线A）：boot_cpu = 本核 mhartid，由 head.S 在进入内核时
+ *   读一次传进来（a0）。全内核仅此一处得到"我是哪个核"，之后一律读
+ *   current_running->running_cpu（get_current_cpu_id），不再碰 mhartid——
+ *   细粒度版 + 双核 + 高频 syscall 下 csrr mhartid 偶发被判非法指令，
+ *   残值当返回值用会让 PC 飞进数据区（详见 include/os/smp.h）。 */
+int main(uint64_t boot_cpu)
 {
-    /* P3 任务3：从核（mhartid != 0）走从核路径。
+    /* P3 任务3：从核（核号 != 0）走从核路径。
      *   主核已完成全部全局初始化（BSS/任务表/锁/异常/屏幕），从核只做
      *   本核必要设置：陷阱入口、陷阱栈、自己的 idle PCB、第一个时钟，
      *   然后进 idle 循环——时钟中断会把它带进 do_scheduler 开始参与调度。
      *   顺序要点：先关 sie（防 bootblock 阶段的挂起软中断在 stvec 未换前
      *   再 trap 进 _start）、再备 sscratch、再 setup_exception（它开 SIE，
-     *   但此刻 sie=0 无中断可来）、备 timer，最后 enable_preempt 放开一切。 */
-    if (get_current_cpu_id() != 0) {
+     *   但此刻 sie=0 无中断可来）、备 timer，最后 enable_preempt 放开一切。
+     *   ★ 本分支里在给 current_running 赋值【之前】不能调用
+     *   get_current_cpu_id()：它现在读的是 current_running->running_cpu，
+     *   而此刻 tp 还是 U-Boot 留下的残值。核号用参数 boot_cpu。 */
+    if (boot_cpu != 0) {
         asm volatile("csrw sie, zero");
         asm volatile("csrw sscratch, %0" ::"r"(SECONDARY_TRAP_STACK));
         setup_exception();              /* stvec = 陷阱入口；sstatus.SIE = 1 */
-        current_running = &pid0_pcb[1];
-        core_running[1] = &pid0_pcb[1];
-        pid0_pcb[1].status = TASK_RUNNING;
+        pid0_pcb[boot_cpu].running_cpu = boot_cpu;   /* 本核 idle 认领本核（路线A） */
+        current_running = &pid0_pcb[boot_cpu];
+        core_running[boot_cpu] = &pid0_pcb[boot_cpu];
+        pid0_pcb[boot_cpu].status = TASK_RUNNING;
         printl("[SMP] hart %d idle ready, entering scheduler loop\n",
-               get_current_cpu_id());
+               boot_cpu);
         bios_set_timer(get_ticks() + TIMER_INTERVAL);
         enable_preempt();               /* sie 全开：从核时钟开始节拍 */
         while (1)
@@ -192,8 +202,12 @@ int main(void)
      *   走 printl（QEMU -D 日志，不依赖 current_running、不会被屏幕覆盖）。
      *   ★ 必须等 init_jmptab 之后：printl 经 call_jmptab(QEMU_LOGGING)
      *   查跳转表，表未填就 jalr 0（踩过）。从核的 printl（见从核路径）
-     *   天然安全：主核填表后才写标志唤醒它。 */
-    printl("[SMP] hart %d entered kernel main\n", get_current_cpu_id());
+     *   天然安全：主核填表后才写标志唤醒它。
+     *   ★ 任务5（路线A）：此处【不能】用 get_current_cpu_id()——它现在读
+     *   current_running（tp），而 current_running 要到 init_pcb() 才建立，
+     *   此刻 tp 还是 U-Boot 残值（踩过：解引用炸 load access fault）。
+     *   核号直接用启动参数 boot_cpu。 */
+    printl("[SMP] hart %d entered kernel main\n", boot_cpu);
 
     // Init task information from bootblock-passed AppInfo (〃'▽'〃)
     init_task_info();

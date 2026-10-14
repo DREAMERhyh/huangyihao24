@@ -214,6 +214,13 @@ ENDPROC(ret_from_exception)
  *   老任务被切回时从 switch_to 的返回点继续（do_scheduler 里那里有
  *   lock_kernel()）；新任务不经过那里，在这里补上同一个 lock。 */
 ENTRY(new_task_entry)
+  /* 任务5：sched_lock 交棒——上一任调度器在 switch_to 期间一直持锁，
+   *   新任务作为"接棒方"在这里放锁（与 do_scheduler 中 switch_to 返回点
+   *   的 FINE_UNLOCK 对偶）。大锁版（未定义 FINE_GRAIN_LOCK）不生成。 */
+#ifdef FINE_GRAIN_LOCK
+  la   a0, sched_lock
+  jal  spin_lock_release
+#endif
   jal  lock_kernel
   j    ret_from_exception
 ENDPROC(new_task_entry)

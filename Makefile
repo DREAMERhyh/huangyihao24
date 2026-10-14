@@ -35,6 +35,19 @@ MINICOM         = minicom
 
 CFLAGS          = -O0 -std=gnu11 -fno-builtin -nostdlib -nostdinc -Wall -mcmodel=medany -ggdb3
 
+# -----------------------------------------------------------------------
+# 任务5：细粒度锁开关（两份内核镜像）
+#   make                                 → 大内核锁版（默认）image
+#   make FINE_LOCK=1                     → 细粒度锁版 image
+#   ★ 切换开关必须先 make clean：.o 的依赖不包含 CFLAGS，增量 make
+#     不会因开关变化重编（会拿着旧 .o 链出错误版本的 image）。
+#   两版镜像的产出与对比流程见 .scratch/p3-scenarios.md §3。
+# -----------------------------------------------------------------------
+FINE_LOCK       ?= 0
+ifeq ($(FINE_LOCK),1)
+CFLAGS          += -DFINE_GRAIN_LOCK
+endif
+
 BOOT_INCLUDE    = -I$(DIR_ARCH)/include
 BOOT_CFLAGS     = $(CFLAGS) $(BOOT_INCLUDE) -Wl,--defsym=TEXT_START=$(BOOTLOADER_ENTRYPOINT) -T riscv.lds
 
@@ -214,8 +227,13 @@ $(ELF_CREATEIMAGE): $(SRC_CREATEIMAGE)
 
 # 任务5：createimage 产出 kernel.img 与 apps.img 两个文件；
 # `cat` 拼接成 build/image（QEMU 用，等价于两文件分别写入 SD 卡连续扇区）。
-image: $(ELF_CREATEIMAGE) $(ELF_BOOT) $(ELF_MAIN) $(ELF_USER)
-	cd $(DIR_BUILD) && ./$(<F) --extended $(filter-out $(<F), $(^F))
+# dirs 放普通依赖首位：make 按书写顺序构建（非并行），确保 build/ 先建好
+#   ——createimage 的链接/bootblock 的输出都依赖 build/ 存在（make clean
+#   后直接 make image 踩过 "No such file or directory"）。
+# 调用与参数里显式排除 dirs/createimage（不用 $< 取首个依赖——dirs 进列表
+#   后 $< 会变成 dirs，踩过 "跑成 ./dirs"）。
+image: dirs $(ELF_CREATEIMAGE) $(ELF_BOOT) $(ELF_MAIN) $(ELF_USER)
+	cd $(DIR_BUILD) && ./createimage --extended $(filter-out dirs createimage, $(^F))
 	cd $(DIR_BUILD) && cat kernel.img apps.img > image
 
 .PHONY: image

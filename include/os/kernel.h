@@ -69,6 +69,10 @@ static inline void bios_logging(char *str)
     call_jmptab(QEMU_LOGGING, (long)str, 0, 0, 0, 0);
 }
 
+/* ★ 试过但行不通（2026-10-14，留给后来人）：CPU 的 ISA 串虽带 sstc，
+ *   但 U-Boot 没开 menvcfg.STCE，S 态写 stimecmp 直接是非法指令
+ *   （实测 50201296 处 csrw 0x14d 被 U-Boot 判 truly_illegal → hang）。
+ *   所以定时只能继续走 BIOS_SETTIMER（一次 M 态 ecall）。 */
 static inline void bios_set_timer(uint64_t stime_value)
 {
     call_jmptab(SET_TIMER, (long)stime_value, 0, 0, 0, 0);
