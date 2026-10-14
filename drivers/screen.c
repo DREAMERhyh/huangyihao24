@@ -34,19 +34,49 @@ static void vt100_hidden_cursor()
     printv("%c[?25l", 27);
 }
 
-/* write a char */
+/* P3 任务1：屏幕满时上滚一行（软件滚动）。
+ *   原实现里 cursor_y 会加到 SCREEN_HEIGHT（=50），之后写字符时
+ *   SCREEN_LOC(x, 50) 直接越过 4000 字节的缓冲——P2 的输出都停在
+ *   前几行没触发，P3 的 shell/ps 会很快写到屏幕底部，必须处理。
+ *   做法：缓冲内整体上移一行、末行清空；old_screen 全部置哨兵 0，
+ *   迫使下一轮 screen_reflush 把 4000 格全部重发，真实终端（和
+ *   emu.py 重放器）按定位重画后仍与缓冲一致，不需要清屏指令。 */
+static void screen_scroll_one(void)
+{
+    int i;
+
+    for (i = 0; i < (SCREEN_HEIGHT - 1) * SCREEN_WIDTH; ++i)
+        new_screen[i] = new_screen[i + SCREEN_WIDTH];
+    for (i = (SCREEN_HEIGHT - 1) * SCREEN_WIDTH;
+         i < SCREEN_HEIGHT * SCREEN_WIDTH; ++i)
+        new_screen[i] = ' ';
+
+    memset(old_screen, 0, sizeof(old_screen));
+}
+
 /* write a char */
 void screen_write_ch(char ch)
 {
     if (ch == '\n')
     {
         current_running->cursor_x = 0;
-        if (current_running->cursor_y < SCREEN_HEIGHT)
+        /* 已在最后一行再换行 → 屏幕滚动，光标停在最后一行 */
+        if (current_running->cursor_y >= SCREEN_HEIGHT - 1)
+            screen_scroll_one();
+        else
             current_running->cursor_y++;
     }
     else if (ch == '\b' || ch == '\177')
-    {	
-        // TODO: [P3] support backspace here
+    {
+        /* P3 任务1：退格——光标左移一格并把该格擦成空格。
+         *   只处理同一行内退格；行首退格（cursor_x==0）忽略——shell 的
+         *   命令缓冲也不会跨行。 */
+        if (current_running->cursor_x > 0)
+        {
+            current_running->cursor_x--;
+            new_screen[SCREEN_LOC(current_running->cursor_x,
+                                  current_running->cursor_y)] = ' ';
+        }
     }
     else
     {
@@ -54,7 +84,9 @@ void screen_write_ch(char ch)
         if (++current_running->cursor_x >= SCREEN_WIDTH)
         {
             current_running->cursor_x = 0;
-            if (current_running->cursor_y < SCREEN_HEIGHT)
+            if (current_running->cursor_y >= SCREEN_HEIGHT - 1)
+                screen_scroll_one();
+            else
                 current_running->cursor_y++;
         }
     }

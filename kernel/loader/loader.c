@@ -7,9 +7,12 @@
  * 而块设备只能整扇区读、没有偏移参数。所以加载一个 app 要分两步：
  *   ① 把"覆盖该 app 的若干整扇区"读进本中转缓冲；
  *   ② 从缓冲内的 offset 处起，把 size 字节拷到 app 的窗口地址。
- * 缓冲 8KB（= 16 扇区），足以容纳"任意 app 字节数 + 最多 511 字节偏移"
- * 在目前规模内的组合；若某天 app 变大到装不下，会**拒绝加载**而不是越界写。 */
-#define LOAD_STAGING_BYTES 8192
+ * 缓冲 16KB（= 32 扇区），上限 = 最多 511 字节偏移 + 单个 app 至多 ~15.5KB。
+ *   ★ P3 起 app 带完整 tiny_libc 而变大（shell ≈ 9.5KB，P2 时代所有 app
+ *   都 < 7.7KB），原 8KB 缓冲装不下"offset + size"（实测 shell 需 10240 字节），
+ *   会被下面第 ② 步拒绝加载——表现为"任务明明在列表里、exec 却返回 0"。
+ *   若某天 app 再变大到装不下，仍会**拒绝加载**而不是越界写。 */
+#define LOAD_STAGING_BYTES 16384
 static uint8_t load_staging[LOAD_STAGING_BYTES]
     __attribute__((aligned(SECTOR_SIZE)));
 

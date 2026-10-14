@@ -31,6 +31,7 @@
 
 #include <type.h>
 #include <os/list.h>
+#include <os/task.h>
 
 #define NUM_MAX_TASK 16
 
@@ -77,6 +78,10 @@ typedef struct pcb
 
     /* process id */
     pid_t pid;
+
+    /* P3：进程名（exec 按名启动 / ps 显示）。
+     * ★ 槽位空闲的判据：name[0] == '\0'（pcb[] 静态零初始化天然如此）。 */
+    char name[TASK_NAME_LEN];
 
     /* BLOCK | READY | RUNNING */
     task_status_t status;
@@ -135,6 +140,8 @@ extern int do_kill(pid_t pid);
 extern int do_waitpid(pid_t pid);
 extern void do_process_show();
 extern pid_t do_getpid();
+/* shell 的串口轮询：读一个字符，无输入返回 -1（P3 任务1 加） */
+extern int do_getchar(void);
 /************************************************************/
 
 #endif

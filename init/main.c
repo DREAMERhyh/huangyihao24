@@ -17,8 +17,6 @@
 #include <type.h>
 #include <csr.h>
 
-extern void ret_from_exception();
-
 // bootblock 经 head.S 传来的引导参数（任务5 起为【字节】语义）：
 //   a0 = AppInfo 起始字节偏移，a1 = 用户程序数目，a2 = apps 区起始字节偏移
 //   定义见 task.h；赋值在 head.S 清完 BSS 后完成
@@ -29,7 +27,7 @@ uint64_t boot_apps_base_off;
 // Task info array
 task_info_t tasks[TASK_MAXNUM];
 
-// 任务3：镜像里记录的用户程序数目（createimage 写在镜像偏移 0x1f8）
+// 镜像里记录的用户程序数目（createimage 写在镜像偏移 0x1f8）
 int task_num = 0;
 
 static void init_jmptab(void)
@@ -51,9 +49,6 @@ static void init_jmptab(void)
     jmptab[MUTEX_ACQ]       = (long (*)())do_mutex_lock_acquire;
     jmptab[MUTEX_RELEASE]   = (long (*)())do_mutex_lock_release;
     jmptab[SCREEN_REFLUSH]  = (long (*)())screen_reflush;
-
-    // TODO: [p2-task1] (S-core) initialize system call table.
-
 }
 
 static void init_task_info(void)
@@ -62,8 +57,8 @@ static void init_task_info(void)
     //   位置与数量来自 bootblock 传参（head.S 已存进 boot_appinfo_off /
     //   boot_appnum），不再直接读 0x50200xxx。
     //
-    //   ★ 与任务4 的关键差别：AppInfo 在镜像里**不再按扇区对齐**（字节级紧密
-    //   排列），而块设备只能整扇区读、没有偏移参数。所以必须：
+    //   ★ AppInfo 在镜像里**不按扇区对齐**（字节级紧密排列），而块设备只能
+    //   整扇区读、没有偏移参数。所以必须：
     //     ① 算出 AppInfo 落在哪个扇区、扇区内偏移多少；
     //     ② 把"覆盖它的若干个整扇区"读进中转缓冲；
     //     ③ 从缓冲的 offset 处起，拷 APPINFO_BYTES 字节进 tasks[]。
@@ -100,271 +95,21 @@ static void init_task_info(void)
            (size_t)task_num * sizeof(task_info_t));
 }
 
-// 任务5：十进制无符号打印（内核无 itoa，除 10 取余、倒序输出）
-static void put_uint(unsigned int val)
-{
-    char tmp[12];
-    int i = 0;
-
-    if (val == 0) {
-        bios_putchar('0');
-        return;
-    }
-    while (val > 0) {
-        tmp[i++] = (char)('0' + val % 10);
-        val /= 10;
-    }
-    while (i > 0)
-        bios_putchar(tmp[--i]);
-}
-
-// 任务5：十六进制打印（地址用 16 进制更直观）
-static void put_hex(unsigned int val)
-{
-    static const char hex[] = "0123456789abcdef";
-    char tmp[9];
-    int i = 0;
-
-    bios_putstr("0x");
-    if (val == 0) {
-        bios_putchar('0');
-        return;
-    }
-    while (val > 0) {
-        tmp[i++] = hex[val & 0xf];
-        val >>= 4;
-    }
-    while (i > 0)
-        bios_putchar(tmp[--i]);
-}
-
-// 任务5：显示应用信息（slide 25 可选项；name / start(相对字节) / size / entry）
-static void show_task_list(void)
-{
-    bios_putstr("name              offset size   entry\r\n");
-    for (int i = 0; i < task_num; ++i)
-    {
-        int pad = TASK_NAME_LEN - strlen(tasks[i].name);
-
-        bios_putstr(tasks[i].name);
-        while (pad-- > 0)
-            bios_putchar(' ');
-        put_uint(tasks[i].start_byte);
-        bios_putstr("    ");
-        put_uint(tasks[i].byte_size);
-        bios_putstr("    ");
-        put_hex(tasks[i].vaddr_entry);
-        bios_putstr("\r\n");
-    }
-}
-
-// 任务4：读入一行由 \r 或 \n 结束的程序名。
-//   支持退格（BS=0x08 / DEL=0x7f）；名字截断到 TASK_NAME_LEN-1；
-//   若某行超长则"整个名字"判非法，清空到行尾后返回 0。
-//   \r 与 \n 都立即终止；后续的 \r 或 \n（如 \r\n 的另一半）会以空行被
-//   瞬间消费掉，由调用方忽略空行，不会卡住。
-static int readline(char *buf, int cap)
-{
-    int len = 0;
-
-    buf[0] = '\0';
-    while (1)
-    {
-        int ch = bios_getchar();
-
-        if (ch == -1)
-            continue;   // 无输入跳过
-
-        if (ch == '\n' || ch == '\r') {   // 双终止符
-            buf[len] = '\0';
-            // 回车本身不会回显，这里补一个换行，否则下一条提示语会粘在本行末尾
-            bios_putchar('\n');
-            bios_putchar('\r');
-            return len;
-        }
-
-        if (ch == '\b' || ch == 0x7f) {   // 退格：BS 或 DEL
-            if (len > 0) {
-                len--;
-                bios_putchar('\b');        // 回显擦除
-                bios_putchar(' ');
-                bios_putchar('\b');
-            }
-            continue;
-        }
-
-        if (ch < ' ' || ch > '~')         // 不可打印字符忽略
-            continue;
-
-        if (len >= cap - 1) {              // 名字超长：本行作废
-            while (1) {
-                while ((ch = bios_getchar()) == -1)
-                    ;
-                if (ch == '\n' || ch == '\r')
-                    break;
-            }
-            bios_putchar('\n');            // 同上：补换行，免得提示语粘连
-            bios_putchar('\r');
-            buf[0] = '\0';
-            return 0;
-        }
-
-        bios_putchar(ch);                  // 回显
-        buf[len++] = (char)ch;
-    }
-}
-
-// P2：P1 的"按名加载单个程序并跳转过去"变成了"按名挑出一组要并发运行的程序"。
-//   被选中的程序由 init_pcb 逐个装载成 PCB，之后交给 do_scheduler 轮流执行，
-//   所以这里只收集名单，不再跳转。交互格式沿用 P1：一行一个名字，
-//   空行表示"选完了，开始调度"，list 打印应用信息表。
-static task_info_t *running_tasks[TASK_MAXNUM];
-static int running_task_num = 0;
-
-static task_info_t *lookup_task(const char *name)
-{
-    for (int i = 0; i < task_num; ++i) {
-        if (strcmp(tasks[i].name, name) == 0)
-            return &tasks[i];
-    }
-    return 0;
-}
-
-static void select_tasks(void)
-{
-    bios_putstr("Available tasks: ");
-    for (int i = 0; i < task_num; ++i) {
-        bios_putstr(tasks[i].name);
-        if (i + 1 < task_num)
-            bios_putstr(", ");
-    }
-    bios_putstr("\n\r");
-
-    while (1)
-    {
-        char name[TASK_NAME_LEN];
-
-        bios_putstr("Please input a task name ('list' for info, empty line to start): ");
-
-        if (readline(name, TASK_NAME_LEN) <= 0) {   // 空行/非法行
-            if (running_task_num > 0)
-                return;                             // 开始调度
-            bios_putstr("Error: no task selected!\n\r");
-            continue;
-        }
-
-        if (strcmp(name, "list") == 0) {            // 任务5：信息显示命令
-            show_task_list();
-            continue;
-        }
-
-        task_info_t *task = lookup_task(name);
-        if (task == 0) {
-            bios_putstr("Error: unknown task!\n\r");
-            continue;
-        }
-
-        // 每个 app 只有一块固定的加载窗口，同一个程序不能选两次
-        int dup = 0;
-        for (int i = 0; i < running_task_num; ++i) {
-            if (running_tasks[i] == task)
-                dup = 1;
-        }
-        if (dup) {
-            bios_putstr("Error: task already selected!\n\r");
-            continue;
-        }
-
-        running_tasks[running_task_num++] = task;
-    }
-}
-
 /************************************************************/
-static void init_pcb_stack(
-    ptr_t kernel_stack, ptr_t user_stack, ptr_t entry_point,
-    pcb_t *pcb)
-{
-     /* TODO: [p2-task3] initialization of registers on kernel stack
-      * HINT: sp, ra, sepc, sstatus
-      * NOTE: To run the task in user mode, you should set corresponding bits
-      *     of sstatus(SPP, SPIE, etc.).
-      */
-    regs_context_t *pt_regs =
-        (regs_context_t *)(kernel_stack - sizeof(regs_context_t));
-
-    /* 任务3：伪造一份"刚从用户态陷入、现场已存好"的陷阱帧。
-     *   switch_to 末尾 jr ra 跳到 ret_from_exception 后，RESTORE_CONTEXT
-     *   会照着它把寄存器铺回 CPU，最后 sret 进用户态。 */
-    memset((void *)pt_regs, 0, sizeof(regs_context_t));
-
-    pt_regs->regs[2]  = (reg_t)user_stack;    // sp：该任务自己的用户栈顶
-    pt_regs->regs[4]  = (reg_t)pcb;           // tp == current_running
-    pt_regs->regs[1]  = (reg_t)entry_point;   // ra：main 万一返回也有个去处
-    pt_regs->sepc     = (reg_t)entry_point;   // sret 后从程序入口开始执行
-    pt_regs->sstatus  = SR_SPIE;              // SPP=0 回 User 态；SPIE=1 让 sret 后开中断
-
-
-    /* TODO: [p2-task1] set sp to simulate just returning from switch_to
-     * NOTE: you should prepare a stack, and push some values to
-     * simulate a callee-saved context.
-     *
-     * 任务1：新任务没有已保存的现场，所以要手工伪造一个"刚从 switch_to 里
-     *   恢复"的 switchto_context_t，按 sched.h 里 regs[14] 的顺序摆：
-     *     regs[0]=ra  —— switch_to 末尾的 jr ra 会跳到这里
-     *     regs[1]=sp  —— 恢复现场时用的 sp
-     *     regs[2..13]=s0~s11 —— 新任务没有需要恢复的 callee-saved 变量，清零
-     *   任务3 起 ra 改成 ret_from_exception（先恢复陷阱帧、再 sret 进用户态），
-     *   于是 sp 要指向上面那份陷阱帧的基址。 */
-    switchto_context_t *pt_switchto =
-        (switchto_context_t *)((ptr_t)pt_regs - sizeof(switchto_context_t));
-
-    pt_switchto->regs[0] = (reg_t)ret_from_exception;   /* ra */
-    pt_switchto->regs[1] = (reg_t)pt_regs;              /* sp → 陷阱帧 */
-    for (int i = 2; i < 14; ++i)
-        pt_switchto->regs[i] = 0;                       /* s0 ~ s11 */
-
-    /* PCB 记住"下次被调度时从哪恢复"以及任务自己的栈顶 */
-    pcb->kernel_sp = (reg_t)pt_switchto;
-    pcb->user_sp = (reg_t)user_stack;
-}
-
 static void init_pcb(void)
 {
-    // 本次要跑哪些程序由这里的交互决定（名单见 running_tasks / running_task_num）
-    select_tasks();
-
-    for (int i = 0; i < running_task_num; ++i)
-    {
-        pcb_t *task = &pcb[i];
-
-        // TODO: [p2-task1] load needed tasks and init their corresponding PCB
-        //   内核栈与用户栈各分配一块 4K 页（地址段见任务书表 P2-1）：
-        //   内核栈给"内核态现场"用，用户栈给程序自己的 C 栈用，二者分开
-        ptr_t kernel_stack = allocKernelPage(1) + PAGE_SIZE;
-        ptr_t user_stack   = allocUserPage(1) + PAGE_SIZE;
-
-        // 按名字把 app 从镜像搬进它的加载窗口，返回值就是入口地址
-        uint64_t entry = load_task_img(running_tasks[i]->name);
-        assert(entry != 0);
-
-        task->pid = process_id++;
-        task->status = TASK_READY;
-        task->cursor_x = 0;
-        task->cursor_y = 0;
-        task->wakeup_time = 0;
-
-        init_pcb_stack(kernel_stack, user_stack, (ptr_t)entry, task);
-
-        // TODO: [p2-task1] remember to initialize 'current_running'
-        //   新任务一建好就排进就绪队列，等 do_scheduler 挑它上场
-        list_add_tail(&task->list, &ready_queue);
-    }
-
+    // TODO: [p2-task1] initialize 'current_running'
     // 内核自己也得有个 PCB：调度、屏幕光标等都是经由 current_running 访问的。
     //   pid0 是内核的空转任务，初始置 RUNNING 只为对齐 current_running；它不参与
     //   轮转、也不进就绪队列，只在就绪队列为空时被拎回来怠速（睡眠唤醒靠它的时钟中断）。
     current_running = &pid0_pcb;
     pid0_pcb.status = TASK_RUNNING;
+
+    // P3 任务1：内核初始化完成后，直接启动 shell，让它作为 pid 号为 1 的
+    //   第一个用户态进程（任务书约定）。shell 负责从串口读命令、用 exec
+    //   启动所有其余任务——内核不再提供"选任务"的交互界面。
+    pid_t shell_pid = do_exec("shell", 0, 0);
+    assert(shell_pid == 1);
 }
 
 static void init_syscall(void)
@@ -376,12 +121,22 @@ static void init_syscall(void)
     syscall[SYSCALL_WRITE]        = (long (*)())screen_write;
     syscall[SYSCALL_CURSOR]       = (long (*)())screen_move_cursor;
     syscall[SYSCALL_REFLUSH]      = (long (*)())screen_reflush;
+    syscall[SYSCALL_CLEAR]        = (long (*)())screen_clear;
     syscall[SYSCALL_GET_TIMEBASE] = (long (*)())get_time_base;
     syscall[SYSCALL_GET_TICK]     = (long (*)())get_ticks;
     syscall[SYSCALL_LOCK_INIT]    = (long (*)())do_mutex_lock_init;
     syscall[SYSCALL_LOCK_ACQ]     = (long (*)())do_mutex_lock_acquire;
     syscall[SYSCALL_LOCK_RELEASE] = (long (*)())do_mutex_lock_release;
     syscall[SYSCALL_SET_WORKLOAD] = (long (*)())do_set_sche_workload;
+
+    // P3 任务1：进程管理 + 终端
+    syscall[SYSCALL_EXEC]         = (long (*)())do_exec;
+    syscall[SYSCALL_EXIT]         = (long (*)())do_exit;
+    syscall[SYSCALL_KILL]         = (long (*)())do_kill;
+    syscall[SYSCALL_WAITPID]      = (long (*)())do_waitpid;
+    syscall[SYSCALL_PS]           = (long (*)())do_process_show;
+    syscall[SYSCALL_GETPID]       = (long (*)())do_getpid;
+    syscall[SYSCALL_READCH]       = (long (*)())do_getchar;
 }
 /************************************************************/
 
@@ -392,12 +147,6 @@ int main(void)
 
     // Init task information from bootblock-passed AppInfo (〃'▽'〃)
     init_task_info();
-
-    // 任务5 附加：把引导参数另存一份到 .data（Ctrl+C 暖重启时要重新塞回 a0~a2）
-    extern uint64_t boot_saved[3];
-    boot_saved[0] = boot_appinfo_off;
-    boot_saved[1] = boot_appnum;
-    boot_saved[2] = boot_apps_base_off;
 
     // Init Process Control Blocks |•'-'•) ✧
     init_pcb();

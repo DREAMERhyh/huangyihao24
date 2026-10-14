@@ -47,6 +47,10 @@ typedef struct mutex_lock
     spin_lock_t lock;
     list_head block_queue;
     int key;
+    /* P3：当前持锁者（无主为 NULL）。
+     * kill 一个进程时，如果它正持有某把锁，内核要替它释放并唤醒等待者，
+     * 否则这把锁永远锁死；没有这个字段就无从知道"谁持有"。 */
+    struct pcb *owner;
 } mutex_lock_t;
 
 void init_locks(void);
@@ -59,6 +63,10 @@ void spin_lock_release(spin_lock_t *lock);
 int do_mutex_lock_init(int key);
 void do_mutex_lock_acquire(int mlock_idx);
 void do_mutex_lock_release(int mlock_idx);
+
+/* 全局互斥锁数组（kernel/locking/lock.c 定义）——kill 进程时要遍历它
+ * 释放被 kill 者持有的锁、摘除它挂着的等待队列 */
+extern mutex_lock_t mlocks[LOCK_NUM];
 
 /************************************************************/
 typedef struct barrier

@@ -25,15 +25,24 @@ clear_loop:
     j     clear_loop
 clear_done:
 
-    /* 进入 app 的 main 函数；测试程序都是死循环，正常不会返回 */
+    /* 进入 app 的 main 函数 */
     call  main
 
+    /* [P3] main 正常返回后走 sys_exit 退出：
+     *   内核由此回收本进程的全部资源（PCB/内核栈/用户栈/持有的锁），
+     *   并唤醒所有 waitpid 本进程的等待者。
+     *   ★ 原 P2 版本这里是 "loop: wfi" 死循环，P3 必须去掉：
+     *   ① U 态执行 wfi 是非法指令（illegal instruction 直接进 M 态，
+     *      由 U-Boot 报 "truly_illegal_insn" 并停摆整个系统）；
+     *   ② main 正常返回的进程（如 ready_to_exit）若不退出，
+     *      waitpid 的等待者永远等不到。 */
+    call  sys_exit
+
     /************************************************************/
-    /* TODO: [P3] call sys_exit */
+    /* Do not touch this comment. Reserved for future projects. */
     /************************************************************/
-// while(1) loop, unreachable here
+// unreachable unless sys_exit has a bug：纯自旋兜底（不再用 wfi，见上）
 loop:
-    wfi
     j loop
 
 END(_start)

@@ -96,47 +96,64 @@ void sys_set_sche_workload(int workload)
 }
 
 /************************************************************/
+/* P3 任务1：进程管理与终端。全部走 invoke_syscall（a7 传号、a0~a4 传参） */
 #ifdef S_CORE
 pid_t  sys_exec(int id, int argc, uint64_t arg0, uint64_t arg1, uint64_t arg2)
 {
-    /* TODO: [p3-task1] call invoke_syscall to implement sys_exec for S_CORE */
-}    
+    return (pid_t)invoke_syscall(SYSCALL_EXEC, (long)id, (long)argc, (long)arg0,
+                                 (long)arg1, (long)arg2);
+}
 #else
 pid_t  sys_exec(char *name, int argc, char **argv)
 {
-    /* TODO: [p3-task1] call invoke_syscall to implement sys_exec */
+    return (pid_t)invoke_syscall(SYSCALL_EXEC, (long)name, (long)argc,
+                                 (long)argv, IGNORE, IGNORE);
 }
 #endif
 
 void sys_exit(void)
 {
-    /* TODO: [p3-task1] call invoke_syscall to implement sys_exit */
+    invoke_syscall(SYSCALL_EXIT, IGNORE, IGNORE, IGNORE, IGNORE, IGNORE);
+    /* 正常情况下内核已让出 CPU 不会回到这里；万一返回了，死循环兜底，
+     * 不能继续往下跑（现场的栈/PCB 都已经被回收了） */
+    while (1)
+        ;
 }
 
 int  sys_kill(pid_t pid)
 {
-    /* TODO: [p3-task1] call invoke_syscall to implement sys_kill */
+    return (int)invoke_syscall(SYSCALL_KILL, (long)pid, IGNORE, IGNORE, IGNORE,
+                               IGNORE);
 }
 
 int  sys_waitpid(pid_t pid)
 {
-    /* TODO: [p3-task1] call invoke_syscall to implement sys_waitpid */
+    return (int)invoke_syscall(SYSCALL_WAITPID, (long)pid, IGNORE, IGNORE,
+                               IGNORE, IGNORE);
 }
 
 
 void sys_ps(void)
 {
-    /* TODO: [p3-task1] call invoke_syscall to implement sys_ps */
+    invoke_syscall(SYSCALL_PS, IGNORE, IGNORE, IGNORE, IGNORE, IGNORE);
 }
 
 pid_t sys_getpid()
 {
-    /* TODO: [p3-task1] call invoke_syscall to implement sys_getpid */
+    return (pid_t)invoke_syscall(SYSCALL_GETPID, IGNORE, IGNORE, IGNORE, IGNORE,
+                                 IGNORE);
 }
 
 int  sys_getchar(void)
 {
-    /* TODO: [p3-task1] call invoke_syscall to implement sys_getchar */
+    return (int)invoke_syscall(SYSCALL_READCH, IGNORE, IGNORE, IGNORE, IGNORE,
+                               IGNORE);
+}
+
+/* P3 任务1：clear 命令——清屏幕缓冲（内核 screen_clear） */
+void sys_clear(void)
+{
+    invoke_syscall(SYSCALL_CLEAR, IGNORE, IGNORE, IGNORE, IGNORE, IGNORE);
 }
 
 int  sys_barrier_init(int key, int goal)

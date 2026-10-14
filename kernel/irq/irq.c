@@ -28,42 +28,15 @@ void interrupt_helper(regs_context_t *regs, uint64_t stval, uint64_t scause)
         exc_table[scause](regs, stval, scause);
 }
 
-/* 暖重启用的引导参数副本：放 .data 段——head.S 清 BSS 时不会抹掉它
- * （boot_* 那三个全局在 .bss 里，重启会被清零，必须另存一份）。 */
-uint64_t boot_saved[3] __attribute__((section(".data"))) = { 1, 1, 1 };
-
-/* 重启内核：等价于把机器热启动一次，回到"选任务"的提示符。
- *   为什么需要它：测试程序都是 while(1) 死循环，调度一旦开始内核就不再读键盘，
- *   按什么键都没反应，只能退出 QEMU 重来。验收时要换一组任务的话，这样最快。
- *   做法就是把内核入口 head.S 的 _start 重跑一遍（清 BSS、重设栈、回 main），
- *   但要自己把 bootblock 传来的三个引导参数重新放进 a0/a1/a2，
- *   否则 init_task_info 会拿到垃圾值。 */
-static void restart_kernel(void) __attribute__((noreturn));
-static void restart_kernel(void)
-{
-    /* 就绪/睡眠队列是 .data 里的静态初始化链表，清 BSS 不会复位它们，
-     * 得手动断开，免得新任务建 PCB 时挂到旧结点上 */
-    list_init(&ready_queue);
-    list_init(&sleep_queue);
-
-    asm volatile("csrw sie, zero");                 /* 关中断，重启途中不再被打断 */
-    asm volatile("mv a0, %0" ::"r"(boot_saved[0]));
-    asm volatile("mv a1, %0" ::"r"(boot_saved[1]));
-    asm volatile("mv a2, %0" ::"r"(boot_saved[2]));
-    asm volatile("li sp, %0" ::"i"(INIT_KERNEL_STACK));
-    asm volatile("la t0, _start\n\t jr t0");
-
-    __builtin_unreachable();
-}
+/* ★ P3 起删掉了 P2 的"Ctrl+C 暖重启"：
+ *   ① 它靠时钟中断里轮询 bios_getchar 实现，而 P3 的 shell 是串口的正经
+ *      消费者——两个读者并存时，用户敲的字符可能被中断抢先读走再丢掉，
+ *      shell 就丢输入。串口只能有一个读者，归还给 shell。
+ *   ② P3 的测试进程都能正常 exit（不再是 P2 那样的死循环），不需要重启
+ *      换任务组；真卡死了，在 QEMU 层重跑脚本即可。 */
 
 void handle_irq_timer(regs_context_t *regs, uint64_t stval, uint64_t scause)
 {
-    /* 跑测试时按 Ctrl+C：停掉当前这组任务，回到选任务的提示符。
-     * 内核在调度期间不读键盘，所以这里顺手看一眼（每个时钟节拍一次 M 模式
-     * 调用，开销很小）。正常的验收操作不会按到 Ctrl+C。 */
-    if (bios_getchar() == 0x03)
-        restart_kernel();
-
     // TODO: [p2-task4] clock interrupt handler.
     // Note: use bios_set_timer to reset the timer and remember to reschedule
 

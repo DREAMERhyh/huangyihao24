@@ -41,6 +41,7 @@ void init_locks(void)
         mlocks[i].key = KEY_UNUSED;
         spin_lock_init(&mlocks[i].lock);
         list_init(&mlocks[i].block_queue);
+        mlocks[i].owner = 0;
     }
 }
 
@@ -86,6 +87,7 @@ int do_mutex_lock_init(int key)
         if (mlocks[i].key == KEY_UNUSED) {
             spin_lock_init(&mlocks[i].lock);
             list_init(&mlocks[i].block_queue);
+            mlocks[i].owner = 0;
             mlocks[i].key = key;
             return i;
         }
@@ -111,8 +113,10 @@ void do_mutex_lock_acquire(int mlock_idx)
 
         list_add_tail(&current_running->list, &lock->block_queue);
         acquired = spin_lock_try_acquire(&lock->lock);
-        if (acquired)
+        if (acquired) {
             list_del(&current_running->list);   // 抢到了，从等待队列里摘出来
+            lock->owner = current_running;      // P3：记下持锁者（kill 时要用）
+        }
         current_running->status = acquired ? TASK_RUNNING : TASK_BLOCKED;
 
         irq_restore(sstatus);
@@ -135,6 +139,7 @@ void do_mutex_lock_release(int mlock_idx)
      * 锁已空的情况下却收不到唤醒，就会一直睡下去。 */
     uint64_t sstatus = irq_save();
 
+    lock->owner = 0;                    // P3：持锁者即将易主（或变空）
     spin_lock_release(&lock->lock);
 
     // 叫醒一个等待者；它醒来后会重新尝试抢占这把锁

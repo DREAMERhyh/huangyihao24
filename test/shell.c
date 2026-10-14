@@ -15,13 +15,12 @@
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
  *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+ * PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+ * HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+ * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+ * THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  *
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *  * * * * * * * * * * */
 
@@ -30,8 +29,167 @@
 #include <unistd.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdlib.h>
 
-#define SHELL_BEGIN 20
+/* shell 的显示区：屏幕下半部分（上半部分留给任务输出） */
+#define SHELL_BEGIN  20
+#define CMD_BUF_LEN  128
+#define ARGV_MAX     10
+
+/* ---------------------------------------------------------------------
+ * 读一行命令。
+ *   · 阻塞轮询 sys_getchar（串口在 P3 里由 shell 独占消费）；
+ *   · 读到可打印字符就回显、退格（BS/DEL）就擦除；
+ *   · 回车（\r 或 \n）结束，返回长度（空行返回 0）。
+ *   · 读不到字符时 sys_yield 让出 CPU——shell 空转不该白占时间片，
+ *     把 CPU 让给正在跑的任务；下一次被调度回来继续轮询。
+ * --------------------------------------------------------------------- */
+static int read_line(char *buf, int cap)
+{
+    int len = 0;
+
+    while (1)
+    {
+        int ch = sys_getchar();
+
+        if (ch < 0)                 /* 无输入 */
+        {
+            sys_yield();
+            continue;
+        }
+
+        if (ch == '\r' || ch == '\n')
+        {
+            printf("\n");           /* 回车回显：换到下一行 */
+            buf[len] = '\0';
+            return len;
+        }
+
+        if (ch == '\b' || ch == '\177')
+        {
+            if (len > 0)
+            {
+                len--;
+                printf("\b");       /* 驱动负责"左移一格并擦除" */
+            }
+            continue;
+        }
+
+        if (ch == 0x03)             /* Ctrl+C：目前不做中断处理，忽略 */
+            continue;
+
+        if (ch < ' ' || ch > '~')   /* 其它不可打印字符忽略 */
+            continue;
+
+        if (len >= cap - 1)         /* 缓冲满：忽略多余字符 */
+            continue;
+
+        buf[len++] = (char)ch;
+        printf("%c", ch);           /* 回显 */
+    }
+}
+
+/* ---------------------------------------------------------------------
+ * 按空格/制表符把一个命令行切成参数（原地写 '\0'）。
+ * 返回参数个数。 */
+static int split(char *line, char **argv, int max)
+{
+    int argc = 0;
+    char *p = line;
+
+    while (*p != '\0')
+    {
+        while (*p == ' ' || *p == '\t')
+            *p++ = '\0';
+        if (*p == '\0')
+            break;
+        if (argc >= max)
+            break;
+        argv[argc++] = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t')
+            p++;
+    }
+
+    return argc;
+}
+
+/* ---------------------------------------------------------------------
+ * exec <name> [args...] [&]
+ *   按名启动一个新任务；启动参数原样透传（argv[0] 就是程序名，
+ *   与任务里 main(argc, argv) 的约定一致）。
+ *   默认（不带 &）等它跑完（sys_waitpid）；带 & 则后台运行。 */
+static void cmd_exec(int argc, char **argv)
+{
+    int background = 0;
+
+    if (argc < 2)
+    {
+        printf("Usage: exec <task> [args...] [&]\n");
+        return;
+    }
+
+    if (strcmp(argv[argc - 1], "&") == 0)
+    {
+        background = 1;
+        argc--;
+    }
+
+    pid_t pid = sys_exec(argv[1], argc - 1, &argv[1]);
+    if (pid == 0)
+    {
+        printf("Error: cannot load task \"%s\"\n", argv[1]);
+        return;
+    }
+
+    if (!background)
+        sys_waitpid(pid);
+}
+
+/* ---------------------------------------------------------------------
+ * kill <pid>：终止指定进程 */
+static void cmd_kill(int argc, char **argv)
+{
+    if (argc < 2)
+    {
+        printf("Usage: kill <pid>\n");
+        return;
+    }
+
+    int pid = atoi(argv[1]);
+    if (sys_kill(pid) == 0)
+        printf("Error: cannot find process %d\n", pid);
+}
+
+/* ---------------------------------------------------------------------
+ * 命令分发 */
+static void run_command(int argc, char **argv)
+{
+    if (strcmp(argv[0], "ps") == 0)
+    {
+        sys_ps();
+    }
+    else if (strcmp(argv[0], "clear") == 0)
+    {
+        sys_clear();
+        sys_move_cursor(0, SHELL_BEGIN);   /* 清屏后回到 shell 区顶部 */
+    }
+    else if (strcmp(argv[0], "exec") == 0)
+    {
+        cmd_exec(argc, argv);
+    }
+    else if (strcmp(argv[0], "kill") == 0)
+    {
+        cmd_kill(argc, argv);
+    }
+    else if (strcmp(argv[0], "help") == 0)
+    {
+        printf("Commands: ps | clear | exec <task> [args...] [&] | kill <pid> | help\n");
+    }
+    else
+    {
+        printf("Unknown command: %s\n", argv[0]);
+    }
+}
 
 int main(void)
 {
@@ -39,18 +197,20 @@ int main(void)
     printf("------------------- COMMAND -------------------\n");
     printf("> root@UCAS_OS: ");
 
+    char buf[CMD_BUF_LEN];
+
     while (1)
     {
-        // TODO [P3-task1]: call syscall to read UART port
-        
-        // TODO [P3-task1]: parse input
-        // note: backspace maybe 8('\b') or 127(delete)
+        if (read_line(buf, CMD_BUF_LEN) > 0)
+        {
+            char *argv[ARGV_MAX];
+            int argc = split(buf, argv, ARGV_MAX);
 
-        // TODO [P3-task1]: ps, exec, kill, clear    
+            if (argc > 0)
+                run_command(argc, argv);
+        }
 
-        /************************************************************/
-        /* Do not touch this comment. Reserved for future projects. */
-        /************************************************************/    
+        printf("> root@UCAS_OS: ");
     }
 
     return 0;
