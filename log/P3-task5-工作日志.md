@@ -1,6 +1,6 @@
 # P3 任务5 工作日志：细粒度锁、C-core 自适应调度与双核稳定性战役
 
-> 分支：`Project3`。相关提交：`0d9a9bb`（本任务）。
+> 分支：`Project3`。相关提交：`3495cf2`（本任务）。
 > 验证环境：QEMU `-smp 2` + `loadbootm`；对比数据用
 > `QEMU_EXTRA="-icount shift=3,sleep=off"` 采集（虚钟=指令量，
 > 免疫宿主负载——P2 的老教训，见下）。

@@ -225,6 +225,12 @@ pid_t do_exec(char *name, int argc, char **argv, uint64_t mask)
     if (name == 0 || argc < 0 || argc > EXEC_MAX_ARGC)
         return 0;
 
+    /* P3 评审补丁：显式掩码里若含本系统之外的核位（如 0x4），该任务在
+     *   任何核上都选不中、滞留就绪队列静默饿死——直接拒绝启动。
+     *   （mask==0 仍表示"继承父进程"，不是非法值。） */
+    if (mask != 0 && (mask & ~CPU_MASK_ALL) != 0)
+        return 0;
+
     /* ① 名称从用户空间拷进内核（长度封顶 TASK_NAME_LEN-1） */
     char kname[TASK_NAME_LEN];
     int i = 0;
@@ -425,7 +431,10 @@ int do_waitpid(pid_t pid)
 
     pcb_t *task = find_pcb_by_pid(pid);
 
-    if (task == 0) {
+    /* P3 评审补丁：pid==0 会解析到本核 idle、pid==自己 会解析到自身——
+     *   两者的 wait_list 都永远等不到"退出唤醒"，直接按"无可等待对象"
+     *   返回 0（与 pid 不存在的语义一致），避免调用者永睡。 */
+    if (task == 0 || is_idle_pcb(task) || task == current_running) {
         FINE_UNLOCK(&sched_lock);
         return 0;
     }
@@ -535,7 +544,9 @@ pid_t do_getpid(void)
  * ===================================================================== */
 int do_taskset_p(pid_t pid, uint64_t mask)
 {
-    if (mask == 0)
+    /* P3 评审补丁：除 0 之外，高位掩码（没有核能跑）同样拒绝——
+     *   否则任务滞留就绪队列、静默饿死。 */
+    if (mask == 0 || (mask & ~CPU_MASK_ALL) != 0)
         return 0;
 
     int ret = 0;

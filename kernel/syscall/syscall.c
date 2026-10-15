@@ -14,7 +14,16 @@ void handle_syscall(regs_context_t *regs, uint64_t interrupt, uint64_t cause)
      *   现场就摆在内核栈顶的 regs_context_t 里，直接读写对应槽位即可。 */
     regs->sepc += 4;    // 跳过 ecall 这条指令；不改的话 sret 回去会立刻再次陷入
 
-    regs->regs[10] = syscall[regs->regs[17]](regs->regs[10], regs->regs[11],
-                                             regs->regs[12], regs->regs[13],
-                                             regs->regs[14]);
+    /* P3 评审补丁：调用号由用户提供，先验界再跳表——
+     *   超出表长会读分发表外围，落进未注册槽位会跳 NULL。
+     *   非法号按"调用失败"返回 0，与合法路径的返回值约定一致。 */
+    uint64_t nr = regs->regs[17];
+    if (nr >= NUM_SYSCALLS || syscall[nr] == 0) {
+        regs->regs[10] = 0;
+        return;
+    }
+
+    regs->regs[10] = syscall[nr](regs->regs[10], regs->regs[11],
+                                 regs->regs[12], regs->regs[13],
+                                 regs->regs[14]);
 }

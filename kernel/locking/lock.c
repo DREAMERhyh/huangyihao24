@@ -110,6 +110,9 @@ int do_mutex_lock_init(int key)
 void do_mutex_lock_acquire(int mlock_idx)
 {
     /* TODO: [p2-task2] acquire mutex lock */
+    /* P3 评审补丁：handle 来自用户态，先验界再索引（越界会读写内核内存） */
+    if (mlock_idx < 0 || mlock_idx >= LOCK_NUM)
+        return;
     mutex_lock_t *lock = &mlocks[mlock_idx];
 
     /* ★ 先入队、再抢锁：这样"入队"与"检查锁状态"之间没有空档，不会丢唤醒。
@@ -152,6 +155,9 @@ void do_mutex_lock_acquire(int mlock_idx)
 void do_mutex_lock_release(int mlock_idx)
 {
     /* TODO: [p2-task2] release mutex lock */
+    /* P3 评审补丁：handle 来自用户态，先验界再索引 */
+    if (mlock_idx < 0 || mlock_idx >= LOCK_NUM)
+        return;
     mutex_lock_t *lock = &mlocks[mlock_idx];
 
     /* "置空"和"唤醒队首"必须是一个原子动作：中间被抢占的话，等待者在
@@ -234,6 +240,10 @@ int do_barrier_init(int key, int goal)
 {
     /* 与 do_mutex_lock_init 同款：同一个 key 复用同一个 handle（= 下标）
      * 任务5：key/goal 属 sync 域（细粒度版）；改完统一从尾部返回。 */
+    /* P3 评审补丁：goal<=0 时 wait 的判据 arrived==goal 永远凑不齐，
+     *   全体参与者永久挂起——直接按参数错误拒绝。 */
+    if (goal <= 0)
+        return -1;
     uint64_t sstatus = irq_save();
     int ret = -1;
 
@@ -267,6 +277,9 @@ out:
 
 void do_barrier_wait(int bar_idx)
 {
+    /* P3 评审补丁：handle 来自用户态，先验界再索引 */
+    if (bar_idx < 0 || bar_idx >= BARRIER_NUM)
+        return;
     barrier_t *b = &barriers[bar_idx];
 
     uint64_t sstatus = irq_save();
@@ -300,6 +313,9 @@ void do_barrier_wait(int bar_idx)
 
 void do_barrier_destroy(int bar_idx)
 {
+    /* P3 评审补丁：handle 来自用户态，先验界再索引 */
+    if (bar_idx < 0 || bar_idx >= BARRIER_NUM)
+        return;
     barrier_t *b = &barriers[bar_idx];
 
     /* 测试在所有参与者退出后才 destroy（barrier.c 先 waitpid 三个孩子），
@@ -366,6 +382,11 @@ out:
 
 void do_condition_wait(int cond_idx, int mutex_idx)
 {
+    /* P3 评审补丁：两个 handle 都来自用户态，任一越界直接返回
+     *   （不解锁不阻塞——调用者按条件变量语义重查条件即可）。 */
+    if (cond_idx < 0 || cond_idx >= CONDITION_NUM ||
+        mutex_idx < 0 || mutex_idx >= LOCK_NUM)
+        return;
     condition_t *c = &conditions[cond_idx];
 
     /* ★ 全过程在一段关中断窗口里：挂上条件队列 → 放开互斥锁 → 置 BLOCKED。
@@ -403,6 +424,9 @@ void do_condition_wait(int cond_idx, int mutex_idx)
 
 void do_condition_signal(int cond_idx)
 {
+    /* P3 评审补丁：handle 来自用户态，先验界再索引 */
+    if (cond_idx < 0 || cond_idx >= CONDITION_NUM)
+        return;
     condition_t *c = &conditions[cond_idx];
 
     uint64_t sstatus = irq_save();
@@ -415,6 +439,9 @@ void do_condition_signal(int cond_idx)
 
 void do_condition_broadcast(int cond_idx)
 {
+    /* P3 评审补丁：handle 来自用户态，先验界再索引 */
+    if (cond_idx < 0 || cond_idx >= CONDITION_NUM)
+        return;
     condition_t *c = &conditions[cond_idx];
 
     uint64_t sstatus = irq_save();
@@ -427,6 +454,9 @@ void do_condition_broadcast(int cond_idx)
 
 void do_condition_destroy(int cond_idx)
 {
+    /* P3 评审补丁：handle 来自用户态，先验界再索引 */
+    if (cond_idx < 0 || cond_idx >= CONDITION_NUM)
+        return;
     condition_t *c = &conditions[cond_idx];
 
     uint64_t sstatus = irq_save();
@@ -501,6 +531,9 @@ out:
 
 void do_mbox_close(int mbox_idx)
 {
+    /* P3 评审补丁：handle 来自用户态，先验界再索引 */
+    if (mbox_idx < 0 || mbox_idx >= MBOX_NUM)
+        return;
     mailbox_t *m = &mboxes[mbox_idx];
 
     uint64_t sstatus = irq_save();
@@ -517,11 +550,16 @@ void do_mbox_close(int mbox_idx)
 
 int do_mbox_send(int mbox_idx, void *msg, int msg_length)
 {
+    /* P3 评审补丁：handle 来自用户态，先验界再索引 */
+    if (mbox_idx < 0 || mbox_idx >= MBOX_NUM)
+        return -1;
+
     mailbox_t *m = &mboxes[mbox_idx];
     int blocked = 0;
 
-    /* 单条比整个缓冲还大：剩余空间永远凑不够，直接拒绝（测试不会出现） */
-    if (msg_length > MAX_MBOX_LENGTH)
+    /* 单条比整个缓冲还大：剩余空间永远凑不够，直接拒绝（测试不会出现）。
+     *   评审补丁：负长度会绕过判据并反向腐蚀 m->count（send 减），一并拒绝。 */
+    if (msg_length <= 0 || msg_length > MAX_MBOX_LENGTH)
         return -1;
 
     while (1) {
@@ -560,10 +598,15 @@ int do_mbox_send(int mbox_idx, void *msg, int msg_length)
 
 int do_mbox_recv(int mbox_idx, void *msg, int msg_length)
 {
+    /* P3 评审补丁：handle 来自用户态，先验界再索引 */
+    if (mbox_idx < 0 || mbox_idx >= MBOX_NUM)
+        return -1;
+
     mailbox_t *m = &mboxes[mbox_idx];
     int blocked = 0;
 
-    if (msg_length > MAX_MBOX_LENGTH)
+    /* 评审补丁：负长度会绕过判据并反向腐蚀 m->count（recv 增），一并拒绝 */
+    if (msg_length <= 0 || msg_length > MAX_MBOX_LENGTH)
         return -1;
 
     while (1) {
