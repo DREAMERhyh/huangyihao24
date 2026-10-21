@@ -111,44 +111,422 @@ shell 支持退格（BS/DEL）删除输入；输入区固定在屏幕下半部�
 
 ---
 
-## 四、各任务验收组合
+## 四、各任务验收步骤（一步一步）
 
-| 任务 | 输入 | 期望看到 |
-|---|---|---|
-| 1 shell / 进程管理 | `ps`；`exec waitpid &`；`exec waitpid`（无 `&`）；`kill <pid>`；`clear`；退格；`xyzzy` | `ps` 显示 PID 0 idle、PID 1 shell；`waitpid` 测试里 `ready_to_exit` 拿两把锁→释放→退出，`wait_locks` 阻塞→被唤醒→拿锁→退出；`kill` 后目标转 EXITED；未知命令报错 |
-| 2 barrier | `exec barrier &` | 3 个 `test_barrier` 的 `(i)` 计数严格并排增长，10 轮一起收尾（屏障语义成立） |
-| 2 condition | `exec condition &` | producer 10 轮后 EXITED，3 个 consumer 的 `produced = consumed` 守恒、无负值（基于条件变量的生产者-消费者） |
-| 2 mailbox | `exec mbox_server &`，再 `exec mbox_client &`（可启动多个） | server 的 `errorBytes` 恒 0、`correctBytes` 持续增长；client 的 `send bytes` 合计 ≈ server 收量 |
-| 3 双核 | `make run-smp` + `loadbootm`；`exec multicore &` | 串口日志有 `[SMP] hart 0 entered kernel main` 与 `[SMP] hart 1 idle ready, entering scheduler loop`；multicore 打印单核/双核 ticks，双核更快（参考图 P3-7 约 1.8×） |
-| 4 taskset | `taskset 0x1 affinity &`；`ps`；`taskset -p 0x2 <pid>`；`ps` | 5 个子任务 mask 全为 `0x1`（继承父进程）；改绑后 `ps` 显示 `mask: 0x2 Running on core 1`，该子任务明显变快；5 个 `test_affinity` 的 `auipc` 相同（共享一份代码映像） |
-| 5 细粒度锁 | 两套镜像；`exec producer_rate &`、`exec consumer_rate &`，稳定后 `exec fly &` | 细粒度版开 fly 后 consumer 消费速率下降 **≤ 50%**；大锁版下降明显更大（任务书 §5.6） |
-
-> 任务 2 的 condition / mailbox 测试是**常驻不退出**的：验收完用 `ps` 看状态，
-> 再用 `kill <pid>` 收场，不要等程序自己结束。
+> **通用约定**
+> - 任务 1、2 用**单核**：`make run` → `loadbootd`；任务 3、4、5 用**双核**：`make run-smp` → `loadbootm`。
+> - 下面代码块里的行，都是在 shell 提示符 `> root@UCAS_OS:` 后**逐行输入**（提示符本身不用输入）。
+> - `<pid>`、`<mask>` 是占位符，按屏幕上的实际数字替换。
+> - 退出 QEMU 统一是：先按 `Ctrl+a`，松开后再按 `x`。
+> - 每个任务都从 `make clean && make` 开始；同一镜像内重跑可以跳过构建，直接 `make run`。
 
 ---
 
-## 五、细粒度锁双镜像对比（任务 5）
+### 4.1 任务 1：交互式 shell 与进程管理（单核）
+
+**① 构建并启动**
 
 ```bash
-make clean && make                  # 构建大锁版 → build/image
-# 运行：make run-smp → loadbootm
-#   exec producer_rate &
-#   exec consumer_rate &
-#   （记录 fly-off 时 consumer 的每秒消费量）
-#   exec fly &
-#   （记录 fly-on 时 consumer 的每秒消费量）
-
-make clean && make FINE_LOCK=1      # 构建细粒度版 → build/image
-# 同样跑一遍，比较 fly-on / fly-off 的保留率
+make clean && make
+make run
 ```
 
-**判据**：细粒度版开 fly 后消费速率下降不超过一半（保留率 ≥ 50%）。
-大锁版在大负载下会明显更差。
+U-Boot 出现 `=> ` 提示符后输入：
 
-> 留档建议：加 `QEMU_EXTRA="-icount shift=3,sleep=off"`（或等价方式）把时间基准
-> 固定成指令数，避免宿主负载/冻结污染速率口径；icount 下 guest 变慢，注入延时
-> 要放大几倍。
+```
+loadbootd
+```
+
+等内核初始化完成，屏幕出现：
+
+```
+------------------- COMMAND -------------------
+> root@UCAS_OS:
+```
+
+**② 基本命令**
+
+输入：
+
+```
+ps
+```
+
+期望：打印 `[Process Table]:`，下面只有 shell 一行（最终版**不列 idle**，也没有进程名列）：
+
+```
+[0] PID : 1  STATUS : RUNNING mask: 0x3 Running on core 0
+```
+
+输入：
+
+```
+clear
+```
+
+期望：清屏，提示符回到屏幕下半部分（第 20 行）。
+
+输入 `abc`，按两次 Backspace，再输入 `d`，然后回车。操作序列写成：
+
+```
+abc<BS><BS>d
+```
+
+（`<BS>` 表示按一次退格键，不要真的输入这几个字符。）
+
+期望：提示符后先回显 `abc`，两次退格后变成 `a`，再输入 `d` 显示 `ad`；回车后打印：
+
+```
+Unknown command: ad
+```
+
+输入一个不存在的命令：
+
+```
+xyzzy
+```
+
+期望：
+
+```
+Unknown command: xyzzy
+```
+
+**③ 后台 `exec` + `waitpid`**
+
+输入：
+
+```
+exec waitpid &
+```
+
+期望：
+- shell 打印 `Info: execute waitpid successfully, pid = N ...`，随后立刻回到提示符（`&` 表示后台运行）；
+- 屏幕第 0 行：`> [TASK] I want to wait task (pid=...) to exit.`；
+- 屏幕第 1 行：`ready_to_exit` 连续打印 `> [TASK] I am task with pid X, I have acquired two mutex locks. (i)`，`i` 从 0 涨到 9999；
+- 屏幕第 2 行：`wait_locks` 打印 `> [TASK] I want to acquire mutex lock1 ...` 后停住（两把锁都在 `ready_to_exit` 手里）；
+- `ready_to_exit` 跑满 10000 轮后释放两把锁并退出；`wait_locks` 随即打印 `I have acquired mutex lock1` / `lock2` 并退出；
+- `waitpid` 任务依次打印两条 `> [TASK] Task (pid=...) has exited.`，然后自己结束。
+
+**④ 前台 `exec` + `waitpid`**
+
+输入：
+
+```
+exec waitpid
+```
+
+期望：shell 停在 `sys_waitpid` 里等这个测试跑完，期间**不打印下一条提示符**；测试结束后提示符才回来。这就是前台执行的语义（与 ③ 的 `&` 对比）。
+
+**⑤ `kill` 一个持有锁的进程**
+
+输入：
+
+```
+exec waitpid &
+```
+
+看屏幕第 1 行，记下 `ready_to_exit` 打印的 pid `X`（`ps` 不显示进程名，所以 pid 从它自己的打印里读）。趁它还在打印（它有 10000 轮，窗口足够），输入：
+
+```
+ps
+```
+
+确认列表里有这个 pid，然后：
+
+```
+kill X
+```
+
+期望：`kill` 成功时**不打印任何东西**；如果 pid 不存在，会打印 `Error: cannot find process X`。
+
+```
+ps
+```
+
+期望：该进程状态变成 `EXITED`（或已被新进程复用）；同时因为内核替它释放了两把锁，`wait_locks` 会打印 `I have acquired mutex lock1` 并继续，`waitpid` 任务也会被唤醒。若第 1 行已经不再刷新（测试已自己跑完），重新 `exec waitpid &` 再来一次。
+
+**⑥ 退出**：`Ctrl+a` → `x`。
+
+---
+
+### 4.2 任务 2：同步原语（单核）
+
+三个子场景**各自独立启动一次 QEMU**；每个子场景结束后直接 `Ctrl+a` → `x` 退出即可（condition / mailbox 的测试是死循环，不用 kill，退出 QEMU 就把它们一起结束了）。
+
+**公共启动步骤**（三个子场景都先做这一步）：
+
+```bash
+make clean && make
+make run
+```
+
+等 `=> ` 后输入：
+
+```
+loadbootd
+```
+
+#### 2A 屏障 barrier
+
+输入：
+
+```
+exec barrier &
+```
+
+期望：屏幕第 0、1、2 行各有一个 `test_barrier`，交替打印：
+
+```
+> [TASK] Ready to enter the barrier.(i)
+> [TASK] Exited barrier (i).(sleep N s)
+```
+
+三个任务的 `(i)` **严格并排增长**（0→9）：任何一个都不会在自己的 `i` 还没到 10 时独自进入下一轮——这就是屏障语义。10 轮后 3 个 `test_barrier` 一起结束，`barrier` 主任务 `waitpid` 完自动退出。
+
+验收完：`Ctrl+a` → `x`。
+
+#### 2B 条件变量 condition
+
+重新启动（`make run` → `loadbootd`），输入：
+
+```
+exec condition &
+```
+
+期望：1 个 producer + 3 个 consumer 并发运行：
+
+- 第 0 行：producer 打印 `> [TASK] Total produced 3 products. (next in N seconds)`，每轮 +3，直到 `Total produced 30 products.`，然后 EXITED；
+- 第 1~3 行：3 个 consumer 打印 `> [TASK] Total consumed M products. (Sleep N seconds)`；
+- producer 结束后，3 个 consumer 的 `M` 之和 = **30**（生产多少消费多少，不超卖、不为负）；之后 consumer 全部阻塞在条件变量上。
+
+可以输入 `ps` 辅助确认：
+
+```
+ps
+```
+
+期望：producer 为 `EXITED`，3 个 consumer 为 `BLOCKED`，`condition` 父任务为 `BLOCKED`（它在 `waitpid` 等 4 个子进程）。
+
+验收完：`Ctrl+a` → `x`（不用 kill）。
+
+#### 2C 邮箱 mailbox
+
+重新启动（`make run` → `loadbootd`），**先启动 server，再启动两个 client**：
+
+```
+exec mbox_server &
+```
+
+等它打印 `[Server] server started`，再输入：
+
+```
+exec mbox_client &
+exec mbox_client &
+```
+
+期望：
+
+- server 打印 `[Server]: recved msg from N (blocked: B, correctBytes: C, errorBytes: E)`；
+- `E` 恒为 **0**，`C` 持续增长；
+- 两个 client 各自打印 `[Client] send bytes: N, blocked: M`，`N` 持续增长；
+- server 每秒只处理一条消息，client 发得更快时 `blocked` 会增长——这正是"信箱满 → 发送者阻塞"的预期行为；`correctBytes` 与两个 client 的累计 `send bytes` 只差信箱里尚未取走的有限缓冲，不会越差越多。
+
+验收完：`Ctrl+a` → `x`（不用 kill）。
+
+---
+
+### 4.3 任务 3：双核 SMP（双核）
+
+**① 构建并启动**
+
+```bash
+make clean && make
+make run-smp
+```
+
+等 `=> ` 后输入：
+
+```
+loadbootm
+```
+
+**② 确认两个核都进入内核**
+
+在宿主另一个终端查看 QEMU 日志（路径见 Makefile 的 `QEMU_LOG_FILE`，默认 `$HOME/OSLab-RISC-V/oslab-log.txt`）：
+
+```bash
+grep -a "\[SMP\]" "$HOME/OSLab-RISC-V/oslab-log.txt"
+```
+
+期望两行都在：
+
+```
+[SMP] hart 0 entered kernel main
+[SMP] hart 1 idle ready, entering scheduler loop
+```
+
+（`grep -a` 的 `-a` 不能省：日志里带 `\r`，普通 grep 可能把它当二进制文件。）
+
+**③ 跑 multicore 测试**
+
+```
+exec multicore &
+```
+
+期望：先打印 `start test multi-core performance`，然后分两阶段打印：
+
+```
+single core: <ticks1> ticks, result = <r>
+multi core:  <ticks2> ticks, result = <r>
+```
+
+同一次运行中 `ticks2` 应明显小于 `ticks1`（任务书参考图 P3-7 约 1.8×；实际倍数随宿主/QEMU 波动，看方向即可）。测试最后自己 `sys_exit`。
+
+**④ 退出**：`Ctrl+a` → `x`。
+
+---
+
+### 4.4 任务 4：taskset 绑核（双核）
+
+**① 构建并启动**
+
+```bash
+make clean && make
+make run-smp
+```
+
+等 `=> ` 后输入：
+
+```
+loadbootm
+```
+
+**② 用 mask 0x1 启动 affinity**
+
+```
+taskset 0x1 affinity &
+```
+
+期望：shell 打印 `taskset 0x1 affinity.`；`affinity` 在第 1 行打印：
+
+```
+start test cpu affinity, pids = {N1, N2, N3, N4, N5}
+```
+
+5 个 `test_affinity` 在屏幕第 2~6 行各自打印：
+
+```
+[pid] integer test (i/150) access: X auipc: <同一个十六进制地址>
+```
+
+5 个 `auipc` 值相同——它们共享同一份代码映像（只是各自的 PCB/栈不同）。
+
+**③ 看掩码继承**
+
+```
+ps
+```
+
+期望：`affinity` 和 5 个 `test_affinity` 的 `mask` 全是 `0x1`；其中正在运行的显示 `Running on core 0`，其余为 `READY`。
+
+**④ 动态改绑一个子任务**
+
+从第 1 行的 `pids = {N1, ...}` 里选一个，例如 `N1`：
+
+```
+taskset -p 0x2 N1
+```
+
+期望：shell 打印 `taskset -p 0x2 N1.`。改绑不打断当前时间片，等它下一次被调度后才会搬到核 1；多试几次：
+
+```
+ps
+```
+
+期望：`N1` 的 `mask` 变成 `0x2`，并在状态为 `RUNNING` 时显示 `Running on core 1`；它的 `integer test (i/150)` 进度会明显快于其他 4 个（核 1 上只有它一个，核 0 上还有另外 4 个分时间片）。
+
+**⑤ 等待结束**：5 个子任务各跑满 150 轮后自己结束，`affinity` 主任务 `waitpid` 完自动退出。
+
+**⑥ 退出**：`Ctrl+a` → `x`。
+
+---
+
+### 4.5 任务 5：细粒度锁对比（双核，两套镜像）
+
+任务是"同一份源码、两个编译开关"，要分别构建、分别运行、记录同一个指标。
+
+**① 大锁版（对照）**
+
+```bash
+make clean && make
+make run-smp
+```
+
+等 `=> ` 后输入 `loadbootm`。在 shell 里：
+
+```
+exec producer_rate &
+exec consumer_rate &
+```
+
+期望：`consumer_rate` 在屏幕第 1 行每秒打印一次：
+
+```
+[consumer] consume rate: N /s
+```
+
+等速率稳定（连续十几次数值接近，约 1 分钟），记下这个 **fly-off** 中位数。
+
+```
+exec fly &
+```
+
+期望：屏幕第 10~16 行出现一架左右飞的 ASCII 飞机。再等 1~2 分钟，记下稳定的 **fly-on** 中位数。
+
+```
+ps
+```
+
+期望：`producer_rate`、`consumer_rate`、`fly` 都在列表里，状态如实（`RUNNING` / `READY` 按调度时刻不同）。
+
+记录完：`Ctrl+a` → `x`（不用 kill）。
+
+**② 细粒度版**
+
+```bash
+make clean && make FINE_LOCK=1
+make run-smp
+```
+
+同样 `loadbootm`，重复：
+
+```
+exec producer_rate &
+exec consumer_rate &
+# 等稳定，记 fly-off
+exec fly &
+# 等稳定，记 fly-on
+ps
+```
+
+**③ 判据**
+
+- 细粒度版：`fly-on / fly-off ≥ 50%`（开 fly 后消费速率下降不超过一半，任务书 §5.6）。
+- 大锁版：开 fly 后通常断崖式下降（实测方向：保留率只有个位数百分比）。
+- 两套镜像必须都 `make clean` 后再构建——Makefile 不跟踪 CFLAGS，不 clean 会拿旧 `.o` 拼出新镜像（见 §一）。
+
+**④ 退出**：`Ctrl+a` → `x`。
+
+---
+
+## 五、任务 5 的判据与记录口径（补充）
+
+- 指标只看**同一镜像内**的 `fly-on / fly-off` 比值：`make run-smp` 用真实时钟，
+  宿主负载会同时影响两个绝对值，但不影响"同一镜像、同一台机器"的比值方向。
+- `fly-off` 取 `exec fly &` 之前连续 60 秒的中位数；`fly-on` 取开 fly 后
+  60~120 秒的中位数；两者都按 `consumer_rate` 每秒打印的数值记。
+- 细粒度版判据：保留率 ≥ 50%；大锁版作为对照，预期明显更低。
 
 ---
 
