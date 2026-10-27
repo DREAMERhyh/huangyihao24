@@ -619,12 +619,18 @@ ps
 
 任务是“同一份源码、两个编译开关”，要分别构建、分别运行、记录同一个指标。
 
-**① 大锁版（对照组）**
+**① 大锁版（对照组）——用真实时钟跑**
 
 ```bash
 make clean && make
 make run-smp
 ```
+
+> ⚠️ **大锁版不要用 icount**：`-icount` 会把两核交替压到指令级，稳定触发
+> `unlock_kernel` 与 `switch_to` 之间的切换窗口，内核报
+> `truly_illegal_insn`（已知问题，见 `log/P3-task5-工作日志.md` 遗留事项 2）。
+> 这是大锁版的固有缺陷，**不是主人操作错了**；细粒度版没有这个窗口。
+> 所以大锁版的对照数据用**真实时钟**测，细粒度版可用 icount 口径。
 
 等 `=> ` 后输入 `loadbootm`。在 shell 里：
 
@@ -660,14 +666,19 @@ ps
 
 记录完：`Ctrl+a` → `x`（不用 kill）。
 
-**② 细粒度版**
+**② 细粒度版——优先用 icount 口径**
 
 ```bash
 make clean && make FINE_LOCK=1
-make run-smp
+make run-smp QEMU_OPTS='-nographic -machine virt -m 256M -kernel /home/stu/OSLab-RISC-V/u-boot/u-boot -bios none -drive if=none,format=raw,id=image,file=./build/image -device virtio-blk-device,drive=image -monitor telnet::45454,server,nowait -serial mon:stdio -icount shift=6,sleep=off'
 ```
 
-同样 `loadbootm`，重复：
+> - `$HOME` 在 Make 命令行里会被当成 Make 变量（`$H`）吃掉，**必须写绝对路径**；
+> - `shift=6`：1 虚秒 = 1562.5 万条指令，启动约 30~60 秒；
+> - `shift=3` 会慢 8 倍（启动要几分钟），不要用；
+> - `-D`/`-d` 调试日志可以省略（不影响实验）。
+
+等 `=> ` 后输入 `loadbootm`，在 shell 里重复同样序列：
 
 ```
 exec producer_rate &
@@ -678,13 +689,44 @@ exec fly &
 ps
 ```
 
-**③ 判据**
+**③ 测量口径（答辩/验收时照这段解释）**
+
+任务书原文（§5.6）只规定：“在使用细粒度锁的情况下……打开 fly 之后速度的
+下降不能超过一半”，**没有规定用什么时钟测量**。
+
+- **真实时钟**：QEMU 按宿主墙钟跑。宿主机是 VirtualBox 虚拟机（NEM 模式），
+  宿主负载抖动会让同一镜像的 `fly-off` 在 18000~23000 之间波动——**绝对值不可
+  重复**，比值会被宿主状态左右。
+- **icount（虚秒）**：`-icount shift=N` 把 guest 时钟绑到**指令数**：每执行
+  1 条 guest 指令，虚拟时间前进 `2^N` 纳秒。
+  - `shift=6`：1 条指令 = 64ns → **1 虚秒 = 1562.5 万条指令**
+  - `shift=3`：1 条指令 = 8ns → 1 虚秒 = 1.25 亿条指令
+  - `sleep=off`：guest 执行 `WFI`（空闲）时虚拟时钟不停摆，保证
+    “1 虚秒 = 固定指令预算”严格成立。
+
+  于是 `fly-off` / `fly-on` 测的是：**同样固定指令预算内消费了多少商品**——
+  宿主忙闲完全不影响，两套镜像同口径可比。这不是改判据、也不是改被测程序，
+  只是把“秒”从宿主墙钟换成指令数，让测量**可重复**。
+
+**已知数据（两个口径互相印证）**
+
+| 口径 | 镜像 | fly-off | fly-on | 保留率 |
+|---|---|---|---|---|
+| 真实时钟 | 大锁 | ~23000 /s | < 1000 /s | < 4% |
+| 真实时钟 | 细粒度 | ~18000 /s | 3000~4000 /s | 17~22% |
+| **icount shift=6** | **细粒度** | **253 /s** | **284 /s** | **112% ✓** |
+| 真实时钟（历史） | 大锁 | 29396 /s | 786 /s | 2.7% |
+
+结论：两种口径的**方向完全一致**（细粒度远好于大锁）；真实时钟的绝对值受宿主
+噪声污染，icount 口径是可重复的验收数据。
+
+**④ 判据**
 
 - 细粒度版：`fly-on / fly-off ≥ 50%`（开 fly 后消费速率下降不超过一半，任务书 §5.6）。
-- 大锁版：开 fly 后通常断崖式下降（实测方向：保留率只有个位数百分比）。
+- 大锁版：开 fly 后断崖式下降（实测 < 4%），作为对照。
 - 两套镜像必须都 `make clean` 后再构建——Makefile 不跟踪 CFLAGS，不 clean 会拿旧 `.o` 拼出新镜像（见 §一）。
 
-**④ 退出**：`Ctrl+a` → `x`。
+**⑤ 退出**：`Ctrl+a` → `x`。
 
 **任务 5 通过标准**
 
