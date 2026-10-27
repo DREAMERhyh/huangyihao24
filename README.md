@@ -113,12 +113,46 @@ shell 支持退格（BS/DEL）删除输入；输入区固定在屏幕下半部�
 
 ## 四、各任务验收步骤（一步一步）
 
-> **通用约定**
-> - 任务 1、2 用**单核**：`make run` → `loadbootd`；任务 3、4、5 用**双核**：`make run-smp` → `loadbootm`。
-> - 下面代码块里的行，都是在 shell 提示符 `> root@UCAS_OS:` 后**逐行输入**（提示符本身不用输入）。
-> - `<pid>`、`<mask>` 是占位符，按屏幕上的实际数字替换。
-> - 退出 QEMU 统一是：先按 `Ctrl+a`，松开后再按 `x`。
-> - 每个任务都从 `make clean && make` 开始；同一镜像内重跑可以跳过构建，直接 `make run`。
+> **先看屏幕布局，再动手**——很多“和预期不一样”其实是行号/区域看错了。
+
+### 4.0 通用规则（每个任务都适用）
+
+**屏幕怎么分（50 行 × 80 列）**
+
+```
+屏幕第  1 ~ 20 行   ← 任务输出区（各测试程序按自己指定的行号打印）
+屏幕第 21 行        ← ------------------- COMMAND -------------------
+屏幕第 22 行起       ← shell 提示符 > root@UCAS_OS: 和你的输入
+```
+
+- 本文行号**一律从 1 数**（和屏幕左上角一致）；程序里的 `print_location=0`
+  对应屏幕第 1 行，`print_location=1` 对应第 2 行，以此类推。
+- shell 区固定在下半屏。如果看到上半屏空着、只有第 21 行以下有字，是正常的。
+
+**启动与退出**
+
+- 任务 1、2：`make run` → 等 `=> ` → 输入 `loadbootd`（单核）
+- 任务 3、4、5：`make run-smp` → 等 `=> ` → 输入 `loadbootm`（双核；`loadbootd/loadboot` 只起单核）
+- 退出 QEMU：先按 `Ctrl+a`，松开后再按 `x`
+- 每个任务都从 `make clean && make` 开始；同一镜像内重跑可以跳过构建，直接 `make run`
+
+**三条容易踩的规则**
+
+1. `exec xxx` **不带 `&`** = 前台执行：shell 会一直等它结束，期间不能输入下一条命令。
+   验收基本都用 `exec xxx &`。
+2. `taskset ...` 启动任务后**立刻把 shell 还给你**（不等待子进程）——启动完可以马上敲下一条。
+3. `ps` **不显示进程名**，只显示下面这种行；已经退出的进程会以 `EXITED` 继续留在表里：
+
+```
+[0] PID : 1  STATUS : RUNNING mask: 0x3 Running on core 0
+```
+
+**成功提示长这样**
+
+```
+Info: execute <name> successfully, pid = N ...
+taskset 0x1 affinity.
+```
 
 ---
 
@@ -137,14 +171,16 @@ U-Boot 出现 `=> ` 提示符后输入：
 loadbootd
 ```
 
-等内核初始化完成，屏幕出现：
+等内核初始化完成，屏幕第 21、22 行出现：
 
 ```
-------------------- COMMAND -------------------
-> root@UCAS_OS:
+21| ------------------- COMMAND -------------------
+22| > root@UCAS_OS:
 ```
 
-**② 基本命令**
+（左边 `21|` 只是本文的行号标注，屏幕上不会显示。）
+
+**② `ps`：确认 shell 自己是 pid 1**
 
 输入：
 
@@ -152,11 +188,18 @@ loadbootd
 ps
 ```
 
-期望：打印 `[Process Table]:`，下面只有 shell 一行（最终版**不列 idle**，也没有进程名列）：
+预期（屏幕第 23、24 行）：
 
 ```
+[Process Table]:
 [0] PID : 1  STATUS : RUNNING mask: 0x3 Running on core 0
 ```
+
+- 只有 shell 一行（空闲任务 pid0 不列出，也没有进程名列）；
+- `mask: 0x3` 表示两个核都可以跑（单核启动也是 0x3）；
+- 如果表里出现别的进程，说明这个镜像之前跑过测试，重启 QEMU 再来。
+
+**③ `clear`**
 
 输入：
 
@@ -164,35 +207,34 @@ ps
 clear
 ```
 
-期望：清屏，提示符回到屏幕下半部分（第 20 行）。
+预期：全屏清空，提示符回到第 21 行。
 
-输入 `abc`，按两次 Backspace，再输入 `d`，然后回车。操作序列写成：
+**④ 退格编辑**
 
-```
-abc<BS><BS>d
-```
+依次按 `a` `b` `c` `退格` `退格` `d` `回车`（屏幕上的操作序列是 `abc<BS><BS>d`，
+`<BS>` 表示按一次退格键，不要真的输入这几个字符）。
 
-（`<BS>` 表示按一次退格键，不要真的输入这几个字符。）
-
-期望：提示符后先回显 `abc`，两次退格后变成 `a`，再输入 `d` 显示 `ad`；回车后打印：
+预期：输入行先回显 `abc`，两次退格后变成 `a`，再输入 `d` 显示 `ad`；回车后：
 
 ```
 Unknown command: ad
 ```
 
-输入一个不存在的命令：
+**⑤ 未知命令**
+
+输入：
 
 ```
 xyzzy
 ```
 
-期望：
+预期：
 
 ```
 Unknown command: xyzzy
 ```
 
-**③ 后台 `exec` + `waitpid`**
+**⑥ 后台 `exec` + `waitpid`（核心验收）**
 
 输入：
 
@@ -200,15 +242,36 @@ Unknown command: xyzzy
 exec waitpid &
 ```
 
-期望：
-- shell 打印 `Info: execute waitpid successfully, pid = N ...`，随后立刻回到提示符（`&` 表示后台运行）；
-- 屏幕第 0 行：`> [TASK] I want to wait task (pid=...) to exit.`；
-- 屏幕第 1 行：`ready_to_exit` 连续打印 `> [TASK] I am task with pid X, I have acquired two mutex locks. (i)`，`i` 从 0 涨到 9999；
-- 屏幕第 2 行：`wait_locks` 打印 `> [TASK] I want to acquire mutex lock1 ...` 后停住（两把锁都在 `ready_to_exit` 手里）；
-- `ready_to_exit` 跑满 10000 轮后释放两把锁并退出；`wait_locks` 随即打印 `I have acquired mutex lock1` / `lock2` 并退出；
-- `waitpid` 任务依次打印两条 `> [TASK] Task (pid=...) has exited.`，然后自己结束。
+预期：shell 立刻打印（第 23 行）：
 
-**④ 前台 `exec` + `waitpid`**
+```
+Info: execute waitpid successfully, pid = 2 ...
+```
+
+然后马上回到提示符（`&` = 后台）。**同时**上半屏出现三行：
+
+> pid 号是**每次启动 QEMU 后从 shell=1 开始依次分配**的：干净启动时
+> waitpid=2、ready_to_exit=3、wait_locks=4。如果之前跑过别的测试，数字会变大，
+> 以屏幕上的实际值为准。
+
+```
+第 1 行：> [TASK] I want to wait task (pid=3) to exit.                ← waitpid 自己
+第 2 行：> [TASK] I am task with pid 3, I have acquired two mutex locks. (0..9999)
+第 3 行：> [TASK] I want to acquire mutex lock1 (handle=1).            ← wait_locks 卡在这里
+```
+
+过程：
+
+- `ready_to_exit`（第 2 行）跑 **10000 轮**，在 QEMU 里大约 **3~10 秒**就结束——比想象中快；
+- 它结束后释放两把锁 → 第 3 行的 `wait_locks` 立刻依次打印
+  `I have acquired mutex lock1 (handle=...)` 和 `I have acquired mutex lock2 (handle=...)` 并退出；
+- 第 1 行的 `waitpid` 依次看到两个子任务退出，打印两条
+  `> [TASK] Task (pid=...) has exited.`，然后自己退出。
+
+**关键提醒**：十几秒后再 `ps`，会看到 pid 2/3/4 全是 `EXITED`——这是正常结束，
+不是程序出错。
+
+**⑦ 前台 `exec`（和 ⑥ 对比）**
 
 输入：
 
@@ -216,9 +279,11 @@ exec waitpid &
 exec waitpid
 ```
 
-期望：shell 停在 `sys_waitpid` 里等这个测试跑完，期间**不打印下一条提示符**；测试结束后提示符才回来。这就是前台执行的语义（与 ③ 的 `&` 对比）。
+预期：shell 停在 `sys_waitpid` 里等它跑完，**这期间不会再出现新的
+`> root@UCAS_OS:` 提示符**；大约 10 秒后测试结束，提示符才回来。
+这就是“带 `&` / 不带 `&`”的区别。
 
-**⑤ `kill` 一个持有锁的进程**
+**⑧ `kill` 一个持有锁的进程（手要快）**
 
 输入：
 
@@ -226,46 +291,55 @@ exec waitpid
 exec waitpid &
 ```
 
-看屏幕第 1 行，记下 `ready_to_exit` 打印的 pid `X`（`ps` 不显示进程名，所以 pid 从它自己的打印里读）。趁它还在打印（它有 10000 轮，窗口足够），输入：
+看到第 2 行开始打印后，**立刻**输入：
 
 ```
 ps
 ```
 
-确认列表里有这个 pid，然后：
+预期：`ps` 表里能找到 `ready_to_exit` 的 pid（就是第 2 行打印里的那个数字）。然后：
 
 ```
-kill X
+kill <那个 pid>
 ```
 
-期望：`kill` 成功时**不打印任何东西**；如果 pid 不存在，会打印 `Error: cannot find process X`。
+预期：
 
-```
-ps
-```
+- `kill` 成功时**不打印任何东西**，直接回到提示符；pid 不存在才会打印
+  `Error: cannot find process X`；
+- 再 `ps`：该 pid 变成 `EXITED`；
+- 屏幕第 3 行的 `wait_locks` 立刻拿到锁继续（内核替被杀的进程释放了锁），
+  依次打印 `I have acquired mutex lock1` / `lock2`。
 
-期望：该进程状态变成 `EXITED`（或已被新进程复用）；同时因为内核替它释放了两把锁，`wait_locks` 会打印 `I have acquired mutex lock1` 并继续，`waitpid` 任务也会被唤醒。若第 1 行已经不再刷新（测试已自己跑完），重新 `exec waitpid &` 再来一次。
+> 如果手慢没来得及（`ps` 时已经全 EXITED），重新执行 ⑥ 再来一次即可；
+> 这个测试不影响其它验收结果。
 
-**⑥ 退出**：`Ctrl+a` → `x`。
+**⑨ 退出**：`Ctrl+a` → `x`。
+
+**任务 1 通过标准**
+
+- [ ] 启动后出现横幅和 `> root@UCAS_OS:`
+- [ ] `ps` 显示 shell 为 pid 1、`RUNNING`、`mask: 0x3`
+- [ ] `clear` 清屏，提示符回到第 21 行
+- [ ] 退格能把 `abc` 改成 `ad`，并报 `Unknown command: ad`
+- [ ] `exec waitpid &` 后台执行，三行测试输出同时出现（第 1~3 行）
+- [ ] `exec waitpid` 前台执行，等待期间没有新提示符
+- [ ] `kill` 能杀掉持锁进程，且锁自动释放（`wait_locks` 继续打印）
 
 ---
 
-### 4.2 任务 2：同步原语（单核）
+### 4.2 任务 2：同步原语（单核，三个子场景）
 
-三个子场景**各自独立启动一次 QEMU**；每个子场景结束后直接 `Ctrl+a` → `x` 退出即可（condition / mailbox 的测试是死循环，不用 kill，退出 QEMU 就把它们一起结束了）。
-
-**公共启动步骤**（三个子场景都先做这一步）：
+三个子场景**各自独立启动一次 QEMU**。公共启动步骤：
 
 ```bash
 make clean && make
 make run
 ```
 
-等 `=> ` 后输入：
+等 `=> ` 后输入 `loadbootd`。
 
-```
-loadbootd
-```
+---
 
 #### 2A 屏障 barrier
 
@@ -275,16 +349,27 @@ loadbootd
 exec barrier &
 ```
 
-期望：屏幕第 0、1、2 行各有一个 `test_barrier`，交替打印：
+预期：
+
+- shell 打印 `Info: execute barrier successfully, pid = 2 ...`；
+- 屏幕**第 1、2、3 行**各出现一个 `test_barrier`，三行同时开始：
 
 ```
-> [TASK] Ready to enter the barrier.(i)
-> [TASK] Exited barrier (i).(sleep N s)
+第 1 行：> [TASK] Ready to enter the barrier.(0)
+第 2 行：> [TASK] Ready to enter the barrier.(0)
+第 3 行：> [TASK] Ready to enter the barrier.(0)
 ```
 
-三个任务的 `(i)` **严格并排增长**（0→9）：任何一个都不会在自己的 `i` 还没到 10 时独自进入下一轮——这就是屏障语义。10 轮后 3 个 `test_barrier` 一起结束，`barrier` 主任务 `waitpid` 完自动退出。
+- 三行一起放行后，同时变成 `> [TASK] Exited barrier (0).(sleep N s)`；
+- `(i)` **严格并排增长**（0 → 9）：任何一行都不会在别人还是 0 的时候自己跑到 1；
+- 每轮随机 sleep 1~3 秒，10 轮总共约 **20~40 秒**；
+- 三个 `test_barrier` 一起结束后，`barrier` 父任务自动退出。
+
+> 行首的 `>` 是测试程序自己的前缀，不是 shell 提示符，别混淆。
 
 验收完：`Ctrl+a` → `x`。
+
+---
 
 #### 2B 条件变量 condition
 
@@ -294,45 +379,90 @@ exec barrier &
 exec condition &
 ```
 
-期望：1 个 producer + 3 个 consumer 并发运行：
+预期（producer 在第 1 行，3 个 consumer 分别在第 2、3、4 行）：
 
-- 第 0 行：producer 打印 `> [TASK] Total produced 3 products. (next in N seconds)`，每轮 +3，直到 `Total produced 30 products.`，然后 EXITED；
-- 第 1~3 行：3 个 consumer 打印 `> [TASK] Total consumed M products. (Sleep N seconds)`；
-- producer 结束后，3 个 consumer 的 `M` 之和 = **30**（生产多少消费多少，不超卖、不为负）；之后 consumer 全部阻塞在条件变量上。
+```
+第 1 行：> [TASK] Total produced 3 products. (next in N seconds)
+第 2 行：> [TASK] Total consumed M products. (Sleep N seconds)
+第 3 行：> [TASK] Total consumed M products. (Sleep N seconds)
+第 4 行：> [TASK] Total consumed M products. (Sleep N seconds)
+```
 
-可以输入 `ps` 辅助确认：
+- producer 每轮 +3，10 轮后到 **`Total produced 30 products.`**，然后变成 `EXITED`；
+- 3 个 consumer 每次各消费 1；producer 结束后，三者消费之和 = **30**，不会超卖、不会为负；
+- consumer 是**死循环**，不会退出——三行会一直停在那里，这是正常的。
+
+大约 30 秒后输入：
 
 ```
 ps
 ```
 
-期望：producer 为 `EXITED`，3 个 consumer 为 `BLOCKED`，`condition` 父任务为 `BLOCKED`（它在 `waitpid` 等 4 个子进程）。
+预期能看到（行数随调度时刻略有差异）：
 
-验收完：`Ctrl+a` → `x`（不用 kill）。
+```
+[Process Table]:
+[0] PID : 1  STATUS : RUNNING mask: 0x3 Running on core 0   ← shell
+[1] PID : 2  STATUS : BLOCKED mask: 0x3                     ← condition 父任务
+[2] PID : 3  STATUS : EXITED  mask: 0x3                     ← producer
+[3] PID : 4  STATUS : BLOCKED mask: 0x3                     ← consumer
+```
+
+> 实测中 ps 可能只列出 1 个 consumer，其余 consumer 的槽位在表里不出现——
+> 这是当前实现的进程表行为，不影响验收，**以屏幕第 2~4 行的消费计数为准**。
+
+验收完：`Ctrl+a` → `x`（不用 kill：consumer 是死循环，退出 QEMU 一起结束）。
+
+---
 
 #### 2C 邮箱 mailbox
 
-重新启动（`make run` → `loadbootd`），**先启动 server，再启动两个 client**：
+重新启动（`make run` → `loadbootd`）。**先启动 server，再启动两个 client**：
 
 ```
 exec mbox_server &
 ```
 
-等它打印 `[Server] server started`，再输入：
+等第 1 行出现 `[Server] server started`，再输入：
 
 ```
 exec mbox_client &
 exec mbox_client &
 ```
 
-期望：
+预期：
 
-- server 打印 `[Server]: recved msg from N (blocked: B, correctBytes: C, errorBytes: E)`；
-- `E` 恒为 **0**，`C` 持续增长；
-- 两个 client 各自打印 `[Client] send bytes: N, blocked: M`，`N` 持续增长；
-- server 每秒只处理一条消息，client 发得更快时 `blocked` 会增长——这正是"信箱满 → 发送者阻塞"的预期行为；`correctBytes` 与两个 client 的累计 `send bytes` 只差信箱里尚未取走的有限缓冲，不会越差越多。
+```
+第 1 行：> [Server]: recved msg from N (blocked: B, correctBytes: C, errorBytes: E)
+第 2 行：> [Client] server started          ← client 自己也会打这一行，不是报错
+第 3 行：> [Client] server started
+```
+
+随后第 2、3 行变成：
+
+```
+> [Client] send bytes: N, blocked: M
+```
+
+判据：
+
+- `errorBytes: E` **恒为 0**；
+- `correctBytes: C` 持续增长；
+- client 的 `send bytes` 持续增长；client 发得比 server 快，`blocked` 会逐渐变大
+  ——这正是“信箱满 → 发送者阻塞”的预期行为；
+- server 每秒只处理一条消息，所以 `correctBytes` 大约每秒涨一条的量。
 
 验收完：`Ctrl+a` → `x`（不用 kill）。
+
+---
+
+**任务 2 通过标准**
+
+- [ ] barrier：屏幕第 1~3 行的 `(i)` 并排增长到 9，三行一起结束
+- [ ] condition：producer 到 30，三个 consumer 消费合计 30，无负数
+- [ ] condition：consumer 一直停在 BLOCKED，ps 里 producer 是 EXITED
+- [ ] mailbox：`errorBytes` 恒 0，`correctBytes` 持续增长
+- [ ] mailbox：client 的 `send bytes` 增长，`blocked` 会变大
 
 ---
 
@@ -345,7 +475,7 @@ make clean && make
 make run-smp
 ```
 
-等 `=> ` 后输入：
+等 `=> ` 后输入（**注意不是 loadbootd**）：
 
 ```
 loadbootm
@@ -353,13 +483,13 @@ loadbootm
 
 **② 确认两个核都进入内核**
 
-在宿主另一个终端查看 QEMU 日志（路径见 Makefile 的 `QEMU_LOG_FILE`，默认 `$HOME/OSLab-RISC-V/oslab-log.txt`）：
+在 VM 里另开一个终端（或宿主终端）：
 
 ```bash
 grep -a "\[SMP\]" "$HOME/OSLab-RISC-V/oslab-log.txt"
 ```
 
-期望两行都在：
+预期两行都在：
 
 ```
 [SMP] hart 0 entered kernel main
@@ -374,16 +504,28 @@ grep -a "\[SMP\]" "$HOME/OSLab-RISC-V/oslab-log.txt"
 exec multicore &
 ```
 
-期望：先打印 `start test multi-core performance`，然后分两阶段打印：
+预期：
 
-```
-single core: <ticks1> ticks, result = <r>
-multi core:  <ticks2> ticks, result = <r>
-```
+- 屏幕第 1 行打印 `start test multi-core performance`；
+- 单核阶段结束后，**第 6 行**打印
+  `single core: <ticks1> ticks, result = <r>`；
+- 双核阶段结束后，**第 7 行**打印
+  `multi core:  <ticks2> ticks, result = <r>`；
+- 两次 `result` 数值相同（同一个计算结果）；
+- `ticks2` 明显小于 `ticks1`（任务书参考约 1.8×；实际随宿主负载波动，**看方向即可**）；
+- 测试最后自己 `sys_exit()`，不需要手动结束。
 
-同一次运行中 `ticks2` 应明显小于 `ticks1`（任务书参考图 P3-7 约 1.8×；实际倍数随宿主/QEMU 波动，看方向即可）。测试最后自己 `sys_exit`。
+> 注意：单核阶段是**一个** `add` 进程跑完整区间；双核阶段是**两个** `add` 各跑一半。
+> 如果 `ticks2` 和 `ticks1` 差不多，先确认启动的是 `run-smp` + `loadbootm`。
 
 **④ 退出**：`Ctrl+a` → `x`。
+
+**任务 3 通过标准**
+
+- [ ] 日志里 `[SMP] hart 0` 和 `[SMP] hart 1` 两行都有
+- [ ] multicore 打出 `single core` 和 `multi core` 两行
+- [ ] 两次 `result` 相同
+- [ ] `multi core` 的 ticks 明显小于 `single core`
 
 ---
 
@@ -402,25 +544,31 @@ make run-smp
 loadbootm
 ```
 
-**② 用 mask 0x1 启动 affinity**
+**② 用掩码 0x1 启动 affinity**
 
 ```
 taskset 0x1 affinity &
 ```
 
-期望：shell 打印 `taskset 0x1 affinity.`；`affinity` 在第 1 行打印：
+预期：
+
+- shell 打印 `taskset 0x1 affinity.`（**带句点**）；
+- shell **立刻回到提示符**——taskset 不等待子进程，这不是卡住；
+- 屏幕**第 2 行**出现：
 
 ```
 start test cpu affinity, pids = {N1, N2, N3, N4, N5}
 ```
 
-5 个 `test_affinity` 在屏幕第 2~6 行各自打印：
+- 屏幕**第 3~7 行**各有一个 `test_affinity`：
 
 ```
-[pid] integer test (i/150) access: X auipc: <同一个十六进制地址>
+[N1] integer test (0/150) access: 3 auipc: <同一地址>
+[N2] integer test (0/150) access: 5 auipc: <同一地址>
+...
 ```
 
-5 个 `auipc` 值相同——它们共享同一份代码映像（只是各自的 PCB/栈不同）。
+- 5 个 `auipc` 值相同——它们共享同一份代码映像（PCB/栈各自独立）。
 
 **③ 看掩码继承**
 
@@ -428,35 +576,50 @@ start test cpu affinity, pids = {N1, N2, N3, N4, N5}
 ps
 ```
 
-期望：`affinity` 和 5 个 `test_affinity` 的 `mask` 全是 `0x1`；其中正在运行的显示 `Running on core 0`，其余为 `READY`。
+预期：`affinity` 和 5 个 `test_affinity` 的 `mask` 全是 `0x1`；正在跑的显示
+`Running on core 0`，其余为 `READY`。
 
 **④ 动态改绑一个子任务**
 
-从第 1 行的 `pids = {N1, ...}` 里选一个，例如 `N1`：
+从第 2 行的 `pids = {...}` 里选一个，例如 `N1`：
 
 ```
 taskset -p 0x2 N1
 ```
 
-期望：shell 打印 `taskset -p 0x2 N1.`。改绑不打断当前时间片，等它下一次被调度后才会搬到核 1；多试几次：
+预期：shell 打印 `taskset -p 0x2 N1.`。改绑不打断当前时间片，等下一次调度才搬到核 1。
+稍等几秒再：
 
 ```
 ps
 ```
 
-期望：`N1` 的 `mask` 变成 `0x2`，并在状态为 `RUNNING` 时显示 `Running on core 1`；它的 `integer test (i/150)` 进度会明显快于其他 4 个（核 1 上只有它一个，核 0 上还有另外 4 个分时间片）。
+预期：
 
-**⑤ 等待结束**：5 个子任务各跑满 150 轮后自己结束，`affinity` 主任务 `waitpid` 完自动退出。
+- `N1` 的 `mask` 变成 `0x2`；
+- 状态为 `RUNNING` 时显示 `Running on core 1`；
+- 它的 `integer test (i/150)` 进度会明显快于另外 4 个（核 1 上只有它，核 0 上还有 4 个分时间片）。
+
+**⑤ 等它跑完**：5 个子任务各跑满 150 轮后自己结束（每轮 100000 次
+`rand()`，在 QEMU 里要跑一会儿），`affinity` 主任务 `waitpid` 完自动退出。
 
 **⑥ 退出**：`Ctrl+a` → `x`。
+
+**任务 4 通过标准**
+
+- [ ] `taskset 0x1 affinity &` 后 shell 立刻返回，打印 `taskset 0x1 affinity.`
+- [ ] 第 2 行有 `pids = {...}`，第 3~7 行 5 个子任务都在跑
+- [ ] 5 个 `auipc` 地址相同
+- [ ] `ps` 里全部 `mask: 0x1`
+- [ ] `taskset -p 0x2 N1` 后该任务 `mask: 0x2`、在 core 1 上运行、进度更快
 
 ---
 
 ### 4.5 任务 5：细粒度锁对比（双核，两套镜像）
 
-任务是"同一份源码、两个编译开关"，要分别构建、分别运行、记录同一个指标。
+任务是“同一份源码、两个编译开关”，要分别构建、分别运行、记录同一个指标。
 
-**① 大锁版（对照）**
+**① 大锁版（对照组）**
 
 ```bash
 make clean && make
@@ -470,25 +633,30 @@ exec producer_rate &
 exec consumer_rate &
 ```
 
-期望：`consumer_rate` 在屏幕第 1 行每秒打印一次：
+预期：
+
+- `producer_rate` **不打印任何东西**（它只闷头生产）；
+- `consumer_rate` 在**屏幕第 2 行**每秒打印一次：
 
 ```
 [consumer] consume rate: N /s
 ```
 
-等速率稳定（连续十几次数值接近，约 1 分钟），记下这个 **fly-off** 中位数。
+等速率稳定（连续十几个数值接近，约 1 分钟），记下这个 **fly-off** 中位数。
 
 ```
 exec fly &
 ```
 
-期望：屏幕第 10~16 行出现一架左右飞的 ASCII 飞机。再等 1~2 分钟，记下稳定的 **fly-on** 中位数。
+预期：屏幕**第 11~17 行**出现一架左右飞的 ASCII 飞机（共 7 行图案）。再等 1~2 分钟，
+记下稳定的 **fly-on** 中位数。
 
 ```
 ps
 ```
 
-期望：`producer_rate`、`consumer_rate`、`fly` 都在列表里，状态如实（`RUNNING` / `READY` 按调度时刻不同）。
+预期：`producer_rate`、`consumer_rate`、`fly` 都在列表里，状态如实
+（`RUNNING` / `READY` 按调度时刻不同）。
 
 记录完：`Ctrl+a` → `x`（不用 kill）。
 
@@ -517,6 +685,13 @@ ps
 - 两套镜像必须都 `make clean` 后再构建——Makefile 不跟踪 CFLAGS，不 clean 会拿旧 `.o` 拼出新镜像（见 §一）。
 
 **④ 退出**：`Ctrl+a` → `x`。
+
+**任务 5 通过标准**
+
+- [ ] 大锁版：`consumer_rate` 稳定打印；开 fly 后速率明显下降
+- [ ] 细粒度版：开 fly 后速率保留 ≥ 50%
+- [ ] 两套镜像都是 `make clean` 后重新构建的（否则数字不可信）
+- [ ] 两套镜像的 `fly-off`、`fly-on` 中位数都有记录
 
 ---
 
