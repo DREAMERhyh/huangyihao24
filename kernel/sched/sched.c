@@ -299,7 +299,12 @@ void do_unblock(list_node_t *pcb_node)
 
     list_del(pcb_node);
     task->status = TASK_READY;
-    list_add_tail(pcb_node, &ready_queue);
+    /* 任务5：唤醒插队——刚被唤醒的任务放队首，而不是队尾。
+     *   条件变量/互斥锁这类"乒乓"负载里，每一轮都要阻塞-唤醒一次，
+     *   速率取决于唤醒后多久被调度。放队尾时要排在 shell/fly 后面等
+     *   一整轮（开 fly 后尤其明显，实测 10066/s → 700/s）；放队首则
+     *   醒来就能跑，和往届用 vruntime 把唤醒者抬到队首的做法等价。 */
+    list_add(pcb_node, &ready_queue);
 
     /* 任务5：唤醒"还在核上"的任务只挂队、先不给挑（wake_pending）。
      *   窗口：它放下 sched_lock 之后、走进自己的 do_scheduler 之前；此刻
