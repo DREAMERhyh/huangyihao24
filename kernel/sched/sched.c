@@ -32,6 +32,19 @@ pcb_t pid0_pcb[NR_CPUS] = {
 /* 每核"正在运行"的 PCB（do_scheduler 在大锁内维护，见 sched.h 注释） */
 pcb_t *core_running[NR_CPUS];
 
+/* ===== 临时诊断（开发板 consumer_rate 卡死排查用，定稿前删除）=====
+ *   · diag_beat[c]     ：每核进 do_scheduler 的次数（判断"时钟中断/调度
+ *                        是否还活着"——两核都不涨 = 定时器死了或核卡住）
+ *   · diag_wp_set      ：do_unblock 打 wake_pending 标记的累计次数
+ *   · diag_wp_heal*    ：pick_next 发现"标记已过期"（任务不在任何核上）
+ *                        并清除的次数 / 最近一次的 pid 与它自报的核号
+ *   ps 里会打印这些计数（见 process.c do_process_show）。 */
+uint64_t diag_beat[NR_CPUS];
+uint64_t diag_wp_set;
+uint64_t diag_wp_heal;
+pid_t    diag_wp_heal_pid;
+int      diag_wp_heal_cpu;
+
 LIST_HEAD(ready_queue);
 LIST_HEAD(sleep_queue);
 
@@ -89,6 +102,34 @@ static int cpu_allows(pcb_t *t, int cpu)
     return (t->cpu_mask >> cpu) & 1UL;
 }
 
+/* 任务5 唤醒纪律：这个任务此刻是否要因 wake_pending 被跳过？
+ *   ★ 自愈（只在细粒度版开）：wake_pending 只该在"任务还在核上、且马上
+ *     就要走进自己的 do_scheduler"的窗口里为真。若现在它已经不在任何核的
+ *     core_running[] 表上，说明那个窗口早过去了——它的 do_scheduler 要么
+ *     已经清过标记（正常），要么这条路径没能走到（异常）。后一种情况下
+ *     标记没人会再清，任务会被两个核永远跳过（板上 consumer 卡死的形态）。
+ *     交棒锁保证：pick_next 持 sched_lock 时，不在 core_running[] 上
+ *     ⇔ 已完整下核、现场已保存，绝无"两核同跑一个内核栈"的风险；
+ *     所以直接把过期标记清掉、按普通任务参与挑选即可。
+ *     大锁版不启用：它的 unlock→switch_to 之间还有几条汇编指令的窗口，
+ *     "不在表上"不蕴含"现场已写完"（见 sched.h 注释），此时清标记会
+ *     退化成不安全的版本——好在那个版本从不打这个标记。 */
+static int wp_blocks(pcb_t *t)
+{
+    if (!t->wake_pending)
+        return 0;
+#ifdef FINE_GRAIN_LOCK
+    if (!task_on_cpu(t)) {
+        diag_wp_heal++;
+        diag_wp_heal_pid = t->pid;
+        diag_wp_heal_cpu = t->running_cpu;
+        t->wake_pending = 0;
+        return 0;
+    }
+#endif
+    return 1;                    /* 还在核上：等它自己的 do_scheduler 清标记 */
+}
+
 /* 从全局就绪队列里挑下一个跑的任务（队首 RR + 任务5 的 pick-min）。
  *   返回 NULL：队列为空、或队列里的任务掩码都不允许本核——由调用者
  *   让本核 idle 怠速。 */
@@ -99,8 +140,8 @@ static pcb_t *pick_next(int cpu)
     /* 取"第一个掩码允许本核"的任务当候选（等价于原来"选队首"的 RR 语义） */
     for (list_node_t *n = ready_queue.next; n != &ready_queue; n = n->next) {
         pcb_t *t = list_entry(n, pcb_t, list);
-        if (t->wake_pending)
-            continue;               /* 还在别的核上：等它自己的 do_scheduler 清标记 */
+        if (wp_blocks(t))
+            continue;
         if (cpu_allows(t, cpu)) {
             best = t;
             break;
@@ -115,7 +156,7 @@ static pcb_t *pick_next(int cpu)
         pcb_t *t = list_entry(n, pcb_t, list);
         if (!cpu_allows(t, cpu))
             continue;
-        if (t->wake_pending)
+        if (wp_blocks(t))
             continue;                       /* 同上：提前唤醒的静默期 */
         if (!t->has_wl || t->wl_run >= WL_RUN_MAX)
             continue;                       /* 配额用尽：退回普通轮转 */
@@ -140,6 +181,8 @@ void do_scheduler(void)
      *   时由本核写入）。★ 第 183 行起 current_running 会被改写成 next，
      *   所以函数内部一律用这个局部量，不再中途调 get_current_cpu_id()。 */
     int cpu = (int)get_current_cpu_id();
+
+    diag_beat[cpu]++;               /* 临时诊断：本核调度心跳 */
 
     // TODO: [p2-task3] Check sleep queue to wake up PCBs
     // 每次调度前先看看有没有睡够的进程，把它们放回就绪队列
@@ -283,6 +326,8 @@ void do_unblock(list_node_t *pcb_node)
      *   栈，正是 300s 验证里残存的 epc=ra=&sched_lock 崩溃（hit1=4 的现场：
      *   consumer 被核 0 认领的同时被核 1 从就绪队列挑走）。设标记后由它
      *   自己的 do_scheduler 解除，那时代码路径全程持 sched_lock，安全。 */
-    if (task_on_cpu(task))
+    if (task_on_cpu(task)) {
         task->wake_pending = 1;
+        diag_wp_set++;              /* 临时诊断：打过一次静默标记 */
+    }
 }

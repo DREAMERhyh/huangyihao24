@@ -14,6 +14,13 @@ extern void ret_from_exception();
 /* P3 任务3：新任务的首次上场入口（entry.S）——先补拿大内核锁再走公共返回路径 */
 extern void new_task_entry();
 
+/* 临时诊断（板测排查 consumer_rate 卡死用，定稿前删除）：定义在 sched.c */
+extern uint64_t diag_beat[NR_CPUS];
+extern uint64_t diag_wp_set;
+extern uint64_t diag_wp_heal;
+extern pid_t    diag_wp_heal_pid;
+extern int      diag_wp_heal_cpu;
+
 /* =====================================================================
  * P3 任务1：进程管理（exec / exit / kill / waitpid / ps / getpid）
  *
@@ -293,6 +300,11 @@ pid_t do_exec(char *name, int argc, char **argv, uint64_t mask)
     task->wl_cols = 0;
     task->wl_run = 0;
     task->has_wl = 0;
+    /* 任务5：PCB 复用时必须清掉上一世的唤醒挂起标记——否则新进程
+     *   一起步就带着 wake_pending=1，而它的 do_scheduler 要等被调度到
+     *   才清；可 pick_next 又因这个标记永不选它 → 自锁死（板上
+     *   consumer_rate 卡死的候选根因之一）。 */
+    task->wake_pending = 0;
     list_init(&task->wait_list);
 
     /* ⑥ 伪造现场并入就绪队列（初始 sp = 参数区之下的对齐位置） */
@@ -472,6 +484,17 @@ static const char *task_status_str(task_status_t st)
     }
 }
 
+/* 临时诊断：任务当前是否真的挂在就绪队列上（ps 里 q: 字段）。
+ *   调用者已持 sched_lock。READY 却 q:0 = 结点已从队列里丢失。 */
+static int in_ready_queue(pcb_t *t)
+{
+    for (list_node_t *n = ready_queue.next; n != &ready_queue; n = n->next) {
+        if (list_entry(n, pcb_t, list) == t)
+            return 1;
+    }
+    return 0;
+}
+
 void do_process_show(void)
 {
     /* 输出格式对齐官方参考图（任务书图 P3-8）：
@@ -522,10 +545,22 @@ void do_process_show(void)
                row, pcb[i].pid, st, pcb[i].cpu_mask);
         if (core >= 0)
             printk(" Running on core %d", core);
+        /* 临时诊断字段：wp = wake_pending；q = 是否真在就绪队列上（非 READY 打 -1） */
+        printk(" wp:%d q:%d", pcb[i].wake_pending,
+               pcb[i].status == TASK_READY ? in_ready_queue(&pcb[i]) : -1);
         printk("\n");
 
         ++row;
     }
+
+    /* 临时诊断汇总：两核调度心跳 + 唤醒标记的设置/自愈计数 */
+    printk("[diag] beat0=%ld beat1=%ld wp_set=%ld wp_heal=%ld(pid=%d cpu=%d)\n",
+           (long)diag_beat[0], (long)diag_beat[1],
+           (long)diag_wp_set, (long)diag_wp_heal,
+           diag_wp_heal_pid, diag_wp_heal_cpu);
+    printk("[diag] core0=%d core1=%d\n",
+           core_running[0] ? core_running[0]->pid : -1,
+           core_running[1] ? core_running[1]->pid : -1);
 
     FINE_UNLOCK(&sched_lock);
 }
