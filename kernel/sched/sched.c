@@ -32,19 +32,6 @@ pcb_t pid0_pcb[NR_CPUS] = {
 /* 每核"正在运行"的 PCB（do_scheduler 在大锁内维护，见 sched.h 注释） */
 pcb_t *core_running[NR_CPUS];
 
-/* ===== 临时诊断（开发板 consumer_rate 卡死排查用，定稿前删除）=====
- *   · diag_beat[c]     ：每核进 do_scheduler 的次数（判断"时钟中断/调度
- *                        是否还活着"——两核都不涨 = 定时器死了或核卡住）
- *   · diag_wp_set      ：do_unblock 打 wake_pending 标记的累计次数
- *   · diag_wp_heal*    ：pick_next 发现"标记已过期"（任务不在任何核上）
- *                        并清除的次数 / 最近一次的 pid 与它自报的核号
- *   ps 里会打印这些计数（见 process.c do_process_show）。 */
-uint64_t diag_beat[NR_CPUS];
-uint64_t diag_wp_set;
-uint64_t diag_wp_heal;
-pid_t    diag_wp_heal_pid;
-int      diag_wp_heal_cpu;
-
 LIST_HEAD(ready_queue);
 LIST_HEAD(sleep_queue);
 
@@ -120,9 +107,6 @@ static int wp_blocks(pcb_t *t)
         return 0;
 #ifdef FINE_GRAIN_LOCK
     if (!task_on_cpu(t)) {
-        diag_wp_heal++;
-        diag_wp_heal_pid = t->pid;
-        diag_wp_heal_cpu = t->running_cpu;
         t->wake_pending = 0;
         return 0;
     }
@@ -181,8 +165,6 @@ void do_scheduler(void)
      *   时由本核写入）。★ 第 183 行起 current_running 会被改写成 next，
      *   所以函数内部一律用这个局部量，不再中途调 get_current_cpu_id()。 */
     int cpu = (int)get_current_cpu_id();
-
-    diag_beat[cpu]++;               /* 临时诊断：本核调度心跳 */
 
     // TODO: [p2-task3] Check sleep queue to wake up PCBs
     // 每次调度前先看看有没有睡够的进程，把它们放回就绪队列
@@ -326,8 +308,6 @@ void do_unblock(list_node_t *pcb_node)
      *   栈，正是 300s 验证里残存的 epc=ra=&sched_lock 崩溃（hit1=4 的现场：
      *   consumer 被核 0 认领的同时被核 1 从就绪队列挑走）。设标记后由它
      *   自己的 do_scheduler 解除，那时代码路径全程持 sched_lock，安全。 */
-    if (task_on_cpu(task)) {
+    if (task_on_cpu(task))
         task->wake_pending = 1;
-        diag_wp_set++;              /* 临时诊断：打过一次静默标记 */
-    }
 }
