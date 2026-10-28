@@ -33,7 +33,7 @@ MINICOM         = minicom
 # Build/Debug Flags and Variables
 # -----------------------------------------------------------------------
 
-CFLAGS          = -O0 -std=gnu11 -fno-builtin -nostdlib -nostdinc -Wall -mcmodel=medany -ggdb3
+CFLAGS          = -O2 -std=gnu11 -fno-builtin -nostdlib -nostdinc -Wall -mcmodel=medany -ggdb3
 
 # -----------------------------------------------------------------------
 # 任务5：细粒度锁开关（两份内核镜像）
