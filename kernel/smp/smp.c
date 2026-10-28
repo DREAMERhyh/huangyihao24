@@ -1,4 +1,5 @@
 #include <atomic.h>
+#include <common.h>
 #include <os/sched.h>
 #include <os/smp.h>
 #include <os/lock.h>
@@ -89,22 +90,15 @@ uint64_t get_current_cpu_id()
 
 void wakeup_other_hart()
 {
-    /* 向"从核唤醒标志"写 1：从核在 bootblock 里自旋轮询这个地址
-     *   （0x50300000，见 smp.h 的 SMP_WAKEUP_ADDR；bootblock.S 的
-     *   secondary 段用同一字面量）。
-     *
-     * ★ 为什么不用 send_ipi（踩坑记录）：主核经 U-Boot 发出的 IPI 是
-     *   CLINT MSIP（M 态软中断），要进 M 态 trap 才能被 U-Boot 转发成
-     *   SSIP 去唤醒 S 态的从核，而进 M 态 trap 需要 mstatus.MIE=1——
-     *   从核 mret 后 MIE=0，且【S 态无权改 MIE】（写 mie/mstatus 直接
-     *   非法指令）。换成内存标志后整条链路不再依赖任何中断使能位，
-     *   QEMU 多核内存一致直接保证可见性。
-     *   ★ 主核 main 的全部初始化完成后才调用（只写一次）：
-     *   写标志前的 fence 发布此前所有初始化写入，从核看到标志时
-     *   就能安全使用内核数据（BSS/tasks/锁表/pid0_pcb……）。 */
-    asm volatile("fence rw, rw" ::: "memory");
-    *(volatile uint64_t *)SMP_WAKEUP_ADDR = 1;
-    asm volatile("fence rw, rw" ::: "memory");
+    /* [2026-10-28 板上修复] 按任务书 §5.1 / 往届标准做法：用 IPI 唤醒从核。
+     *   从核在 bootblock 里已把 stvec 设成内核入口并开了 S 态软件中断；
+     *   bbl/u-boot 的 M 态把主核的 MSIP 转发成 S 态软中断后，从核由
+     *   trap 直接进内核入口（head.S 的从核分支）。
+     *   ★ 主核 main 的全部初始化完成后才调用（只发一次）。 */
+    /* 只发给从核 hart 1（mask bit1）——往届标准做法；send_ipi(NULL)
+     * 会连主核自己一起发，主核收到 SSIP 会多走一次陷阱。 */
+    unsigned long mask = 0x2;
+    send_ipi(&mask);
 }
 
 #ifndef FINE_GRAIN_LOCK
