@@ -51,13 +51,10 @@
   sd   t0, OFFSET_REG_SP(sp)
 
   /*
-   * Disable user-mode memory access as it should only be set in the
-   * actual user copy routines.
-   *
-   * Disable the FPU to detect illegal usage of floating point in kernel
-   * space.
+   * P4 任务1：保留 SUM=1。内核需要直接读写用户地址（exec 拷 argv、写
+   * 子进程用户栈），进入内核后不能把 SUM 清掉；只关 FPU。
    */
-  li t0, SR_SUM | SR_FS
+  li t0, SR_FS
   csrc CSR_SSTATUS, t0
 
   /* 任务3：保存 sstatus, sepc, stval 和 scause */

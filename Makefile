@@ -2,7 +2,7 @@
 # Project Information
 # -----------------------------------------------------------------------
 
-PROJECT_IDX	= 3
+PROJECT_IDX	= 4
 
 # -----------------------------------------------------------------------
 # Host Linux Variables
@@ -33,7 +33,7 @@ MINICOM         = minicom
 # Build/Debug Flags and Variables
 # -----------------------------------------------------------------------
 
-CFLAGS          = -O2 -std=gnu11 -fno-builtin -nostdlib -nostdinc -Wall -mcmodel=medany -ggdb3
+CFLAGS          = -O2 -std=gnu11 -fno-builtin -nostdlib -nostdinc -Wall -mcmodel=medany -ggdb3 -fno-pie
 
 # -----------------------------------------------------------------------
 # 任务5：细粒度锁开关（两份内核镜像）
@@ -49,14 +49,14 @@ CFLAGS          += -DFINE_GRAIN_LOCK
 endif
 
 BOOT_INCLUDE    = -I$(DIR_ARCH)/include
-BOOT_CFLAGS     = $(CFLAGS) $(BOOT_INCLUDE) -Wl,--defsym=TEXT_START=$(BOOTLOADER_ENTRYPOINT) -T riscv.lds
+BOOT_CFLAGS     = $(CFLAGS) $(BOOT_INCLUDE) -no-pie -Wl,--build-id=none -Wl,--defsym=TEXT_START=$(BOOTLOADER_ENTRYPOINT) -T riscv.lds
 
 KERNEL_INCLUDE  = -I$(DIR_ARCH)/include -Iinclude -Idrivers
-KERNEL_CFLAGS   = $(CFLAGS) $(KERNEL_INCLUDE) -Wl,--defsym=TEXT_START=$(KERNEL_ENTRYPOINT) -T riscv.lds
+KERNEL_CFLAGS   = $(CFLAGS) $(KERNEL_INCLUDE) -no-pie -Wl,--build-id=none -Wl,--defsym=TEXT_START=$(KERNEL_ENTRYPOINT) -T riscv.lds
 
 USER_INCLUDE    = -I$(DIR_TINYLIBC)/include
 USER_CFLAGS     = $(CFLAGS) $(USER_INCLUDE)
-USER_LDFLAGS    = -L$(DIR_BUILD) -ltinyc
+USER_LDFLAGS    = -L$(DIR_BUILD) -ltinyc -no-pie -Wl,--build-id=none
 
 QEMU_LOG_FILE   = $(DIR_OSLAB)/oslab-log.txt
 QEMU_OPTS       = -nographic -machine virt -m 256M -kernel $(UBOOT) -bios none \
@@ -82,8 +82,9 @@ DIR_TEST        = ./test
 DIR_TEST_PROJ   = $(DIR_TEST)/test_project$(PROJECT_IDX)
 
 BOOTLOADER_ENTRYPOINT   = 0x50200000
-KERNEL_ENTRYPOINT       = 0x50201000
-USER_ENTRYPOINT         = 0x52000000
+KERNEL_ENTRYPOINT       = 0xffffffc050202000
+# P4 C-core：所有用户程序统一链接到 0x10000（虚拟地址空间由页表隔离）
+USER_ENTRYPOINT         = 0x10000
 
 # -----------------------------------------------------------------------
 # UCAS-OS Kernel Source Files
@@ -96,8 +97,9 @@ SRC_DRIVER  = $(wildcard $(DIR_DRIVERS)/*.c)
 SRC_INIT    = $(wildcard $(DIR_INIT)/*.c)
 SRC_KERNEL  = $(wildcard $(DIR_KERNEL)/*/*.c)
 SRC_LIBS    = $(wildcard $(DIR_LIBS)/*.c)
+SRC_START   = $(wildcard $(DIR_ARCH)/kernel/*.c)
 
-SRC_MAIN    = $(SRC_ARCH) $(SRC_INIT) $(SRC_BIOS) $(SRC_DRIVER) $(SRC_KERNEL) $(SRC_LIBS)
+SRC_MAIN    = $(SRC_ARCH) $(SRC_START) $(SRC_INIT) $(SRC_BIOS) $(SRC_DRIVER) $(SRC_KERNEL) $(SRC_LIBS) 
 
 ELF_BOOT    = $(DIR_BUILD)/bootblock
 ELF_MAIN    = $(DIR_BUILD)/main
@@ -114,23 +116,11 @@ SRC_LIBC    = $(wildcard ./tiny_libc/*.c)
 OBJ_LIBC    = $(patsubst %.c, %.o, $(foreach file, $(SRC_LIBC), $(DIR_BUILD)/$(notdir $(file))))
 LIB_TINYC   = $(DIR_BUILD)/libtinyc.a
 
-# P3：shell 在 test/ 下（不在 test_project3/），单独列出；
-# fly 留在 test_project2/ 下不动（任务5 细粒度锁实验的干扰负载），
-# 用 $(sort) 固定 app 名单顺序（窗口地址按名字算，见下方 app_addr）。
+# P4：shell 在 test/ 下；P4 的所有测试程序都在 test/test_project4/。
+# 所有 app 统一链接到 USER_ENTRYPOINT（0x10000），各自有独立页表，不再需要窗口。
 SRC_SHELL   = $(DIR_TEST)/shell.c
-SRC_FLY     = $(DIR_TEST)/test_project2/fly.c
-SRC_USER    = $(sort $(SRC_SHELL) $(SRC_FLY) $(wildcard $(DIR_TEST_PROJ)/*.c))
+SRC_USER    = $(sort $(SRC_SHELL) $(wildcard $(DIR_TEST_PROJ)/*.c))
 ELF_USER    = $(patsubst %.c, %, $(foreach file, $(SRC_USER), $(DIR_BUILD)/$(notdir $(file))))
-
-# -----------------------------------------------------------------------
-# 每个 app 的加载窗口 = USER_ENTRYPOINT + (它在排序后列表中的序号) * 0x10000
-#   ★ 必须**按名字**算，绝不能按"本次构建顺序"逐次累加：增量编译时只有改动过
-#   的 app 会重新链接，累加的话它会拿到已经被别的 app 占用的窗口；两个 app 撞进
-#   同一块地址后，后加载的把先加载的覆盖掉，运行时表现为"某个任务跑的是别人的
-#   代码"（改 fly 的 CYCLE_PER_MOVE 时踩过：fly1/fly5 撞地址，看起来像调度出错）。
-# -----------------------------------------------------------------------
-app_addr    = $(shell python3 -c "l='$(basename $(notdir $(SRC_USER)))'.split(); \
-                                 print(hex($(USER_ENTRYPOINT) + l.index('$(1)')*0x10000))")
 
 # -----------------------------------------------------------------------
 # Host Linux Tools Source Files
@@ -191,7 +181,7 @@ $(ELF_BOOT): $(SRC_BOOT) riscv.lds
 	$(CC) $(BOOT_CFLAGS) -o $@ $(SRC_BOOT) -e main
 
 $(ELF_MAIN): $(SRC_MAIN) riscv.lds
-	$(CC) $(KERNEL_CFLAGS) -o $@ $(SRC_MAIN)
+	$(CC) $(KERNEL_CFLAGS) -o $@ $(SRC_MAIN) -e _boot
 
 $(OBJ_CRT0): $(SRC_CRT0)
 	$(CC) $(USER_CFLAGS) -I$(DIR_ARCH)/include -c $< -o $@
@@ -203,16 +193,10 @@ $(DIR_BUILD)/%.o: $(DIR_TINYLIBC)/%.c
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 $(DIR_BUILD)/%: $(DIR_TEST_PROJ)/%.c $(OBJ_CRT0) $(LIB_TINYC) riscv.lds
-	$(CC) $(USER_CFLAGS) -o $@ $(OBJ_CRT0) $< $(USER_LDFLAGS) -Wl,--defsym=TEXT_START=$(call app_addr,$*) -T riscv.lds
+	$(CC) $(USER_CFLAGS) -o $@ $(OBJ_CRT0) $< $(USER_LDFLAGS) -Wl,--defsym=TEXT_START=$(USER_ENTRYPOINT) -T riscv.lds
 
 $(DIR_BUILD)/%: $(DIR_TEST)/%.c $(OBJ_CRT0) $(LIB_TINYC) riscv.lds
-	$(CC) $(USER_CFLAGS) -o $@ $(OBJ_CRT0) $< $(USER_LDFLAGS) -Wl,--defsym=TEXT_START=$(call app_addr,$*) -T riscv.lds
-
-# fly 用静态规则：pattern 规则 $(DIR_TEST)/%.c 与 $(DIR_TEST)/test_project2/%.c
-# 都能匹配 build/fly（stem 同长、取先定义者），歧义行为依赖 make 的规则选择细节，
-# 静态规则没有这层不确定性。
-$(DIR_BUILD)/fly: $(DIR_TEST)/test_project2/fly.c $(OBJ_CRT0) $(LIB_TINYC) riscv.lds
-	$(CC) $(USER_CFLAGS) -o $@ $(OBJ_CRT0) $< $(USER_LDFLAGS) -Wl,--defsym=TEXT_START=$(call app_addr,fly) -T riscv.lds
+	$(CC) $(USER_CFLAGS) -o $@ $(OBJ_CRT0) $< $(USER_LDFLAGS) -Wl,--defsym=TEXT_START=$(USER_ENTRYPOINT) -T riscv.lds
 
 elf: $(ELF_BOOT) $(ELF_MAIN) $(LIB_TINYC) $(ELF_USER)
 
@@ -235,5 +219,7 @@ $(ELF_CREATEIMAGE): $(SRC_CREATEIMAGE)
 image: dirs $(ELF_CREATEIMAGE) $(ELF_BOOT) $(ELF_MAIN) $(ELF_USER)
 	cd $(DIR_BUILD) && ./createimage --extended $(filter-out dirs createimage, $(^F))
 	cd $(DIR_BUILD) && cat kernel.img apps.img > image
+	# P4：QEMU/板上的 swap 区在 32MB 处，镜像后面补 64MB 零空间
+	cd $(DIR_BUILD) && dd if=/dev/zero of=image oflag=append conv=notrunc bs=64M count=1
 
 .PHONY: image

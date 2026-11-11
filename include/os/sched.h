@@ -34,7 +34,9 @@
 #include <os/task.h>
 #include <os/smp.h>
 
-#define NUM_MAX_TASK 16
+/* P4：consensus 会同时有 1 个父进程 + 8 个子进程，mailbox 每个进程还有
+ * 2 个线程；32 个 PCB 槽位足够覆盖 C-core 全部测试。 */
+#define NUM_MAX_TASK 48
 
 /* used to save register infomation */
 typedef struct regs_context
@@ -79,6 +81,9 @@ typedef struct pcb
 
     /* process id */
     pid_t pid;
+
+    /* P4：本任务使用的根页表（内核虚拟地址）。idle 用内核页表。 */
+    ptr_t pgdir;
 
     /* P3：进程名（exec 按名启动 / ps 显示）。
      * ★ 槽位空闲的判据：name[0] == '\0'（pcb[] 静态零初始化天然如此）。 */

@@ -238,6 +238,14 @@ void do_scheduler(void)
     current_running = next;
     core_running[cpu] = next;   /* 每核 current_running 表（PCB 复用要查） */
 
+    /* P4：进程切换时切换 satp（页表根）。内核空间的映射所有进程相同，
+     * 所以切换后内核代码/栈照样可访问。ASID 用 pid，线程同 pid 共享。 */
+    ptr_t pgdir = next->pgdir ? next->pgdir : pa2kva(PGDIR_PA);
+    set_satp(SATP_MODE_SV39, (unsigned)(next->pid & 0xffff),
+             kva2pa(pgdir) >> NORMAL_PAGE_SHIFT);
+    local_flush_tlb_all();
+    local_flush_icache_all();
+
     /* 时间片统一为 1/4 个时钟节拍——绝不为 0，飞机不会"停下"。 */
     bios_set_timer(get_ticks() + SLICE_LEN);
 
