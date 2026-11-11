@@ -233,11 +233,6 @@ int main(uint64_t boot_cpu)
     /* P4：初始化物理页分配器/换页管理。必须在任何 allocPage 之前。 */
     paging_init();
 
-    /* P4：主核此时已完整运行在 KVA 上，撤掉启动期的 0x50000000-
-     * 0x51000000 恒等映射（从核 boot_kernel 会自己再 enable_vm，不依赖
-     * 这张表里的恒等映射；这里撤掉后从核的重复调用是无害的幂等操作）。 */
-    remove_identity_map();
-
     // Init task information from bootblock-passed AppInfo (〃'▽'〃)
     init_task_info();
 

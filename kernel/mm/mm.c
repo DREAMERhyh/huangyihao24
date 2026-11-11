@@ -303,6 +303,9 @@ static uintptr_t alloc_page_helper_locked(uintptr_t va, uintptr_t pgdir)
     PTE *pte = walk_page_table(va, pgdir, 1);
     ptr_t page;
 
+    if (pte == 0)
+        return 0;
+
     if (*pte & _PAGE_PRESENT) {
         page = (ptr_t)pa2kva(get_pa(*pte));
         return (uintptr_t)page + (va & OFFSET_MASK_4K);
@@ -337,6 +340,10 @@ uintptr_t map_user_page(uintptr_t va, uintptr_t pgdir, uint64_t perm)
 
     spin_lock_acquire(&paging_lock);
     pte = walk_page_table(va, pgdir, 1);
+    if (pte == 0) {
+        spin_lock_release(&paging_lock);
+        return 0;
+    }
     if (*pte & _PAGE_PRESENT) {
         page = (ptr_t)pa2kva(get_pa(*pte));
     } else {
@@ -396,7 +403,21 @@ void handle_page_fault(regs_context_t *regs, uint64_t stval, uint64_t scause)
     }
 
     if (*pte & _PAGE_PRESENT) {
-        /* 板上 A/D 位为 0 会触发缺页；只补位，不能覆盖原有权限。 */
+        /* 板上 A/D 位为 0 会触发缺页；只补位，不能覆盖原有权限。
+         * 但权限不足（写只读页/取指不可执行页）不是 A/D 问题：补位后
+         * 重试还会缺页，会变成持锁的永久 trap 风暴，按坏访问处理。 */
+        uint64_t need = 0;
+        if (scause == EXCC_STORE_PAGE_FAULT)
+            need = _PAGE_WRITE;
+        else if (scause == EXCC_INST_PAGE_FAULT)
+            need = _PAGE_EXEC;
+        else if (scause == EXCC_LOAD_PAGE_FAULT)
+            need = _PAGE_READ;
+        if ((*pte & need) != need) {
+            spin_lock_release(&paging_lock);
+            handle_bad_fault(regs, stval, scause);
+            return;
+        }
         *pte |= _PAGE_ACCESSED | _PAGE_DIRTY;
     } else if (*pte & _PAGE_SOFT) {
         swap_in_one(pte, va & ~OFFSET_MASK_4K, pgdir);
@@ -474,6 +495,8 @@ static uintptr_t shm_page_get_locked(int key)
     }
 
     PTE *pte = walk_page_table(va, pgdir, 1);
+    if (pte == 0)
+        return 0;
     set_pfn(pte, kva2pa(se->kva) >> NORMAL_PAGE_SHIFT);
     set_attribute(pte, _PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE |
                        _PAGE_EXEC | _PAGE_USER | _PAGE_ACCESSED | _PAGE_DIRTY);
