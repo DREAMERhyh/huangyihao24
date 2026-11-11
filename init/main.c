@@ -63,9 +63,8 @@ static void init_task_info(void)
     //     ① 算出 AppInfo 落在哪个扇区、扇区内偏移多少；
     //     ② 把"覆盖它的若干个整扇区"读进中转缓冲；
     //     ③ 从缓冲的 offset 处起，拷 APPINFO_BYTES 字节进 tasks[]。
-    //   中转缓冲需 3 个扇区：offset ≤ 511，APPINFO_BYTES = 32×28 = 896，
-    //   故 offset + 896 ≤ 1407 < 1536（任务5 把 TASK_MAXNUM 从 16 提到 32，
-    //   缓冲同步从 2 扇区加到 3 扇区）。
+    //   中转缓冲需 3 个扇区：offset ≤ 511，APPINFO_BYTES = 32×32 = 1024，
+    //   故 offset + 1024 ≤ 1535 < 1536。
     static uint8_t appinfo_buf[3 * SECTOR_SIZE]
         __attribute__((aligned(SECTOR_SIZE)));
 
@@ -86,13 +85,13 @@ static void init_task_info(void)
         return;
     }
 
-    if (bios_sd_read((unsigned)(unsigned long)appinfo_buf, need,
+    if (bios_sd_read((unsigned)kva2pa((uintptr_t)appinfo_buf), need,
                      sector) != 0) {
         task_num = 0;
         return;
     }
 
-    // 只拷"有内容的那几行"（task_num × 28 字节），从缓冲的 offset 处起
+    // 只拷"有内容的那几行"（task_num × 32 字节），从缓冲的 offset 处起
     memcpy((void *)tasks, (const void *)(appinfo_buf + offset),
            (size_t)task_num * sizeof(task_info_t));
 }
@@ -108,6 +107,10 @@ static void init_pcb(void)
     current_running = &pid0_pcb[0];
     core_running[0] = &pid0_pcb[0];
     pid0_pcb[0].status = TASK_RUNNING;
+
+    /* P4：idle 任务只在内核空间跑，页表就是内核根页表。 */
+    for (int c = 0; c < NR_CPUS; ++c)
+        pid0_pcb[c].pgdir = pa2kva(PGDIR_PA);
 
     // P3 任务1：内核初始化完成后，直接启动 shell，让它作为 pid 号为 1 的
     //   第一个用户态进程（任务书约定）。shell 负责从串口读命令、用 exec
@@ -159,6 +162,12 @@ static void init_syscall(void)
 
     // P3 任务4：taskset -p（改进程核亲和掩码）
     syscall[SYSCALL_TASKSET]      = (long (*)())do_taskset_p;
+
+    // P4：共享内存 + 线程
+    syscall[SYSCALL_SHM_GET]        = (long (*)())shm_page_get;
+    syscall[SYSCALL_SHM_DT]         = (long (*)())shm_page_dt;
+    syscall[SYSCALL_PTHREAD_CREATE] = (long (*)())do_pthread_create;
+    syscall[SYSCALL_PTHREAD_JOIN]   = (long (*)())do_pthread_join;
 }
 /************************************************************/
 
@@ -183,12 +192,19 @@ int main(uint64_t boot_cpu)
         asm volatile("csrw sie, zero");
         asm volatile("csrw sscratch, %0" ::"r"(SECONDARY_TRAP_STACK));
         setup_exception();              /* stvec = 陷阱入口；sstatus.SIE = 1 */
+        /* P4：内核态也要能访问 U 位页面（do_exec 从父进程地址空间拷 argv） */
+        asm volatile("csrs sstatus, %0" ::"r"(SR_SUM));
         pid0_pcb[boot_cpu].running_cpu = boot_cpu;   /* 本核 idle 认领本核（路线A） */
         current_running = &pid0_pcb[boot_cpu];
         core_running[boot_cpu] = &pid0_pcb[boot_cpu];
         pid0_pcb[boot_cpu].status = TASK_RUNNING;
+        printk("> [INIT] CPU #%u has entered kernel with VM!\n",
+               (unsigned int)boot_cpu);
         printl("[SMP] hart %d idle ready, entering scheduler loop\n",
                boot_cpu);
+        /* 从核已经完整运行在内核虚地址上：这时才可以撤掉启动期的
+         * 0x50000000-0x51000000 恒等映射（主核此时早在 KVA 上跑）。 */
+        remove_identity_map();
         bios_set_timer(get_ticks() + TIMER_INTERVAL);
         enable_preempt();               /* sie 全开：从核时钟开始节拍 */
         while (1)
@@ -208,6 +224,13 @@ int main(uint64_t boot_cpu)
      *   此刻 tp 还是 U-Boot 残值（踩过：解引用炸 load access fault）。
      *   核号直接用启动参数 boot_cpu。 */
     printl("[SMP] hart %d entered kernel main\n", boot_cpu);
+
+    /* P4：内核态要访问用户页（exec 拷 name/argv、写子进程用户栈）。
+     * 尽早置 SUM；entry.S 已改成 trap 后不再清它。 */
+    asm volatile("csrs sstatus, %0" ::"r"(SR_SUM));
+
+    /* P4：初始化物理页分配器/换页管理。必须在任何 allocPage 之前。 */
+    paging_init();
 
     // Init task information from bootblock-passed AppInfo (〃'▽'〃)
     init_task_info();
@@ -239,6 +262,10 @@ int main(uint64_t boot_cpu)
     init_screen();
     printk("> [INIT] SCREEN initialization succeeded.\n");
 
+    /* P4 任务1：双核各自打印一行；从核在它自己的 main 分支里打印。 */
+    printk("> [INIT] CPU #%u has entered kernel with VM!\n",
+           (unsigned int)boot_cpu);
+
     // TODO: [p2-task4] Setup timer interrupt and enable all interrupt globally
     // NOTE: The function of sstatus.sie is different from sie's
 
@@ -251,7 +278,7 @@ int main(uint64_t boot_cpu)
     //    → 第一个任务被调度上场）。但陷阱入口要靠 sscratch 找内核栈顶，所以
     //    先给它一页专用的陷阱栈——直接借用 main 现在用的内核栈会和 main 的
     //    栈帧重叠。
-    asm volatile("csrw sscratch, %0" : : "r"(allocKernelPage(1) + PAGE_SIZE));
+    asm volatile("csrw sscratch, %0" : : "r"(allocPage(1) + PAGE_SIZE));
 
     // ② 再打开 sie 的 STIE 位（允许时钟中断）。此时 sstatus.SIE 已经是 1
     //    （内核态由 setup_exception 打开，用户态由 sret 按陷阱帧的 SPIE 恢复），

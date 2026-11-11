@@ -41,11 +41,10 @@ static ptr_t task_stack_alloc(int is_kernel)
     if (is_kernel) {
         if (kstack_nfree > 0)
             return kstack_free[--kstack_nfree];
-        return allocKernelPage(1);
+        return allocPage(1);
     }
-    if (ustack_nfree > 0)
-        return ustack_free[--ustack_nfree];
-    return allocUserPage(1);
+    /* P4：用户栈页属于进程页表，由 free_user_pgdir 统一回收，不再单独池化 */
+    return 0;
 }
 
 static void task_stack_free(ptr_t base, int is_kernel)
@@ -73,7 +72,27 @@ static pcb_t *find_pcb_by_pid(pid_t pid)
     if (pid == 0)
         return &pid0_pcb[get_current_cpu_id()];   /* pid0：返回本核的 idle */
     for (int i = 0; i < NUM_MAX_TASK; ++i) {
-        if (pcb[i].name[0] != '\0' && pcb[i].pid == pid)
+        if (pcb[i].name[0] != '\0' && pcb[i].pid == pid && !pcb[i].is_thread)
+            return &pcb[i];
+    }
+    return 0;
+}
+
+/* P4：按线程号找 PCB（pthread_join 用） */
+static pcb_t *find_pcb_by_tid(pid_t tid)
+{
+    for (int i = 0; i < NUM_MAX_TASK; ++i) {
+        if (pcb[i].name[0] != '\0' && pcb[i].tid == tid)
+            return &pcb[i];
+    }
+    return 0;
+}
+
+/* P4：找同 pid 的主线程 PCB（线程退出时维护 thread_count / 回收页表） */
+static pcb_t *find_main_pcb(pid_t pid)
+{
+    for (int i = 0; i < NUM_MAX_TASK; ++i) {
+        if (pcb[i].name[0] != '\0' && pcb[i].pid == pid && !pcb[i].is_thread)
             return &pcb[i];
     }
     return 0;
@@ -96,11 +115,18 @@ static pcb_t *alloc_pcb(void)
      *     细粒度版整个 switch_to 都在 sched_lock 内（交棒），本函数也在锁内。 */
     for (int i = 0; i < NUM_MAX_TASK; ++i) {
         if (pcb[i].status == TASK_EXITED && list_empty(&pcb[i].wait_list)
-            && !task_on_cpu(&pcb[i])) {
+            && !task_on_cpu(&pcb[i])
+            /* 主线程的 PCB 只有在没有存活线程时才可复用；线程 PCB 可以。 */
+            && (pcb[i].is_thread || pcb[i].thread_count == 0)) {
             task_stack_free(pcb[i].kernel_stack_base, 1);
             task_stack_free(pcb[i].user_stack_base, 0);
             pcb[i].kernel_stack_base = 0;
             pcb[i].user_stack_base = 0;
+            /* 主 PCB 若还挂着未被回收的页表（例如被 kill），在这里回收。 */
+            if (!pcb[i].is_thread && pcb[i].pgdir != 0) {
+                free_user_pgdir(pcb[i].pgdir);
+                pcb[i].pgdir = 0;
+            }
             return &pcb[i];
         }
     }
@@ -133,47 +159,54 @@ static pcb_t *alloc_pcb(void)
  *
  * 返回 0 表示失败（参数太长/指针非法），调用方要负责回收。
  * argc == 0 时不调用本函数，argv_va 保持 0、sp 取栈顶。 */
-static int pack_args(ptr_t ustack_top, int argc, char **argv, uint64_t *argv_va,
-                     ptr_t *sp_out)
+/* P4：参数区在子进程的页表里。ustack_top_va 是用户虚拟栈顶，
+ * ustack_top_kva 是同一页的内核直接映射地址；两者差值保持不变。 */
+static int pack_args(uintptr_t ustack_top_va, uintptr_t ustack_top_kva,
+                     int argc, char **argv, uint64_t *argv_va,
+                     uintptr_t *sp_out)
 {
-    ptr_t sp = ustack_top;
+    uintptr_t sp = ustack_top_va;
     uint64_t ptrs[EXEC_MAX_ARGC];
+
+#define ARG_KVA(va) (ustack_top_kva - (ustack_top_va - (va)))
 
     /* ① 终止格 */
     sp -= sizeof(uint64_t);
-    if (sp < ustack_top - ARG_AREA_LIMIT || sp >= ustack_top)
+    if (sp < ustack_top_va - ARG_AREA_LIMIT || sp >= ustack_top_va)
         return 0;
-    ((uint64_t *)sp)[0] = 0;
+    *(uint64_t *)ARG_KVA(sp) = 0;
 
     /* ② 预留指针数组的空间（稍后回填） */
-    ptr_t arr_base = sp - (uint64_t)argc * sizeof(uint64_t);
-    if (arr_base < ustack_top - ARG_AREA_LIMIT)
+    uintptr_t arr_base = sp - (uint64_t)argc * sizeof(uint64_t);
+    if (arr_base < ustack_top_va - ARG_AREA_LIMIT)
         return 0;
     sp = arr_base;
 
-    /* ③ 参数字符串（用户指针直接读，无虚存） */
+    /* ③ 参数字符串：argv[i] 是父进程用户地址，内核置 SUM=1 后可直接读 */
     for (int i = 0; i < argc; ++i) {
         char *arg = argv[i];
         if (arg == 0)
             return 0;
         uint64_t len = strlen(arg) + 1;
         sp -= len;
-        if (sp < ustack_top - ARG_AREA_LIMIT || sp >= ustack_top)
+        if (sp < ustack_top_va - ARG_AREA_LIMIT || sp >= ustack_top_va)
             return 0;
-        memcpy((uint8_t *)sp, (const uint8_t *)arg, (uint32_t)len);
+        memcpy((uint8_t *)ARG_KVA(sp), (const uint8_t *)arg, (uint32_t)len);
         ptrs[i] = sp;
     }
 
     for (int i = 0; i < argc; ++i)
-        ((uint64_t *)arr_base)[i] = ptrs[i];
+        *(uint64_t *)ARG_KVA(arr_base + (uintptr_t)i * sizeof(uint64_t)) =
+            ptrs[i];
 
     /* ④ 栈起点：参数区之下、16 对齐（RISC-V psABI 要求） */
     sp &= ~0xFULL;
-    if (sp < ustack_top - ARG_AREA_LIMIT)
+    if (sp < ustack_top_va - ARG_AREA_LIMIT)
         return 0;
 
     *argv_va = arr_base;
     *sp_out = sp;
+#undef ARG_KVA
     return 1;
 }
 
@@ -199,7 +232,8 @@ static void init_pcb_stack(ptr_t kernel_stack, ptr_t user_stack,
     pt_regs->regs[10] = (reg_t)argc;          /* a0 = argc */
     pt_regs->regs[11] = (reg_t)argv_va;       /* a1 = argv */
     pt_regs->sepc     = (reg_t)entry_point;
-    pt_regs->sstatus  = SR_SPIE;              /* SPP=0 回 User 态；SPIE=1 开中断 */
+    /* P4：SUM=1 让内核态能访问用户页（exec 拷参数、写子进程栈） */
+    pt_regs->sstatus  = SR_SPIE | SR_SUM;     /* SPP=0 回 User 态；SPIE=1 开中断 */
 
     switchto_context_t *pt_switchto =
         (switchto_context_t *)((ptr_t)pt_regs - sizeof(switchto_context_t));
@@ -242,49 +276,70 @@ pid_t do_exec(char *name, int argc, char **argv, uint64_t mask)
     if (i == 0)
         return 0;
 
-    /* ② 按名加载代码（同一个程序加载多次＝共享同一份代码窗口，
-     *   各进程有自己的内核栈/用户栈——任务4 的测试正依赖这一点）。
-     *   任务5：细粒度版用 loader_lock 包住加载（staging 缓冲与地址表
-     *   全局共享，两核同时 exec 会踩）；加载完就放锁，与 sched_lock
-     *   不嵌套——两把锁分属不同域，无需遵守锁序。 */
-    FINE_LOCK(&loader_lock);
-    uint64_t entry = load_task_img(kname);
-    FINE_UNLOCK(&loader_lock);
-    if (entry == 0)
+    /* ② 为新进程建独立页表：清空后把内核空间的上半部分复制进来，
+     *   用户空间（0..255 项）留给 load_task_img 逐页填。 */
+    ptr_t pgdir = allocPage(1);
+    if (pgdir == 0)
         return 0;
+    clear_pgdir(pgdir);
+    share_pgtable(pgdir, pa2kva(PGDIR_PA));
 
-    /* ③ PCB 与两张栈（从这里到入队是一个 sched_lock 事务：
-     *   pcb 池与栈池的空闲链表都归 sched_lock 保护，见 smp.h 纪律） */
+    /* ③ 按名加载代码到子进程页表（此时父进程页表仍生效，内核用直接
+     *   映射写子进程物理页）。 */
+    FINE_LOCK(&loader_lock);
+    uint64_t entry = load_task_img(kname, pgdir);
+    FINE_UNLOCK(&loader_lock);
+    if (entry == 0) {
+        free_user_pgdir(pgdir);
+        return 0;
+    }
+
+    /* ④ PCB 与栈。从这里到入队是一个 sched_lock 事务。 */
     FINE_LOCK(&sched_lock);
 
     pcb_t *task = alloc_pcb();
     if (task == 0)
-        goto fail;
+        goto fail_pgdir;
 
     ptr_t kstack_base = task_stack_alloc(1);
-    ptr_t ustack_base = task_stack_alloc(0);
+    if (kstack_base == 0)
+        goto fail_pcb;
     ptr_t kstack_top = kstack_base + PAGE_SIZE;
-    ptr_t ustack_top = ustack_base + PAGE_SIZE;
 
-    /* ④ 参数打包进新进程的用户栈。
-     *   注意 sp 不由 ustack_top 直接充当：pack_args 会把初始 sp 落在
-     *   参数区【之下】（见其注释），main 的栈帧向下生长才不会踩参数。 */
-    uint64_t argv_va = 0;
-    ptr_t user_sp_init = ustack_top;
-    if (argc > 0 && argv != 0) {
-        if (!pack_args(ustack_top, argc, argv, &argv_va, &user_sp_init))
-            goto fail_free;
+    /* ⑤ 用户栈：固定映射 USER_STACK_ADDR 以下的 8 页。
+     *   页表里的用户页由 free_user_pgdir 统一回收。 */
+    uintptr_t stack_top_kva = 0;
+    for (int p = 0; p < USER_STACK_PAGES; ++p) {
+        uintptr_t va = USER_STACK_ADDR - (uintptr_t)(p + 1) * PAGE_SIZE;
+        uintptr_t kva = map_user_page(va, pgdir,
+                                      _PAGE_READ | _PAGE_WRITE | _PAGE_EXEC);
+        if (kva == 0)
+            goto fail_stack;
+        /* kva 是 va（= USER_STACK_ADDR-PAGE_SIZE）对应的页首 KVA；
+         * 参数区以 USER_STACK_ADDR 为基准，所以基准 KVA 要 +PAGE_SIZE。 */
+        if (p == 0)
+            stack_top_kva = kva + PAGE_SIZE;
     }
 
-    /* ⑤ 填 PCB */
+    /* ⑥ 参数打包进新进程用户栈（内核通过直接映射写） */
+    uint64_t argv_va = 0;
+    uintptr_t user_sp_init = USER_STACK_ADDR;
+    if (argc > 0 && argv != 0) {
+        if (!pack_args(USER_STACK_ADDR, stack_top_kva, argc, argv,
+                       &argv_va, &user_sp_init))
+            goto fail_stack;
+    }
+
+    /* ⑦ 填 PCB */
     task->pid = process_id++;
+    task->tid = task->pid;
+    task->is_thread = 0;
+    task->thread_count = 1;
+    task->pgdir = pgdir;
     strcpy(task->name, kname);
     task->kernel_stack_base = kstack_base;
-    task->user_stack_base = ustack_base;
+    task->user_stack_base = 0;
     task->status = TASK_READY;
-    /* P3 任务4：核亲和掩码。taskset 启动时显式给（mask != 0）；
-     *   否则继承父进程——affinity 的 5 个 test_affinity 子任务
-     *   正是靠继承拿到 taskset 指定的掩码。 */
     task->cpu_mask = (mask != 0) ? mask : current_running->cpu_mask;
     task->cursor_x = 0;
     task->cursor_y = 0;
@@ -293,30 +348,141 @@ pid_t do_exec(char *name, int argc, char **argv, uint64_t mask)
     task->wl_cols = 0;
     task->wl_run = 0;
     task->has_wl = 0;
-    /* 任务5：PCB 复用时必须清掉上一世的唤醒挂起标记——否则新进程
-     *   一起步就带着 wake_pending=1，而它的 do_scheduler 要等被调度到
-     *   才清；可 pick_next 又因这个标记永不选它 → 自锁死（板上
-     *   consumer_rate 卡死的候选根因之一）。 */
     task->wake_pending = 0;
     list_init(&task->wait_list);
 
-    /* ⑥ 伪造现场并入就绪队列（初始 sp = 参数区之下的对齐位置） */
-    init_pcb_stack(kstack_top, user_sp_init, (ptr_t)entry, task, argc,
+    /* ⑧ 伪造现场并入就绪队列（初始 sp = 参数区之下的对齐位置） */
+    init_pcb_stack(kstack_top, (ptr_t)user_sp_init, (ptr_t)entry, task, argc,
                    (ptr_t)argv_va);
     list_add_tail(&task->list, &ready_queue);
+    pid_t newpid = task->pid;
 
     FINE_UNLOCK(&sched_lock);
 
-    return task->pid;
+    /* 放锁后 PCB 可能被别的核复用，不能再读 task->pid。 */
+    return newpid;
 
-fail_free:
+fail_stack:
     task_stack_free(kstack_base, 1);
-    task_stack_free(ustack_base, 0);
-fail:
+fail_pcb:
+    task->name[0] = '\0';
+    task->pgdir = 0;
+fail_pgdir:
     FINE_UNLOCK(&sched_lock);
+    free_user_pgdir(pgdir);
     return 0;
 }
 #endif /* !S_CORE */
+
+/* =====================================================================
+ * P4 任务4：pthread_create / pthread_join
+ *   线程 = 一个独立 PCB + 独立内核栈 + 独立用户栈页，
+ *   但 pid / 根页表 / 其余用户内存都与主线程共享。
+ * ===================================================================== */
+static pid_t next_thread_tid = 1000;
+
+pid_t do_pthread_create(void (*entry)(void *, void *),
+                        void (*start_routine)(void *), void *arg)
+{
+    if (entry == 0 || start_routine == 0)
+        return 0;
+
+    FINE_LOCK(&sched_lock);
+
+    /* 锁内再找主线程：另一核可能刚好把主 PCB 复用走。 */
+    pcb_t *main_task = find_main_pcb(current_running->pid);
+    if (main_task == 0 || main_task->pgdir == 0 ||
+        main_task->status == TASK_EXITED) {
+        FINE_UNLOCK(&sched_lock);
+        return 0;
+    }
+
+    pcb_t *task = alloc_pcb();
+    if (task == 0) {
+        FINE_UNLOCK(&sched_lock);
+        return 0;
+    }
+
+    ptr_t kstack_base = task_stack_alloc(1);
+    if (kstack_base == 0) {
+        task->name[0] = '\0';
+        FINE_UNLOCK(&sched_lock);
+        return 0;
+    }
+    ptr_t kstack_top = kstack_base + PAGE_SIZE;
+
+    pid_t tid = next_thread_tid++;
+    uintptr_t stack_va = THREAD_STACK_BASE +
+                         (uintptr_t)(tid - 1000) * THREAD_STACK_STEP;
+    uintptr_t stack_kva = map_user_page(stack_va, main_task->pgdir,
+                                        _PAGE_READ | _PAGE_WRITE | _PAGE_EXEC);
+    if (stack_kva == 0) {
+        task_stack_free(kstack_base, 1);
+        task->name[0] = '\0';
+        FINE_UNLOCK(&sched_lock);
+        return 0;
+    }
+
+    task->pid = main_task->pid;
+    task->tid = tid;
+    task->is_thread = 1;
+    task->thread_count = 0;
+    task->pgdir = main_task->pgdir;
+    strcpy(task->name, main_task->name);
+    task->kernel_stack_base = kstack_base;
+    task->user_stack_base = 0;
+    task->status = TASK_READY;
+    /* 线程钉在创建者所在核：同一进程的线程不会同时在两个核上跑，
+     * 页表/TLB 修改只需本地 flush。 */
+    task->cpu_mask = 1UL << get_current_cpu_id();
+    task->cursor_x = 0;
+    task->cursor_y = 0;
+    task->wakeup_time = 0;
+    task->wl_pos = 0;
+    task->wl_cols = 0;
+    task->wl_run = 0;
+    task->has_wl = 0;
+    task->wake_pending = 0;
+    list_init(&task->wait_list);
+
+    init_pcb_stack(kstack_top, stack_va + PAGE_SIZE, (ptr_t)entry,
+                   task, 0, 0);
+    /* trampoline(entry) 的 a0/a1：真实线程函数与参数 */
+    regs_context_t *regs =
+        (regs_context_t *)(kstack_top - sizeof(regs_context_t));
+    regs->regs[10] = (reg_t)start_routine;
+    regs->regs[11] = (reg_t)arg;
+
+    /* 同一进程的主线程和所有线程钉在同一核：页表只有一个核在改，
+     * 换页/TLB flush 不需要跨核 shootdown。 */
+    main_task->cpu_mask = 1UL << get_current_cpu_id();
+    main_task->thread_count++;
+    list_add_tail(&task->list, &ready_queue);
+
+    FINE_UNLOCK(&sched_lock);
+    return tid;
+}
+
+int do_pthread_join(pid_t tid)
+{
+    FINE_LOCK(&sched_lock);
+
+    pcb_t *target = find_pcb_by_tid(tid);
+    /* 只能 join 同进程的线程：别的进程的 tid 空间互不可见。 */
+    if (target == 0 || target == current_running || !target->is_thread ||
+        target->pid != current_running->pid ||
+        target->status == TASK_EXITED) {
+        FINE_UNLOCK(&sched_lock);
+        return 0;
+    }
+
+    current_running->status = TASK_BLOCKED;
+    list_add_tail(&current_running->list, &target->wait_list);
+
+    FINE_UNLOCK(&sched_lock);
+    do_scheduler();
+    return 0;
+}
 
 /* =====================================================================
  * do_exit：结束当前进程
@@ -338,6 +504,21 @@ void do_exit(void)
 
     while (!list_empty(&task->wait_list))
         do_unblock(task->wait_list.next);
+
+    /* P4：线程/进程共用一个根页表。最后一个线程退出时才回收页表。 */
+    pcb_t *main_task = find_main_pcb(task->pid);
+    if (main_task != 0 && main_task->thread_count > 0) {
+        main_task->thread_count--;
+        if (main_task->thread_count == 0 && main_task->pgdir != 0) {
+            /* 先把本核 satp 切回内核页表，再释放这个进程的页表：
+             * 否则另一核可能立刻把刚释放的根页表页分配走并清零，
+             * 而本核 satp 还指着它。 */
+            set_satp(SATP_MODE_SV39, 0, PGDIR_PA >> NORMAL_PAGE_SHIFT);
+            local_flush_tlb_all();
+            free_user_pgdir(main_task->pgdir);
+            main_task->pgdir = 0;
+        }
+    }
 
     /* ★ 两张栈不在这里归还（以前在这里还，是重磅 bug）：本任务此刻还
      *   踩着自己的内核栈执行——下面还有调度决策、M 态定时器和 switch_to。
@@ -406,6 +587,13 @@ int do_kill(pid_t pid)
         task_stack_free(task->user_stack_base, 0);
         task->kernel_stack_base = 0;
         task->user_stack_base = 0;
+
+        /* P4：没有线程的进程被 kill 且已完整下核时，回收它的用户页表。
+         * 有线程的先不回收（线程可能还持有同一 pgdir）。 */
+        if (task->thread_count <= 1 && task->pgdir != 0) {
+            free_user_pgdir(task->pgdir);
+            task->pgdir = 0;
+        }
     }
 
     ret = 1;
@@ -560,7 +748,11 @@ int do_taskset_p(pid_t pid, uint64_t mask)
 
     pcb_t *task = find_pcb_by_pid(pid);
     if (task != 0 && !is_idle_pcb(task)) {
-        task->cpu_mask = mask;
+        /* 线程与主线程共享地址空间，必须整体改到同一组核上，
+         * 否则同一页表会被两个核同时改（换页/TLB）。 */
+        for (int i = 0; i < NUM_MAX_TASK; ++i)
+            if (pcb[i].name[0] != '\0' && pcb[i].pid == pid)
+                pcb[i].cpu_mask = mask;
         ret = 1;
     }                           /* 找不到进程，或想改 idle（不许） */
 

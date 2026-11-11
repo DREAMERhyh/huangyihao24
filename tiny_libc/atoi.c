@@ -18,7 +18,7 @@ long atol(const char *str)
 
     // Skip blanks until reaching the first non-blank char
     while (isspace(*str)) {
-        ;
+        ++str;
     }
     if ('+' == *str) {
         negative = 0;

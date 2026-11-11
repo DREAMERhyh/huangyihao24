@@ -21,8 +21,8 @@
  *                        · 0x1fc/0x1fe 字段住在第 0 扇区最后 4 字节；
  *                        · u-boot 按块读第 0 扇区并跳到 0x50200000）
  *     字节 512 ..        内核（KB 字节，不补）
- *     紧接其后           AppInfo（APPINFO_BYTES = 896 字节，不补）
- *     => kernel.img 总字节数 = 512 + KB + 896
+ *     紧接其后           AppInfo（APPINFO_BYTES = 1024 字节，不补）
+ *     => kernel.img 总字节数 = 512 + KB + 1024
  *
  *   apps.img:
  *     各 app 首尾相接（app i 从 app i-1 的最后一个字节 + 1 开始）
@@ -31,7 +31,7 @@
  * 由于 AppInfo / apps 都不再按扇区对齐，内核读取它们时**必须经过中转缓冲**：
  * 块设备只能整扇区读，没有偏移参数（见 init_task_info / load_task_img）。
  */
-#define APPINFO_BYTES    (TASK_MAXNUM * sizeof(task_info_t))   /* 32×28 = 896 字节 */
+#define APPINFO_BYTES    (TASK_MAXNUM * sizeof(task_info_t))   /* 32×32 = 1024 字节 */
 
 /* bootblock 经寄存器传给内核的引导参数（任务5 起为【字节】语义）：
  *   a0 = AppInfo 起始字节偏移（镜像内）
@@ -49,14 +49,15 @@ typedef struct {
     char      name[TASK_NAME_LEN];   /* app 名，与 ELF 文件名一致 */
     uint32_t  start_byte;            /* 该 app 在 apps.img 中的【字节偏移】 */
     uint32_t  byte_size;             /* 该 app 的【字节数】（各 PT_LOAD 段 p_filesz 之和） */
-    uint32_t  vaddr_entry;           /* 内存入口地址 */
+    uint32_t  vaddr_entry;           /* 内存入口地址（P4 统一为 0x10000） */
+    uint32_t  mem_size;              /* 该 app 的【内存大小】（各 PT_LOAD 段 p_memsz 之和） */
 } task_info_t;
 
 /* 收官护栏：这些断言守住 createimage 与内核结构体一致、以及"中转缓冲够大"等前提；
  * 若将来改动破坏任一约束，编译期即报错，而不是在运行期跑飞。 */
-_Static_assert(sizeof(task_info_t) == 28, "task_info_t 必须是 28 字节（createimage 同款）");
+_Static_assert(sizeof(task_info_t) == 32, "task_info_t 必须是 32 字节（createimage 同款）");
 _Static_assert(TASK_NAME_LEN == 16, "TASK_NAME_LEN 必须与 createimage 一致（16）");
-_Static_assert(APPINFO_BYTES == 896, "AppInfo 必须是 32×28 = 896 字节");
+_Static_assert(APPINFO_BYTES == 1024, "AppInfo 必须是 32×32 = 1024 字节");
 
 extern task_info_t tasks[TASK_MAXNUM];
 

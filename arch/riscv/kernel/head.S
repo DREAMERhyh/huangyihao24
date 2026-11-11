@@ -6,7 +6,7 @@
 #include <asm.h>
 #include <csr.h>
 
-#define KERNEL_STACK		0x50500000
+#define KERNEL_STACK		0xffffffc050500000
 
 /* P3 任务3：从核的两张固定栈（避开所有已用内存区：
  *   0x50000000-0x50200000 U-Boot/bios、0x50200000-0x50228800 内核镜像、
@@ -14,8 +14,8 @@
  *   · BootStack  —— head.S 从核分支 → main 从核路径 → idle wfi 循环
  *   · TrapStack  —— 从核的陷阱栈（sscratch），与主核"陷阱栈"对应
  *   bootblock.S 的 secondary 段用同一字面量 0x50301000 作为启动栈。 */
-#define SECONDARY_BOOT_STACK	0x50301000
-#define SECONDARY_TRAP_STACK	0x50302000
+#define SECONDARY_BOOT_STACK	0xffffffc050301000
+#define SECONDARY_TRAP_STACK	0xffffffc050302000
 
 .section ".entry_function","ax"
 ENTRY(_start)

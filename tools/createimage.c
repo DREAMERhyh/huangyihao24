@@ -19,22 +19,21 @@
 #define NBYTES2SEC(nbytes) (((nbytes) / SECTOR_SIZE) + ((nbytes) % SECTOR_SIZE != 0))
 
 /* task_info_t，与 include/os/task.h 完全一致（必须保持同步）。
- * 任务5 起字段改为【字节】语义：镜像内部按字节紧密排列，不再按扇区对齐。
- * 大小 16+4+4+4 = 28 字节（不变），32 × 28 = 896 字节。 */
+ * P4 增加 mem_size（p_memsz 之和），加载器据此建立用户页表。
+ * 大小 16+4+4+4+4 = 32 字节，32 × 32 = 1024 字节。 */
 #define TASK_NAME_LEN 16
-/* 与内核 include/os/task.h 的 TASK_MAXNUM 保持一致。
- * 任务5 从 16 提到 32：app 总数已达 18（16 个测试 + shell + fly），
- *   16 会栈溢出 taskinfo[]（实测 "stack smashing detected"）。 */
+/* 与内核 include/os/task.h 的 TASK_MAXNUM 保持一致。 */
 #define TASK_MAXNUM   32
 typedef struct {
     char     name[TASK_NAME_LEN];
     uint32_t start_byte;    /* 该 app 在 apps.img 内的【字节偏移】 */
     uint32_t byte_size;     /* 该 app 的【字节数】（各 PT_LOAD 段 p_filesz 之和） */
     uint32_t vaddr_entry;   /* 内存入口地址 */
+    uint32_t mem_size;      /* 该 app 的【内存大小】（各 PT_LOAD 段 p_memsz 之和） */
 } task_info_t;
 static task_info_t taskinfo[TASK_MAXNUM];
 
-/* AppInfo 区的字节数（32 × 28 = 896，不再是"1 扇区"的概念） */
+/* AppInfo 区的字节数（32 × 32 = 1024） */
 #define APPINFO_BYTES (TASK_MAXNUM * sizeof(task_info_t))
 
 /* 镜像信息区（位于第 0 扇区尾部，任务5 起全部按【字节】语义）：
@@ -60,6 +59,7 @@ static void error(char *fmt, ...);
 static void read_ehdr(Elf64_Ehdr *ehdr, FILE *fp);
 static void read_phdr(Elf64_Phdr *phdr, FILE *fp, int ph, Elf64_Ehdr ehdr);
 static uint32_t get_filesz(Elf64_Phdr phdr);
+static uint32_t get_memsz(Elf64_Phdr phdr);
 static void write_segment(Elf64_Phdr phdr, FILE *fp, FILE *img, int *phyaddr);
 static void write_padding(FILE *img, int *phyaddr, int new_phyaddr);
 static void write_img_info(uint32_t appinfo_off, uint32_t apps_off,
@@ -98,13 +98,16 @@ int main(int argc, char **argv)
     return 0;
 }
 
-/* 预扫描：返回 ELF 中所有 PT_LOAD 段的 p_filesz 之和，并输出入口地址 */
-static uint32_t scan_elf(const char *path, uint64_t *entry_out)
+/* 预扫描：返回 ELF 中所有 PT_LOAD 段的 p_filesz 之和，并输出入口地址
+ * 与 p_memsz 之和（P4 加载器要用 mem_size 建页表/清 BSS）。 */
+static uint32_t scan_elf(const char *path, uint64_t *entry_out,
+                         uint32_t *memsz_out)
 {
     FILE *fp = fopen(path, "r");
     Elf64_Ehdr ehdr;
     Elf64_Phdr phdr;
     uint32_t filesz_sum = 0;
+    uint32_t memsz_sum = 0;
 
     assert(fp != NULL);
     read_ehdr(&ehdr, fp);
@@ -115,8 +118,11 @@ static uint32_t scan_elf(const char *path, uint64_t *entry_out)
         if (phdr.p_type != PT_LOAD)
             continue;
         filesz_sum += get_filesz(phdr);
+        memsz_sum += get_memsz(phdr);
     }
     fclose(fp);
+    if (memsz_out != NULL)
+        *memsz_out = memsz_sum;
     return filesz_sum;
 }
 
@@ -130,11 +136,13 @@ static void create_image(int nfiles, char *files[])
 
     /* 每个文件的布局信息（顺序：files[0]=bootblock, files[1]=main, files[2..]=app） */
     uint32_t used_bytes[TASK_MAXNUM + 2];
+    uint32_t mem_bytes[TASK_MAXNUM + 2];
     uint64_t entry_addr[TASK_MAXNUM + 2];
 
     /* 预扫描一遍文件，得到每个文件实际会写进镜像的字节数 */
     for (int fidx = 0; fidx < nfiles; ++fidx)
-        used_bytes[fidx] = scan_elf(files[fidx], &entry_addr[fidx]);
+        used_bytes[fidx] = scan_elf(files[fidx], &entry_addr[fidx],
+                                    &mem_bytes[fidx]);
 
     /* ---- 任务5 双镜像布局：镜像内部按【字节】紧密排列（不补到扇区） ----
      *
@@ -144,8 +152,8 @@ static void create_image(int nfiles, char *files[])
      *                          内核若从 130 开始会被这两个字段改坏；
      *                        · u-boot 也是按块读第 0 扇区并跳到 0x50200000）
      *   字节 512 ..          内核（KB = 内核字节数，**不补**）
-     *   紧接其后             AppInfo（APPINFO_BYTES = 896 字节，**不补**）
-     *   => kernel.img 总字节 = 512 + KB + 896
+     *   紧接其后             AppInfo（APPINFO_BYTES = 1024 字节，**不补**）
+     *   => kernel.img 总字节 = 512 + KB + 1024
      *
      * apps.img:
      *   各 app 首尾相接：app i 从"app i-1 的最后一个字节 + 1"开始（**不补**）
@@ -178,6 +186,7 @@ static void create_image(int nfiles, char *files[])
         taskinfo[i].start_byte  = app_rel_byte[i];
         taskinfo[i].byte_size   = used_bytes[2 + i];
         taskinfo[i].vaddr_entry = (uint32_t)entry_addr[2 + i];
+        taskinfo[i].mem_size    = mem_bytes[2 + i];
     }
     for (int i = tasknum; i < TASK_MAXNUM; ++i)
         memset(&taskinfo[i], 0, sizeof(task_info_t));
@@ -315,6 +324,11 @@ static void read_phdr(Elf64_Phdr * phdr, FILE * fp, int ph,
 static uint32_t get_filesz(Elf64_Phdr phdr)
 {
     return phdr.p_filesz;
+}
+
+static uint32_t get_memsz(Elf64_Phdr phdr)
+{
+    return phdr.p_memsz;
 }
 
 static void write_segment(Elf64_Phdr phdr, FILE *fp, FILE *img, int *phyaddr)

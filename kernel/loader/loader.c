@@ -1,62 +1,71 @@
 #include <os/task.h>
+#include <os/mm.h>
 #include <os/string.h>
 #include <os/kernel.h>
 #include <type.h>
 
-/* 任务5：镜像内部按【字节】紧密排列，app 在镜像里**可能不在扇区边界上**；
- * 而块设备只能整扇区读、没有偏移参数。所以加载一个 app 要分两步：
- *   ① 把"覆盖该 app 的若干整扇区"读进本中转缓冲；
- *   ② 从缓冲内的 offset 处起，把 size 字节拷到 app 的窗口地址。
- * 缓冲 16KB（= 32 扇区），上限 = 最多 511 字节偏移 + 单个 app 至多 ~15.5KB。
- *   ★ P3 起 app 带完整 tiny_libc 而变大（shell ≈ 9.5KB，P2 时代所有 app
- *   都 < 7.7KB），原 8KB 缓冲装不下"offset + size"（实测 shell 需 10240 字节），
- *   会被下面第 ② 步拒绝加载——表现为"任务明明在列表里、exec 却返回 0"。
- *   若某天 app 再变大到装不下，仍会**拒绝加载**而不是越界写。 */
-#define LOAD_STAGING_BYTES 16384
+/* P4：加载器不再把 app 拷到固定物理窗口，而是：
+ *   ① 从 SD 卡读 app 的 PT_LOAD 数据到内核中转缓冲；
+ *   ② 为 [vaddr_entry, vaddr_entry + mem_size) 逐页建用户页表；
+ *   ③ 把 byte_size 字节抄进映射后的物理页，其余保持 0（.bss）。
+ * apps.img 里只存 PT_LOAD 段数据（createimage 的 write_segment），
+ * 本实验每个 app 只有一个 PT_LOAD，所以按顺序拷贝即可。
+ */
+#define LOAD_STAGING_BYTES 32768
 static uint8_t load_staging[LOAD_STAGING_BYTES]
     __attribute__((aligned(SECTOR_SIZE)));
 
-uint64_t load_task_img(const char *taskname)
+uint64_t load_task_img(const char *taskname, uintptr_t pgdir)
 {
-    /**
-     * 1. [p1-task3] load task from image via task id, and return its entrypoint
-     *    —— 已废弃，改按名字加载（[p1-task4]）
-     * 2. [p1-task4] load task via task name
-     */
-    // 任务4/5：在 tasks[] 里按名字匹配。
-    //   tasks[] 由 init_task_info 从 AppInfo 区读出；未用的槽位被 createimage
-    //   清零（name[0]=='\0'），这里直接跳过，不需要知道实际任务数。
-    for (int i = 0; i < TASK_MAXNUM; ++i)
-    {
+    for (int i = 0; i < TASK_MAXNUM; ++i) {
         if (tasks[i].name[0] == '\0')
             continue;
+        if (strcmp(tasks[i].name, taskname) != 0)
+            continue;
 
-        if (strcmp(tasks[i].name, taskname) == 0)
-        {
-            // ① 算出该 app 在 SD 卡上的【绝对字节偏移】，再拆成"扇区号 + 扇区内偏移"
-            uint32_t abs_off = (uint32_t)boot_apps_base_off
-                             + tasks[i].start_byte;
-            uint32_t sector  = abs_off / SECTOR_SIZE;
-            uint32_t offset  = abs_off % SECTOR_SIZE;
-            uint32_t size    = tasks[i].byte_size;
-            uint32_t need    = NBYTES2SEC(offset + size);   // 要读几个整扇区
+        uint32_t abs_off = (uint32_t)boot_apps_base_off + tasks[i].start_byte;
+        uint32_t sector = abs_off / SECTOR_SIZE;
+        uint32_t offset = abs_off % SECTOR_SIZE;
+        uint32_t size = tasks[i].byte_size;
+        uint32_t mem_size = tasks[i].mem_size;
+        uint32_t need = NBYTES2SEC(offset + size);
 
-            // ② 防御：中转缓冲装不下就拒绝（绝不越界写）
-            if (need * SECTOR_SIZE > LOAD_STAGING_BYTES)
-                return 0;
+        if (size == 0 || need * SECTOR_SIZE > LOAD_STAGING_BYTES)
+            return 0;
+        if (mem_size < size)
+            mem_size = size;
 
-            // ③ 读整扇区到中转缓冲
-            if (bios_sd_read((unsigned)(unsigned long)load_staging, need,
-                             sector) != 0)
-                return 0;   // 任务存在但镜像读取失败
+        if (bios_sd_read((unsigned)kva2pa((uintptr_t)load_staging), need,
+                         sector) != 0)
+            return 0;
 
-            // ④ 从缓冲内偏移处精确拷贝 size 字节到 app 的窗口
-            memcpy((uint8_t *)(unsigned long)tasks[i].vaddr_entry,
-                   (const uint8_t *)(load_staging + offset), size);
+        uintptr_t va = tasks[i].vaddr_entry;
+        uint32_t remain = size;
+        uint32_t src_off = 0;
 
-            return (uint64_t)tasks[i].vaddr_entry;
+        for (uint32_t done = 0; done < mem_size; done += PAGE_SIZE) {
+            uintptr_t cur_va = va + done;
+            uintptr_t page_va = ROUNDDOWN(cur_va, PAGE_SIZE);
+            uintptr_t kva = alloc_page_helper(page_va, pgdir);
+            uint32_t page_off = (uint32_t)(cur_va & (PAGE_SIZE - 1));
+            uint32_t n = PAGE_SIZE - page_off;
+
+            if (n > mem_size - done)
+                n = mem_size - done;
+            if (n > remain)
+                n = remain;
+
+            if (n > 0) {
+                memcpy((void *)(kva + page_off),
+                       (const void *)(load_staging + offset + src_off), n);
+                src_off += n;
+                remain -= n;
+            }
         }
+
+        local_flush_icache_all();
+        return (uint64_t)va;
     }
 
-    return 0;   // 未找到
+    return 0;
 }

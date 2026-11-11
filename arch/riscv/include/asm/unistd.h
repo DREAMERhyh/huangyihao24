@@ -43,4 +43,10 @@
  * 任务书未给号，自定 57（避让 P3 官方全部号段）。 */
 #define SYSCALL_TASKSET 57
 
+/* P4：共享内存与线程（P3 已占用 56/57，这里顺延到 58..61） */
+#define SYSCALL_SHM_GET 58
+#define SYSCALL_SHM_DT 59
+#define SYSCALL_PTHREAD_CREATE 60
+#define SYSCALL_PTHREAD_JOIN 61
+
 #endif
