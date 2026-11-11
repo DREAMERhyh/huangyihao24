@@ -5,6 +5,7 @@
 #include <os/kernel.h>
 #include <os/string.h>
 #include <printk.h>
+#include <csr.h>
 
 /* =====================================================================
  * P4 内存管理（C-core）
@@ -17,7 +18,7 @@
  * 共享内存：0x100000000 起找空页，多个进程映射到同一物理页。
  * ===================================================================== */
 
-#define MAX_FREE_PAGES 1024
+#define MAX_FREE_PAGES 8192
 /* 每个进程最多 USER_PAGE_LIMIT 个常驻可换出页；所有进程的常驻页都要在
  * 这张表里登记，所以上限必须 >= NUM_MAX_TASK * USER_PAGE_LIMIT。 */
 #define MAX_SWAP_ENTRIES (NUM_MAX_TASK * USER_PAGE_LIMIT)
@@ -356,6 +357,18 @@ uintptr_t map_user_page(uintptr_t va, uintptr_t pgdir, uint64_t perm)
 /* ------------------------------------------------------------------ */
 /* 缺页处理                                                            */
 /* ------------------------------------------------------------------ */
+/* 非法地址/无法修复的缺页：U 态来自用户程序，终止它即可；S 态说明
+ * 内核自己踩了坏指针，保留 handle_other 的现场断言便于定位。 */
+static void handle_bad_fault(regs_context_t *regs, uint64_t stval,
+                             uint64_t scause)
+{
+    if (!(regs->sstatus & SR_SPP)) {
+        do_exit();
+        return;
+    }
+    handle_other(regs, stval, scause);
+}
+
 /* 注意：本函数只做"分配/换入 + 建映射"，不得调用 do_scheduler/do_block
  * 等会切换任务的函数——大锁版的 BKL 重入深度依赖"最外层 trap 才放锁"，
  * 在嵌套缺页里调度会让接棒方只减一层深度。 */
@@ -369,7 +382,7 @@ void handle_page_fault(regs_context_t *regs, uint64_t stval, uint64_t scause)
     /* 内核空间的缺页不该发生；非规范地址（Sv39 要求 bit63..39 全等于
      * bit38）也修不了，否则会反复缺页死循环。都走统一的报错路径。 */
     if (((va >> 38) & 1) || (va >> 39) != 0) {
-        handle_other(regs, stval, scause);
+        handle_bad_fault(regs, stval, scause);
         return;
     }
 
@@ -378,7 +391,7 @@ void handle_page_fault(regs_context_t *regs, uint64_t stval, uint64_t scause)
     pte = walk_page_table(va, pgdir, 1);
     if (pte == 0) {
         spin_lock_release(&paging_lock);
-        handle_other(regs, stval, scause);
+        handle_bad_fault(regs, stval, scause);
         return;
     }
 
@@ -525,8 +538,9 @@ void free_user_page(uintptr_t va, uintptr_t pgdir)
     if (pte != 0) {
         if (*pte & _PAGE_PRESENT) {
             ptr_t page = (ptr_t)pa2kva(get_pa(*pte));
-            if (va >= SHM_VA_BASE && va < SHM_VA_END) {
-                shm_unmap_va(va, pgdir);
+            if (va >= SHM_VA_BASE && va < SHM_VA_END &&
+                shm_unmap_va(va, pgdir)) {
+                /* 共享页由 shm_unmap_va 按引用计数回收 */
             } else {
                 swap_entry_remove(pte);
                 freePage(page);

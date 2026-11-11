@@ -39,6 +39,11 @@ uint64_t load_task_img(const char *taskname, uintptr_t pgdir)
                          sector) != 0)
             return 0;
 
+        /* 下面的逐页拷贝假设程序入口是页对齐的（本课程 ELF 都在
+         * 0x10000）；非对齐入口会让第 2 页起的数据整体错位，直接拒绝。 */
+        if (tasks[i].vaddr_entry & (PAGE_SIZE - 1))
+            return 0;
+
         uintptr_t va = tasks[i].vaddr_entry;
         uint32_t remain = size;
         uint32_t src_off = 0;

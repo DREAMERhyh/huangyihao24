@@ -45,7 +45,6 @@ static void init_jmptab(void)
     jmptab[READ_FDT]        = (long (*)())read_fdt;
     jmptab[MOVE_CURSOR]     = (long (*)())screen_move_cursor;
     jmptab[PRINT]           = (long (*)())printk;
-    jmptab[YIELD]           = (long (*)())do_scheduler;
     jmptab[MUTEX_INIT]      = (long (*)())do_mutex_lock_init;
     jmptab[MUTEX_ACQ]       = (long (*)())do_mutex_lock_acquire;
     jmptab[MUTEX_RELEASE]   = (long (*)())do_mutex_lock_release;
@@ -234,12 +233,23 @@ int main(uint64_t boot_cpu)
     /* P4：初始化物理页分配器/换页管理。必须在任何 allocPage 之前。 */
     paging_init();
 
+    /* P4：主核此时已完整运行在 KVA 上，撤掉启动期的 0x50000000-
+     * 0x51000000 恒等映射（从核 boot_kernel 会自己再 enable_vm，不依赖
+     * 这张表里的恒等映射；这里撤掉后从核的重复调用是无害的幂等操作）。 */
+    remove_identity_map();
+
     // Init task information from bootblock-passed AppInfo (〃'▽'〃)
     init_task_info();
+
+    // Init SMP（大内核锁 + 从核 idle PCB 的形式初值）(๑•̀ㅂ•́)و✧
+    // 必须在 init_pcb() 之前：它创建的 shell 会走 do_exec，细粒度版
+    // 的 sched_lock 等域锁这时必须已经初始化（不能靠 BSS 零值碰巧可用）。
+    smp_init();
 
     // Init Process Control Blocks |•'-'•) ✧
     init_pcb();
     printk("> [INIT] PCB initialization succeeded.\n");
+    printk("> [INIT] SMP initialization succeeded.\n");
 
     // Read CPU frequency (｡•ᴗ-)_
     time_base = bios_read_fdt(TIMEBASE);
@@ -247,10 +257,6 @@ int main(uint64_t boot_cpu)
     // Init lock mechanism o(´^｀)o
     init_locks();
     printk("> [INIT] Lock mechanism initialization succeeded.\n");
-
-    // Init SMP（大内核锁 + 从核 idle PCB 的形式初值）(๑•̀ㅂ•́)و✧
-    smp_init();
-    printk("> [INIT] SMP initialization succeeded.\n");
 
     // Init interrupt (^_^)
     init_exception();

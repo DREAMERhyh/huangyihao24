@@ -87,6 +87,32 @@ static int pid_on_cpu(pid_t pid)
     return 0;
 }
 
+/* 同 pid 里除 self 之外，还有没有线程在核上？do_exit 的"最后一个线程"
+ * 判断要用：正在退出的自己也在 core_running[] 上，不能把它算成别人。 */
+static int pid_on_cpu_except(pid_t pid, pcb_t *self)
+{
+    for (int i = 0; i < NUM_MAX_TASK; ++i)
+        if (&pcb[i] != self && pcb[i].name[0] != '\0' && pcb[i].pid == pid &&
+            task_on_cpu(&pcb[i]))
+            return 1;
+    return 0;
+}
+
+/* 替 task 释放它持有的所有互斥锁。调用者必须持 sync_lock + sched_lock
+ * （mlocks 的 owner 属 sync 域，阻塞队列属 sched 域）。do_kill 与 do_exit
+ * 共用，避免"进程退出时把锁永久带走"。 */
+static void release_held_locks(pcb_t *task)
+{
+    for (int j = 0; j < LOCK_NUM; ++j) {
+        if (mlocks[j].owner == task) {
+            mlocks[j].owner = 0;
+            spin_lock_release(&mlocks[j].lock);
+            if (!list_empty(&mlocks[j].block_queue))
+                do_unblock(mlocks[j].block_queue.next);
+        }
+    }
+}
+
 static pcb_t *alloc_pcb(void)
 {
     /* ① 全新的空槽位 */
@@ -113,6 +139,7 @@ static pcb_t *alloc_pcb(void)
             task_stack_free(pcb[i].kernel_stack_base);
             pcb[i].kernel_stack_base = 0;
             pcb[i].user_stack_base = 0;
+            pcb[i].killed = 0;
             /* 主 PCB 若还挂着未被回收的页表（例如被 kill），在这里回收。 */
             if (!pcb[i].is_thread && pcb[i].pgdir != 0) {
                 free_user_pgdir(pcb[i].pgdir);
@@ -326,6 +353,7 @@ pid_t do_exec(char *name, int argc, char **argv, uint64_t mask)
     task->tid = task->pid;
     task->is_thread = 0;
     task->thread_count = 1;
+    task->killed = 0;
     task->pgdir = pgdir;
     strcpy(task->name, kname);
     task->kernel_stack_base = kstack_base;
@@ -420,6 +448,7 @@ pid_t do_pthread_create(void (*entry)(void *, void *),
     task->tid = tid;
     task->is_thread = 1;
     task->thread_count = 0;
+    task->killed = 0;
     task->pgdir = main_task->pgdir;
     strcpy(task->name, main_task->name);
     task->kernel_stack_base = kstack_base;
@@ -494,9 +523,13 @@ void do_exit(void)
     pcb_t *task = current_running;
 
     /* 任务5：状态迁移/唤醒等待者在一个 sched_lock 临界段里完成；
-     *   放锁之后才让出。 */
+     *   放锁之后才让出。
+     * P4：退出前先归还它持有的互斥锁（锁序 sync→sched），否则锁会被
+     *   永久带走，PCB 复用后 owner 还会悬垂到新进程。 */
+    FINE_LOCK(&sync_lock);
     FINE_LOCK(&sched_lock);
 
+    release_held_locks(task);
     task->status = TASK_EXITED;
 
     while (!list_empty(&task->wait_list))
@@ -512,7 +545,8 @@ void do_exit(void)
     pcb_t *main_task = find_pcb_by_pid(task->pid);
     if (main_task != 0 && main_task->thread_count > 0) {
         main_task->thread_count--;
-        if (main_task->thread_count == 0 && main_task->pgdir != 0) {
+        if (main_task->thread_count == 0 && main_task->pgdir != 0 &&
+            !pid_on_cpu_except(task->pid, task)) {
             /* 先把本核 satp 切回内核页表，再释放这个进程的页表：
              * 否则另一核可能立刻把刚释放的根页表页分配走并清零，
              * 而本核 satp 还指着它。 */
@@ -530,6 +564,7 @@ void do_exit(void)
      *   call_bios 代码覆写的内存）。改在 alloc_pcb 真正复用时归还。 */
 
     FINE_UNLOCK(&sched_lock);
+    FINE_UNLOCK(&sync_lock);
 
     do_scheduler();     /* 切走；此后本 PCB 不会被再选中 */
     while (1)           /* 不可达 */
@@ -569,15 +604,11 @@ int do_kill(pid_t pid)
             task->status == TASK_EXITED)
             continue;
 
-        /* ① 替它释放持有的互斥锁 */
-        for (int j = 0; j < LOCK_NUM; ++j) {
-            if (mlocks[j].owner == task) {
-                mlocks[j].owner = 0;
-                spin_lock_release(&mlocks[j].lock);
-                if (!list_empty(&mlocks[j].block_queue))
-                    do_unblock(mlocks[j].block_queue.next);
-            }
-        }
+        /* ① 先打上 kill 标记，再替它释放持有的互斥锁。标记必须在放锁前
+         *   打上：否则被 kill 的任务可能在这之后调 release，把刚被唤醒
+         *   的等待者手里的锁放掉（双重放锁 + 僵尸复活）。 */
+        task->killed = 1;
+        release_held_locks(task);
 
         /* ② 从当前所在队列里摘除 */
         if (task->status == TASK_READY || task->status == TASK_BLOCKED)
@@ -762,9 +793,11 @@ int do_taskset_p(pid_t pid, uint64_t mask)
 
     pcb_t *task = find_pcb_by_pid(pid);
     if (task != 0 && !is_idle_pcb(task)) {
-        /* 带线程的进程只允许单核：同一页表若同时在两个核上跑，
-         * 换页/TLB flush 的"本地 flush 就够"前提就不成立了。 */
-        if (task->thread_count > 1 && (mask & (mask - 1)) != 0) {
+        /* 带线程的进程只允许"不改掩码"：同一页表若同时在两个核上跑，
+         * 换页/TLB flush 的"本地 flush 就够"前提就不成立了。已经钉在
+         * 一个核上的线程组，不能被 taskset 搬到另一个核（正在旧核上跑
+         * 的线程不会立刻停，会短暂双核共享同一页表）。 */
+        if (task->thread_count > 1 && mask != task->cpu_mask) {
             FINE_UNLOCK(&sched_lock);
             return 0;
         }

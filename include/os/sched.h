@@ -92,6 +92,10 @@ typedef struct pcb
      * 回收页表）。 */
     int thread_count;
 
+    /* P4：已被 kill。调度/加锁路径看到它就拒绝把任务重新变成可运行状态，
+     * 防止"已 kill 的任务再跑一圈、把别人的锁放掉"的僵尸复活。 */
+    int killed;
+
     /* P4：本任务使用的根页表（内核虚拟地址）。idle 用内核页表。 */
     ptr_t pgdir;
 
@@ -171,11 +175,10 @@ extern const ptr_t pid0_stack;
 extern pcb_t *core_running[NR_CPUS];
 
 /* 是否有核"还在用"这个 PCB（正在跑 / 正被切换）。判据是 core_running[]——
- *   由 do_scheduler 在派遣时写入、该核下次调度才改写。细粒度版整个
- *   switch_to 都在 sched_lock 内（交棒），所以持锁读到"不在表上"严格蕴含
- *   "已完整下核"：alloc_pcb 敢回收它的栈、do_unblock 敢直接挂回就绪队列。
- *   （大锁版放锁与 switch_to 之间还剩几条汇编指令的窗口，属历史遗留，
- *   实测无影响——大锁从不崩。） */
+ *   由 do_scheduler 在派遣时写入、该核下次调度才改写。两版都在 switch_to
+ *   全程持锁（细粒度 sched_lock、大锁版 BKL，均由接棒方放），所以持锁读到
+ *   "不在表上"严格蕴含"已完整下核"：alloc_pcb 敢回收它的栈、do_unblock
+ *   敢直接挂回就绪队列。 */
 static inline int task_on_cpu(pcb_t *t)
 {
     for (int c = 0; c < NR_CPUS; ++c) {

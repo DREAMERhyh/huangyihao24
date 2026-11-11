@@ -127,6 +127,8 @@ static pcb_t *pick_next(int cpu)
     /* 取"第一个掩码允许本核"的任务当候选（等价于原来"选队首"的 RR 语义） */
     for (list_node_t *n = ready_queue.next; n != &ready_queue; n = n->next) {
         pcb_t *t = list_entry(n, pcb_t, list);
+        if (t->killed || t->status == TASK_EXITED)
+            continue;                   /* 僵尸：不再给 CPU */
         if (wp_blocks(t))
             continue;
         if (cpu_allows(t, cpu)) {
@@ -141,6 +143,8 @@ static pcb_t *pick_next(int cpu)
     /* 任务5 自适应：在"允许本核"的任务之间挑飞得最少的（配额防饿死） */
     for (list_node_t *n = best->list.next; n != &ready_queue; n = n->next) {
         pcb_t *t = list_entry(n, pcb_t, list);
+        if (t->killed || t->status == TASK_EXITED)
+            continue;
         if (!cpu_allows(t, cpu))
             continue;
         if (wp_blocks(t))
@@ -206,7 +210,10 @@ void do_scheduler(void)
      *   所以下面只在就绪队列空的时候把它拎出来怠速。
      *   （用 `-icount shift=3,sleep=off` 把时间基准换成指令数后，偏差为 0.006%，
      *   证明调度本身是公平的，问题出在"墙钟时间基准 + 宿主超载"。） */
-    if (prev->status == TASK_RUNNING && prev != idle) {
+    if (prev->killed && prev != idle) {
+        /* 已被 kill：不再入就绪队列，避免僵尸复活。 */
+        prev->status = TASK_EXITED;
+    } else if (prev->status == TASK_RUNNING && prev != idle) {
         prev->status = TASK_READY;
         list_add_tail(&prev->list, &ready_queue);
     } else if (prev == idle) {
@@ -310,6 +317,12 @@ void do_block(list_node_t *pcb_node, list_head *queue)
     // TODO: [p2-task2] block the pcb task into the block queue
     pcb_t *task = list_entry(pcb_node, pcb_t, list);
 
+    /* 已被 kill：直接退出，别把僵尸挂进睡眠队列。 */
+    if (task->killed) {
+        task->status = TASK_EXITED;
+        do_scheduler();
+    }
+
     // 先置状态、再入队、最后让出，三步之间即使被时钟中断打断也自洽：
     // 状态已是 BLOCKED（do_scheduler 不会把本任务再排回就绪队列），
     // 结点已经在阻塞队列上（唤醒者找得到本任务）。
@@ -329,6 +342,11 @@ void do_unblock(list_node_t *pcb_node)
     pcb_t *task = list_entry(pcb_node, pcb_t, list);
 
     list_del(pcb_node);
+
+    /* 已被 kill / 已退出：只摘队，不复活。 */
+    if (task->killed || task->status == TASK_EXITED)
+        return;
+
     task->status = TASK_READY;
     /* 任务5：唤醒插队——刚被唤醒的任务放队首，而不是队尾。
      *   条件变量/互斥锁这类"乒乓"负载里，每一轮都要阻塞-唤醒一次，

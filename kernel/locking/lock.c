@@ -145,6 +145,14 @@ void do_mutex_lock_acquire(int mlock_idx)
         FINE_LOCK(&sync_lock);
         FINE_LOCK(&sched_lock);
 
+        /* 已被 kill：不能再抢锁（否则会把 status 改回 RUNNING 复活）。 */
+        if (current_running->killed) {
+            FINE_UNLOCK(&sched_lock);
+            FINE_UNLOCK(&sync_lock);
+            irq_restore(sstatus);
+            do_exit();
+        }
+
         list_add_tail(&current_running->list, &lock->block_queue);
         acquired = spin_lock_try_acquire(&lock->lock);
         if (acquired) {
@@ -214,6 +222,15 @@ void do_mutex_lock_release(int mlock_idx)
  *   恢复中断，之后才允许让出（自旋锁绝不能带进 do_scheduler）。 */
 static void block_on_queue(list_head *q, uint64_t sstatus)
 {
+    /* 已被 kill：不挂队，直接走退出路径（否则会以 EXITED 身份留在队列里）。 */
+    if (current_running->killed) {
+        current_running->status = TASK_EXITED;
+        FINE_UNLOCK(&sched_lock);
+        FINE_UNLOCK(&sync_lock);
+        irq_restore(sstatus);
+        do_scheduler();
+    }
+
     current_running->status = TASK_BLOCKED;
     list_add_tail(&current_running->list, q);
 
@@ -228,6 +245,12 @@ static void block_on_queue(list_head *q, uint64_t sstatus)
  *   直接调完整版会重复拿 sync_lock——自旋锁不可重入，会死锁。 */
 static void mutex_release_locked(mutex_lock_t *lock)
 {
+    /* 只有持锁者才能放锁。被 kill 的任务可能还拿着"旧身份"回来调
+     * release——那时 owner 已经被 do_kill 清掉/易主，必须拒绝，
+     * 否则会把新持有者的锁放掉。 */
+    if (lock->owner != current_running)
+        return;
+
     lock->owner = 0;                    // P3：持锁者即将易主（或变空）
     spin_lock_release(&lock->lock);
 
@@ -304,6 +327,14 @@ void do_barrier_wait(int bar_idx)
      *   还没挂上时数满人数，把"还没睡的人"当"到齐"放行（丢唤醒）。 */
     FINE_LOCK(&sync_lock);
     FINE_LOCK(&sched_lock);
+
+    /* 已被 kill：不要参与这一轮 barrier（否则计数会替尸体算一份）。 */
+    if (current_running->killed) {
+        FINE_UNLOCK(&sched_lock);
+        FINE_UNLOCK(&sync_lock);
+        irq_restore(sstatus);
+        do_exit();
+    }
 
     /* 到达计数 +1；凑满 goal 的"最后一人"不睡，由它放行所有人：
      *   · 清零 arrived，为下一轮做准备（测试是 10 轮循环）；
@@ -421,6 +452,14 @@ void do_condition_wait(int cond_idx, int mutex_idx)
 
     FINE_LOCK(&sync_lock);
     FINE_LOCK(&sched_lock);
+
+    /* 已被 kill：不要挂条件队列，直接退出。 */
+    if (current_running->killed) {
+        FINE_UNLOCK(&sched_lock);
+        FINE_UNLOCK(&sync_lock);
+        irq_restore(sstatus);
+        do_exit();
+    }
 
     list_add_tail(&current_running->list, &c->wait_list);
     mutex_release_locked(&mlocks[mutex_idx]);
