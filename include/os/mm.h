@@ -19,6 +19,13 @@
 #define USER_STACK_ADDR   0xf00010000lu
 #define USER_STACK_PAGES  8
 
+/* 人为限制"可换出的用户页"数量，超过就触发 FIFO 换页。
+ * 128 页 = 512KB，足够普通测试；swap 测试会访问超过这个数量的页。 */
+#define USER_PAGE_LIMIT   128
+#define SWAP_START_SECTOR 0x10000u   /* 32MB 处开始；镜像在 Makefile 里 pad 到 64MB */
+#define SWAP_MAX_PAGES    8192u      /* 32MB swap 区 */
+#define SWAP_SECTORS_PER_PAGE (PAGE_SIZE / 512)
+
 /* Rounding; only works for n = power of two */
 #define ROUND(a, n)     (((((uint64_t)(a))+(n)-1)) & ~((n)-1))
 #define ROUNDDOWN(a, n) (((uint64_t)(a)) & ~((n)-1))
