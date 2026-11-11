@@ -13,10 +13,12 @@
  * 三个交接点（缺一不可，详见各自注释）：
  *   · trap 入口（exception_handler_entry，entry.S）：SAVE 之后 lock；
  *   · trap 出口（ret_from_exception，entry.S）：RESTORE 之前 unlock；
- *   · 任务切换缝隙（do_scheduler 的 unlock→switch_to→lock 对偶）：
- *     被切走的执行流停在"不持锁"状态，而无论是被切回的老任务
- *     （从 switch_to 之后继续）还是新任务（从 new_task_entry 进入），
- *     都会先重新 lock 再继续。
+ *   · 任务切换缝隙（do_scheduler 的 switch_to 交棒）：
+ *     switch_to 全程持锁；被切回的老任务（从 switch_to 返回点继续）和
+ *     新任务（从 new_task_entry 进入）都继续持有这把锁，直到本核当前
+ *     执行流真正返回用户态的 ret_from_exception 才统一放。
+ *     ★ 不能在 switch_to 之前放锁：prev 已入就绪队列但现场还没写，
+ *     另一核会挑到旧 kernel_sp（大锁版历史上就是这条偶发崩溃）。
  * 锁的临界区里 SIE=0（trap 入口硬件已清），自旋等待只等"另一个核"
  * 放锁，不会被本地中断打断。
  * ===================================================================== */
