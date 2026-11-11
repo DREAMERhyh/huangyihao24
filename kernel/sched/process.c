@@ -682,41 +682,41 @@ int do_waitpid(pid_t pid)
     /* 任务5：细粒度版把"判子进程状态"和"挂到它的 wait_list"放进同一个
      *   sched_lock 临界段——否则子进程在核 1 上退出（改状态+唤醒等待者）
      *   可能插在我们的两次操作之间，我们随后照睡不误，永久卡死。
-     *   大锁版宏为空（BKL 本来就在 trap 入口持有，天然互斥），等价原逻辑。 */
-    FINE_LOCK(&sched_lock);
+     *   大锁版宏为空（BKL 本来就在 trap 入口持有，天然互斥），等价原逻辑。
+     * P4：主线程先退出时 wait_list 会被提前唤醒，所以用循环重查，
+     *   直到整个线程组都结束（thread_count==0）才返回。 */
+    for (;;) {
+        FINE_LOCK(&sched_lock);
 
-    /* 已被 kill：不能挂到 wait_list 上（同 do_pthread_join 的理由）。 */
-    if (current_running->killed) {
+        /* 已被 kill：不能挂到 wait_list 上（同 do_pthread_join 的理由）。 */
+        if (current_running->killed) {
+            FINE_UNLOCK(&sched_lock);
+            do_exit();
+        }
+
+        pcb_t *task = find_pcb_by_pid(pid);
+
+        /* P3 评审补丁：pid==0 会解析到本核 idle、pid==自己 会解析到自身——
+         *   两者的 wait_list 都永远等不到"退出唤醒"，直接按"无可等待对象"
+         *   返回 0（与 pid 不存在的语义一致），避免调用者永睡。 */
+        if (task == 0 || is_idle_pcb(task) || task == current_running) {
+            FINE_UNLOCK(&sched_lock);
+            return 0;
+        }
+
+        if (task->status == TASK_EXITED && task->thread_count == 0) {
+            FINE_UNLOCK(&sched_lock);
+            return pid;
+        }
+
+        /* 挂到对方的 wait_list 上睡觉；对方 exit/kill 时会被唤醒 */
+        current_running->status = TASK_BLOCKED;
+        list_add_tail(&current_running->list, &task->wait_list);
+
         FINE_UNLOCK(&sched_lock);
-        do_exit();
+
+        do_scheduler();
     }
-
-    pcb_t *task = find_pcb_by_pid(pid);
-
-    /* P3 评审补丁：pid==0 会解析到本核 idle、pid==自己 会解析到自身——
-     *   两者的 wait_list 都永远等不到"退出唤醒"，直接按"无可等待对象"
-     *   返回 0（与 pid 不存在的语义一致），避免调用者永睡。 */
-    if (task == 0 || is_idle_pcb(task) || task == current_running) {
-        FINE_UNLOCK(&sched_lock);
-        return 0;
-    }
-
-    /* P4：主线程先退出但还有线程活着时，整个进程还没结束；等最后一个
-     * 线程退出（do_exit 把 thread_count 减到 0 并唤醒这里）。 */
-    if (task->status == TASK_EXITED && task->thread_count == 0) {
-        FINE_UNLOCK(&sched_lock);
-        return pid;
-    }
-
-    /* 挂到对方的 wait_list 上睡觉；对方 exit/kill 时会被唤醒 */
-    current_running->status = TASK_BLOCKED;
-    list_add_tail(&current_running->list, &task->wait_list);
-
-    FINE_UNLOCK(&sched_lock);
-
-    do_scheduler();
-
-    return pid;
 }
 
 /* =====================================================================
