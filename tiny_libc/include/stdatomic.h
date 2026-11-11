@@ -30,7 +30,7 @@ static inline uint64_t atomic_load_d(volatile uint64_t* obj)
     uint64_t arg = UINT64_MAX;
     uint64_t ret;
     __asm__ __volatile__ (
-                          "amoand.w.aqrl %0, %2, %1\n"
+                          "amoand.d.aqrl %0, %2, %1\n"
                           : "=r"(ret), "+A" (*(uint64_t*)obj)
                           : "r"(arg)
                           : "memory");

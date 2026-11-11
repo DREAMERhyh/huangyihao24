@@ -348,8 +348,10 @@ uintptr_t map_user_page(uintptr_t va, uintptr_t pgdir, uint64_t perm)
         page = (ptr_t)pa2kva(get_pa(*pte));
     } else {
         /* 新映射覆盖一个已换出的旧页时，先归还它的 swap 槽。 */
-        if (*pte & _PAGE_SOFT)
+        if (*pte & _PAGE_SOFT) {
+            swap_entry_remove(pte);
             swap_slot_free((int)get_pfn(*pte));
+        }
         page = alloc_user_page(pgdir, va & ~OFFSET_MASK_4K);
         set_pfn(pte, kva2pa(page) >> NORMAL_PAGE_SHIFT);
         swap_entry_add(pte, pgdir, va & ~OFFSET_MASK_4K);

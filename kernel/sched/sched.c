@@ -317,18 +317,21 @@ void do_block(list_node_t *pcb_node, list_head *queue)
     // TODO: [p2-task2] block the pcb task into the block queue
     pcb_t *task = list_entry(pcb_node, pcb_t, list);
 
-    /* 已被 kill：直接退出，别把僵尸挂进睡眠队列。 */
-    if (task->killed) {
-        task->status = TASK_EXITED;
-        do_scheduler();
-    }
-
     // 先置状态、再入队、最后让出，三步之间即使被时钟中断打断也自洽：
     // 状态已是 BLOCKED（do_scheduler 不会把本任务再排回就绪队列），
     // 结点已经在阻塞队列上（唤醒者找得到本任务）。
     // 任务5：细粒度版把"置态+入队"圈进 sched_lock（跨核原子，防丢唤醒）；
     //   放锁之后才让出（do_scheduler 自己会再拿锁）。大锁版宏为空。
     FINE_LOCK(&sched_lock);
+
+    /* 已被 kill：与"置 BLOCKED/入队"放在同一临界段里判，避免检查后、
+     * 入队前被另一核 do_kill 抢先（TOCTOU）。命中则放锁后让出。 */
+    if (task->killed) {
+        task->status = TASK_EXITED;
+        FINE_UNLOCK(&sched_lock);
+        do_scheduler();
+    }
+
     task->status = TASK_BLOCKED;
     list_add_tail(pcb_node, queue);
     FINE_UNLOCK(&sched_lock);

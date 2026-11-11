@@ -277,6 +277,11 @@ pid_t do_exec(char *name, int argc, char **argv, uint64_t mask)
     if (name == 0 || argc < 0 || argc > EXEC_MAX_ARGC)
         return 0;
 
+    /* argc 与 argv 必须同时给出/同时为空，否则用户 main 拿到
+     * argc>0、argv=NULL 会在第一次用参数时崩。 */
+    if (argc > 0 && argv == 0)
+        return 0;
+
     /* P3 评审补丁：显式掩码里若含本系统之外的核位（如 0x4），该任务在
      *   任何核上都选不中、滞留就绪队列静默饿死——直接拒绝启动。
      *   （mask==0 仍表示"继承父进程"，不是非法值。） */
@@ -493,6 +498,13 @@ int do_pthread_join(pid_t tid)
 {
     FINE_LOCK(&sched_lock);
 
+    /* 已被 kill：不能挂到别人的 wait_list 上（否则僵尸会带着链表结点
+     * 被 alloc_pcb 复用，链表腐坏）。放锁后走退出路径。 */
+    if (current_running->killed) {
+        FINE_UNLOCK(&sched_lock);
+        do_exit();
+    }
+
     pcb_t *target = find_pcb_by_tid(tid);
     /* 只能 join 同进程的线程：别的进程的 tid 空间互不可见。 */
     if (target == 0 || target == current_running || !target->is_thread ||
@@ -545,6 +557,12 @@ void do_exit(void)
     pcb_t *main_task = find_pcb_by_pid(task->pid);
     if (main_task != 0 && main_task->thread_count > 0) {
         main_task->thread_count--;
+        if (main_task->thread_count == 0) {
+            /* 主线程先退出时，waitpid 可能还挂在主 PCB 的 wait_list 上；
+             * 最后一个线程退出时替它收尾。 */
+            while (!list_empty(&main_task->wait_list))
+                do_unblock(main_task->wait_list.next);
+        }
         if (main_task->thread_count == 0 && main_task->pgdir != 0 &&
             !pid_on_cpu_except(task->pid, task)) {
             /* 先把本核 satp 切回内核页表，再释放这个进程的页表：
@@ -667,6 +685,12 @@ int do_waitpid(pid_t pid)
      *   大锁版宏为空（BKL 本来就在 trap 入口持有，天然互斥），等价原逻辑。 */
     FINE_LOCK(&sched_lock);
 
+    /* 已被 kill：不能挂到 wait_list 上（同 do_pthread_join 的理由）。 */
+    if (current_running->killed) {
+        FINE_UNLOCK(&sched_lock);
+        do_exit();
+    }
+
     pcb_t *task = find_pcb_by_pid(pid);
 
     /* P3 评审补丁：pid==0 会解析到本核 idle、pid==自己 会解析到自身——
@@ -677,7 +701,9 @@ int do_waitpid(pid_t pid)
         return 0;
     }
 
-    if (task->status == TASK_EXITED) {
+    /* P4：主线程先退出但还有线程活着时，整个进程还没结束；等最后一个
+     * 线程退出（do_exit 把 thread_count 减到 0 并唤醒这里）。 */
+    if (task->status == TASK_EXITED && task->thread_count == 0) {
         FINE_UNLOCK(&sched_lock);
         return pid;
     }
