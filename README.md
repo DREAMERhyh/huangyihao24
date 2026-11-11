@@ -144,11 +144,25 @@ exec fly &
 
 屏幕第 11~17 行出现左右飞的 ASCII 飞机，说明用户态程序在各自页表下正常运行。
 
+**④ kill 一个进程**
+
+`fly` 是死循环，用它验证 kill：
+
+```
+ps
+kill 2          # 用 ps 里 fly 的实际 pid
+ps
+```
+
+预期：第一条 `ps` 里 fly 为 `RUNNING/READY`；`kill` 成功后不打印任何东西；
+第二条 `ps` 里该 pid 变为 `EXITED`，屏幕上的飞机停止。
+
 **通过标准**
 
 - [ ] 启动打印 `entered kernel with VM`
 - [ ] shell 为 PID 1，`ps` 正常
 - [ ] `exec fly &` 能飞
+- [ ] `kill <fly 的 pid>` 后该进程变 `EXITED`，系统继续响应
 
 ---
 
@@ -179,6 +193,36 @@ Success!
 - [ ] `exec rw 0x20000000` 打印随机数与 `Success!`
 - [ ] 进程正常 `EXITED`，没有 panic / 异常现场
 
+**互斥锁 lock（任务 2 的同步部分）**
+
+`lock` 会反复申请同一把 key=42 的互斥锁，并在持锁期间打印
+`Has acquired lock and running.(0..4)`。启动 2~3 个实例：
+
+```
+exec lock 0 &
+exec lock 1 &
+exec lock 2 &
+```
+
+预期：三行各自先打印 `> [TASK] Applying for a lock.`；**同一时刻只有一行**
+打印 `Has acquired lock and running.(i)`，三行轮流进入临界区，不会交叉。
+
+再验证 kill 持锁者会释放锁：
+
+```
+ps                  # 找到某个 lock 进程的 pid
+kill <pid>
+```
+
+预期：被 kill 的进程变 `EXITED`；其余 lock 实例继续打印（内核替被 kill
+的持锁者放锁并唤醒等待者），系统不崩溃。
+
+**通过标准**
+
+- [ ] 2~3 个 lock 实例的输出不交叉（互斥生效）
+- [ ] `kill` 一个持锁实例后，其余实例继续运行
+- [ ] 没有进程"复活"、没有异常现场
+
 ---
 
 ### 任务 3：FIFO 换页
@@ -200,10 +244,23 @@ swap test PASSED (256 pages)
 
 `ps` 中该进程随后为 `EXITED`。
 
+**证明"真的换了页"（只 PASS 还不够）**
+
+`PASSED` 只能说明读回值正确；要证明换页确实落到了 SD，可在宿主检查镜像
+32MB 偏移处（swap 区起点）是否被写过：
+
+```bash
+dd if=build/image bs=1M skip=32 count=1 2>/dev/null | tr -d '\0' | wc -c
+```
+
+预期输出 **大于 0**（正常一次 swap 测试是几百字节的非零内容）。如果为 0，
+说明 256 页都在内存里、没有触发换出，测试不算数。
+
 **通过标准**
 
 - [ ] 打印 `swap test PASSED (256 pages)`
 - [ ] 读回值全部正确（有错会打印 `FAILED at page N`）
+- [ ] 镜像 32MB 处非零（确实写了 SD）
 - [ ] 无 SD 读写错误、无异常现场
 
 ---
