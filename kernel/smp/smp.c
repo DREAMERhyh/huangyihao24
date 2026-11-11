@@ -104,13 +104,27 @@ void wakeup_other_hart()
 }
 
 #ifndef FINE_GRAIN_LOCK
+/* P4：大锁版允许本核在持 BKL 时再次陷入（典型是 S 态读用户缓冲触发
+ * 缺页）。自旋锁不可重入，这里用每核嵌套深度：同一核重复进入只加深度，
+ * 由最外层 ret_from_exception 真正放锁。深度只由本核读写，不需要跨核
+ * 内存序假设；switch_to 交棒时深度随"本核当前执行流"一起交给下一个任务。 */
+static int bkl_depth[NR_CPUS];
+
 void lock_kernel()
 {
-    spin_lock_acquire(&big_kernel_lock);
+    int cpu = (int)get_current_cpu_id();
+
+    if (bkl_depth[cpu]++ == 0)
+        spin_lock_acquire(&big_kernel_lock);
 }
 
 void unlock_kernel()
 {
-    spin_lock_release(&big_kernel_lock);
+    int cpu = (int)get_current_cpu_id();
+
+    if (bkl_depth[cpu] == 0)
+        return;
+    if (--bkl_depth[cpu] == 0)
+        spin_lock_release(&big_kernel_lock);
 }
 #endif

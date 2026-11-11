@@ -90,6 +90,9 @@ PTE *walk_page_table(uintptr_t va, uintptr_t pgdir, int create)
         set_pfn(&l2[vpn2], kva2pa(page) >> NORMAL_PAGE_SHIFT);
         set_attribute(&l2[vpn2], _PAGE_PRESENT);
     }
+    /* 2MB 叶子（内核直接映射）不能再往下一级走，否则会把物理页当页表。 */
+    if (l2[vpn2] & (_PAGE_READ | _PAGE_WRITE | _PAGE_EXEC))
+        return 0;
     l1 = (PTE *)pa2kva(get_pa(l2[vpn2]));
 
     if (!(l1[vpn1] & _PAGE_PRESENT)) {
@@ -100,6 +103,8 @@ PTE *walk_page_table(uintptr_t va, uintptr_t pgdir, int create)
         set_pfn(&l1[vpn1], kva2pa(page) >> NORMAL_PAGE_SHIFT);
         set_attribute(&l1[vpn1], _PAGE_PRESENT);
     }
+    if (l1[vpn1] & (_PAGE_READ | _PAGE_WRITE | _PAGE_EXEC))
+        return 0;
     l0 = (PTE *)pa2kva(get_pa(l1[vpn1]));
 
     return &l0[vpn0];
@@ -171,6 +176,50 @@ uintptr_t map_user_page(uintptr_t va, uintptr_t pgdir, uint64_t perm)
                                                 _PAGE_EXEC)));
     spin_lock_release(&paging_lock);
     return (uintptr_t)page + (va & OFFSET_MASK_4K);
+}
+
+/* ------------------------------------------------------------------ */
+/* 缺页处理（任务2）                                                   */
+/* ------------------------------------------------------------------ */
+/* 注意：本函数只做"分配 + 建映射"，不得调用 do_scheduler/do_block
+ * 等会切换任务的函数——大锁版的 BKL 重入深度依赖"最外层 trap 才放锁"。 */
+void handle_page_fault(regs_context_t *regs, uint64_t stval, uint64_t scause)
+{
+    uintptr_t va = (uintptr_t)stval;
+    pcb_t *task = current_running;
+    uintptr_t pgdir;
+    PTE *pte;
+
+    /* 内核空间的缺页不该发生；非规范地址（Sv39 要求 bit63..39 全等于
+     * bit38）也修不了，否则会反复缺页死循环。都走统一的报错路径。 */
+    if (((va >> 38) & 1) || (va >> 39) != 0) {
+        handle_other(regs, stval, scause);
+        return;
+    }
+
+    spin_lock_acquire(&paging_lock);
+    pgdir = task->pgdir;
+    pte = walk_page_table(va, pgdir, 1);
+    if (pte == 0) {
+        spin_lock_release(&paging_lock);
+        handle_other(regs, stval, scause);
+        return;
+    }
+
+    if (*pte & _PAGE_PRESENT) {
+        /* 板上 A/D 位为 0 会触发缺页；只补位，不能覆盖原有权限。 */
+        *pte |= _PAGE_ACCESSED | _PAGE_DIRTY;
+    } else {
+        ptr_t page = alloc_user_page(pgdir, va & ~OFFSET_MASK_4K);
+        set_pfn(pte, kva2pa(page) >> NORMAL_PAGE_SHIFT);
+        set_attribute(pte, _PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE |
+                           _PAGE_EXEC | _PAGE_USER | _PAGE_ACCESSED |
+                           _PAGE_DIRTY);
+    }
+
+    local_flush_tlb_page(va);
+    local_flush_icache_all();
+    spin_lock_release(&paging_lock);
 }
 
 /* ------------------------------------------------------------------ */

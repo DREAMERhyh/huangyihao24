@@ -185,7 +185,9 @@ int main(uint64_t boot_cpu)
      *   而此刻 tp 还是 U-Boot 留下的残值。核号用参数 boot_cpu。 */
     if (boot_cpu != 0) {
         asm volatile("csrw sie, zero");
-        asm volatile("csrw sscratch, %0" ::"r"(SECONDARY_TRAP_STACK));
+        /* sscratch=0 表示"当前在 S 态"（P4 可重入陷阱帧约定，
+         * 见 entry.S 的 SAVE_CONTEXT）。 */
+        asm volatile("csrw sscratch, zero");
         setup_exception();              /* stvec = 陷阱入口；sstatus.SIE = 1 */
         /* P4：内核态也要能访问 U 位页面（do_exec 从父进程地址空间拷 argv） */
         asm volatile("csrs sstatus, %0" ::"r"(SR_SUM));
@@ -268,9 +270,10 @@ int main(uint64_t boot_cpu)
     //    （do_scheduler）都会按下一个任务的时间片重设下一次触发时刻。
     bios_set_timer(get_ticks() + TIMER_INTERVAL);
 
-    // ② 内核自己也要能被中断打断（抢占模式下的"第一次调度"正是由这次时钟
-    //    中断发起的）。陷阱入口靠 sscratch 找内核栈顶，先给它一页专用陷阱栈。
-    asm volatile("csrw sscratch, %0" : : "r"(allocPage(1) + PAGE_SIZE));
+    // ② sscratch=0：主核当前在 S 态。P4 的陷阱帧约定（entry.S）是
+    //    "用户态时 sscratch=内核栈顶，S 态时 sscratch=0"；内核空转时被
+    //    时钟打断就直接在当前内核栈上向下压帧，不再需要专用陷阱栈。
+    asm volatile("csrw sscratch, zero");
 
     // ② 再打开 sie 的 STIE 位（允许时钟中断）。此时 sstatus.SIE 已经是 1
     //    （内核态由 setup_exception 打开，用户态由 sret 按陷阱帧的 SPIE 恢复），

@@ -22,10 +22,20 @@ void interrupt_helper(regs_context_t *regs, uint64_t stval, uint64_t scause)
      *   1 → 中断（异步，如时钟中断），低 63 位是中断号
      *   0 → 例外（同步，如 ecall/env call、缺页），低 63 位是例外号
      * 两者用不同的入口表分发。 */
-    if (scause & SCAUSE_IRQ_FLAG)
-        irq_table[scause & ~SCAUSE_IRQ_FLAG](regs, stval, scause);
-    else
+    if (scause & SCAUSE_IRQ_FLAG) {
+        uint64_t code = scause & ~SCAUSE_IRQ_FLAG;
+        if (code >= IRQC_COUNT) {
+            handle_other(regs, stval, scause);
+            return;
+        }
+        irq_table[code](regs, stval, scause);
+    } else {
+        if (scause >= EXCC_COUNT) {
+            handle_other(regs, stval, scause);
+            return;
+        }
         exc_table[scause](regs, stval, scause);
+    }
 }
 
 /* ★ P3 起删掉了 P2 的"Ctrl+C 暖重启"：
@@ -58,6 +68,10 @@ void init_exception()
     for (int i = 0; i < EXCC_COUNT; ++i)
         exc_table[i] = handle_other;
     exc_table[EXCC_SYSCALL] = handle_syscall;
+    /* P4：三类缺页都走同一个按需调页处理程序 */
+    exc_table[EXCC_INST_PAGE_FAULT]  = handle_page_fault;
+    exc_table[EXCC_LOAD_PAGE_FAULT]  = handle_page_fault;
+    exc_table[EXCC_STORE_PAGE_FAULT] = handle_page_fault;
 
     /* TODO: [p2-task4] initialize irq_table */
     /* NOTE: handle_int, handle_other, etc.*/
