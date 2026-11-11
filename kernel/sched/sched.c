@@ -98,9 +98,12 @@ static int cpu_allows(pcb_t *t, int cpu)
  *     交棒锁保证：pick_next 持 sched_lock 时，不在 core_running[] 上
  *     ⇔ 已完整下核、现场已保存，绝无"两核同跑一个内核栈"的风险；
  *     所以直接把过期标记清掉、按普通任务参与挑选即可。
- *     大锁版不启用：它的 unlock→switch_to 之间还有几条汇编指令的窗口，
- *     "不在表上"不蕴含"现场已写完"（见 sched.h 注释），此时清标记会
- *     退化成不安全的版本——好在那个版本从不打这个标记。 */
+ *     大锁版不启用：它的 do_unblock 只在持 BKL 时运行，而阻塞任务在
+ *     放 BKL 之前 core_running[] 已经改成 next，所以"另一个核看得见
+ *     do_unblock"时该任务必然已不在表上——跨核不会设置这个标记
+ *     （同核 check_sleeping 唤醒当前任务时 do_unblock 仍会短暂置位，
+ *     紧接着由 do_scheduler 开头清掉）。自愈分支没有跨核触发条件
+ *     （保留 #ifdef 是防御性取舍）。 */
 static int wp_blocks(pcb_t *t)
 {
     if (!t->wake_pending)
@@ -157,7 +160,13 @@ void do_scheduler(void)
 {
     /* 任务5：细粒度版整个调度决策持 sched_lock（大锁版此处宏为空，
      *   BKL 由 trap 入口持有）。自旋锁不可重入——check_sleeping/
-     *   do_unblock/pick_next 的内部路径不得再拿 sched_lock。 */
+     *   do_unblock/pick_next 的内部路径不得再拿 sched_lock。
+     * ★ 大锁版调用上下文不变式：必须从"已持 BKL"的 trap 上下文进入
+     *   （syscall/中断 → exception_handler_entry 先 lock_kernel）。交棒后
+     *   接棒方的 ret_from_exception 会无条件 unlock_kernel；若从无锁的
+     *   上下文直接调用，会把另一个核正持有的 BKL 放掉、互斥失效。
+     *   （init/main.c 的 jmptab[YIELD] 曾是这样一个入口；现有 U 态测试
+     *   都走 ecall 不触发，但不要再经由跳转表直接调用本函数。） */
     FINE_LOCK(&sched_lock);
 
     /* 任务5（路线A）：本核核号只在这里取一次。进函数时 current_running
@@ -243,9 +252,12 @@ void do_scheduler(void)
     // TODO: [p2-task1] switch_to current_running
     /* P3 任务3：大内核锁在"切换缝隙"里交接（与 entry.S 的 new_task_entry、
      *   trap 入口/出口的 lock/unlock 共同维持不变式，详见 kernel/smp/smp.c）：
-     *   · unlock 后本执行流处于"不持锁"状态，另一核才能进内核；
-     *   · 被切回的老任务从 switch_to 之后继续（重新 lock）；
-     *   · 新任务从 new_task_entry 进（那里先 lock 再走 ret_from_exception）。
+     *   · switch_to 期间本执行流一直持锁（两版都交棒），别的核进不来；
+     *   · 大锁版的 BKL 一路带到"本核当前执行流真正返回用户态"的
+     *     ret_from_exception 才放（老任务从 switch_to 返回点继续、新任务从
+     *     new_task_entry 进入，都在那里统一 unlock）——比原来"switch 前就放"
+     *     只多持有 switch_to 与返回路径的几十条指令；
+     *   · 细粒度版在下面由接棒方 FINE_UNLOCK(&sched_lock)。
      * 任务5：细粒度版的 sched_lock 走【锁交棒】——不再在 switch_to 之前
      *   放开，而是由"接棒方"放（switch_to 返回点 / new_task_entry 里的
      *   FINE_UNLOCK，两处对偶）。
@@ -255,11 +267,22 @@ void do_scheduler(void)
      *     上一轮的旧值，指向 prev 栈上早已被后续调用覆写的死帧 →
      *     switch_to 的 `jr ra` 跳进数据区（实测 ra=0 或 ra=&sched_lock）。
      *     交棒后：锁在 switch_to 全程持有，prev 的现场一定先写完，
-     *     别的核才可能再看见它。 */
-    unlock_kernel();
+     *     别的核才可能再看见它。
+     * 任务5 遗留修复（大锁版同构交棒）：大锁版原来在 switch_to 之前就
+     *   unlock_kernel()，同样留出"prev 已入队、现场未写"的窗口——真实
+     *   时钟下窗口只有 ~10 条指令宽，但多核高频切换时仍可能撞上（icount
+     *   下已稳定复现 truly_illegal_insn）。现在大锁版也不在切换前放锁：
+     *   BKL 在本执行流里一路持有到 ret_from_exception（见 entry.S），
+     *   不再在 switch_to 前后放/拿——这样既关闭了窗口，也省掉了"先放
+     *   再立刻拿回"的瞬态。新任务不再在 new_task_entry 里补锁（它继承
+     *   上一任交过来的锁）。细粒度版 unlock_kernel/lock_kernel 是空函数，
+     *   行为不变。 */
     switch_to(prev, next);
-    FINE_UNLOCK(&sched_lock);   /* 接棒方放锁（大锁版此处宏为空） */
-    lock_kernel();
+    FINE_UNLOCK(&sched_lock);   /* 细粒度：接棒方放 sched_lock（大锁版宏为空） */
+    /* ★ switch_to() 之后不得再添加需要执行的语句：大锁版 FINE_UNLOCK 展开
+     *   为空，-O2 会把本函数末尾编成 tail call（`j switch_to`，objdump 已
+     *   确认）——switch_to 的返回点直接回到 do_scheduler 的调用者，语义
+     *   等价，但本函数不再有自己的返回路径。 */
 }
 
 void do_sleep(uint32_t sleep_time)

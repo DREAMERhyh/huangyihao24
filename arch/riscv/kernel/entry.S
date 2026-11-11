@@ -199,8 +199,9 @@ ENTRY(ret_from_exception)
   /* 任务3：进 here 时 sp 指向本任务内核栈上的 traps 帧（可能是刚从 sret
    *   返回用户态前的最后一站，也可以是新任务第一次被调度的终点：新任务的
    *   switch_to 现场里 ra 就被伪造成了 new_task_entry → 补锁后跳到这里）。 */
-  /* P3 任务3：出内核前释放大内核锁（与 trap 入口 / new_task_entry 的
-   *   lock 配对，维持"内核中执行 ⇒ 持锁"的不变式）。
+  /* P3 任务3：出内核前释放大内核锁（与 trap 入口的 lock 配对，维持
+   *   "内核中执行 ⇒ 持锁"的不变式）。新任务从 new_task_entry 进来时
+   *   继承的是上一任调度器交棒的锁，也在这里统一释放（那里不再 lock）。
    *   放在 RESTORE 之前：jal 不压栈；unlock_kernel 自己的栈帧压在陷阱帧
    *   基址【之下】（本任务内核栈的保留区），不碰陷阱帧。 */
   jal  unlock_kernel
@@ -209,17 +210,17 @@ ENTRY(ret_from_exception)
 ENDPROC(ret_from_exception)
 
 /* P3 任务3：新任务的第一次上场入口（init_pcb_stack 伪造的 ra）。
- *   老任务被切回时从 switch_to 的返回点继续（do_scheduler 里那里有
- *   lock_kernel()）；新任务不经过那里，在这里补上同一个 lock。 */
+ *   老任务被切回时从 switch_to 的返回点继续；新任务不经过那里，从这里
+ *   直接走公共返回路径。
+ * 任务5：两版都在 switch_to 期间由上一任调度器交棒——
+ *   · 细粒度版：接棒方在这里放 sched_lock（与 do_scheduler 返回点对偶）；
+ *   · 大锁版：BKL 由上一任一直持到这里，**不能再 lock**（自旋锁不可重入）；
+ *     直接进 ret_from_exception，由那里的 unlock_kernel 放锁。 */
 ENTRY(new_task_entry)
-  /* 任务5：sched_lock 交棒——上一任调度器在 switch_to 期间一直持锁，
-   *   新任务作为"接棒方"在这里放锁（与 do_scheduler 中 switch_to 返回点
-   *   的 FINE_UNLOCK 对偶）。大锁版（未定义 FINE_GRAIN_LOCK）不生成。 */
 #ifdef FINE_GRAIN_LOCK
   la   a0, sched_lock
   jal  spin_lock_release
 #endif
-  jal  lock_kernel
   j    ret_from_exception
 ENDPROC(new_task_entry)
 
