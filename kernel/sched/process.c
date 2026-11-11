@@ -26,38 +26,27 @@ extern void new_task_entry();
 #define ARG_AREA_LIMIT 2048      /* 参数区最多往下占用户栈一半（4KB 栈） */
 
 /* ---------------------------------------------------------------------
- * 任务栈池：exit/kill 时把栈还进池子，exec 优先从池子取。
- * mm.c 的分配器只前进不回收，进程反复 exec 会一路吃内存；这里给
- * 内核栈/用户栈各建一个小 free list（课程规模 16 个任务够用，
- * 溢出的栈不再入池——对应"池满即弃"）。 */
+ * 内核栈池：exit/kill 时把内核栈还进池子，exec 优先从池子取。
+ * mm.c 的分配器只前进不回收，进程反复 exec 会一路吃内存；这里建一个
+ * 小 free list（课程规模 48 个任务够用，溢出的栈不再入池）。
+ * P4：用户栈页在进程页表里，由 free_user_pgdir / free_user_page 回收。 */
 #define STACK_POOL_MAX NUM_MAX_TASK
 static ptr_t kstack_free[STACK_POOL_MAX];
 static int   kstack_nfree;
-static ptr_t ustack_free[STACK_POOL_MAX];
-static int   ustack_nfree;
 
-static ptr_t task_stack_alloc(int is_kernel)
+static ptr_t task_stack_alloc(void)
 {
-    if (is_kernel) {
-        if (kstack_nfree > 0)
-            return kstack_free[--kstack_nfree];
-        return allocPage(1);
-    }
-    /* P4：用户栈页属于进程页表，由 free_user_pgdir 统一回收，不再单独池化 */
-    return 0;
+    if (kstack_nfree > 0)
+        return kstack_free[--kstack_nfree];
+    return allocPage(1);
 }
 
-static void task_stack_free(ptr_t base, int is_kernel)
+static void task_stack_free(ptr_t base)
 {
     if (base == 0)
         return;
-    if (is_kernel) {
-        if (kstack_nfree < STACK_POOL_MAX)
-            kstack_free[kstack_nfree++] = base;
-    } else {
-        if (ustack_nfree < STACK_POOL_MAX)
-            ustack_free[ustack_nfree++] = base;
-    }
+    if (kstack_nfree < STACK_POOL_MAX)
+        kstack_free[kstack_nfree++] = base;
 }
 
 /* ---------------------------------------------------------------------
@@ -88,13 +77,13 @@ static pcb_t *find_pcb_by_tid(pid_t tid)
     return 0;
 }
 
-/* P4：找同 pid 的主线程 PCB（线程退出时维护 thread_count / 回收页表） */
-static pcb_t *find_main_pcb(pid_t pid)
+/* P4：pid 还有没有线程正在某个核上跑？kill/页表回收/主 PCB 复用都要问。 */
+static int pid_on_cpu(pid_t pid)
 {
-    for (int i = 0; i < NUM_MAX_TASK; ++i) {
-        if (pcb[i].name[0] != '\0' && pcb[i].pid == pid && !pcb[i].is_thread)
-            return &pcb[i];
-    }
+    for (int i = 0; i < NUM_MAX_TASK; ++i)
+        if (pcb[i].name[0] != '\0' && pcb[i].pid == pid &&
+            task_on_cpu(&pcb[i]))
+            return 1;
     return 0;
 }
 
@@ -116,10 +105,12 @@ static pcb_t *alloc_pcb(void)
     for (int i = 0; i < NUM_MAX_TASK; ++i) {
         if (pcb[i].status == TASK_EXITED && list_empty(&pcb[i].wait_list)
             && !task_on_cpu(&pcb[i])
-            /* 主线程的 PCB 只有在没有存活线程时才可复用；线程 PCB 可以。 */
-            && (pcb[i].is_thread || pcb[i].thread_count == 0)) {
-            task_stack_free(pcb[i].kernel_stack_base, 1);
-            task_stack_free(pcb[i].user_stack_base, 0);
+            /* 主线程的 PCB 只有在没有存活线程时才可复用；线程 PCB 可以。
+             * 若同 pid 还有线程在核上（例如 kill 后尚未切走），主 PCB
+             * 也不能复用，否则它挂着的 pgdir 会被提前回收。 */
+            && (pcb[i].is_thread ||
+                (pcb[i].thread_count == 0 && !pid_on_cpu(pcb[i].pid)))) {
+            task_stack_free(pcb[i].kernel_stack_base);
             pcb[i].kernel_stack_base = 0;
             pcb[i].user_stack_base = 0;
             /* 主 PCB 若还挂着未被回收的页表（例如被 kill），在这里回收。 */
@@ -301,7 +292,7 @@ pid_t do_exec(char *name, int argc, char **argv, uint64_t mask)
     if (task == 0)
         goto fail_pgdir;
 
-    ptr_t kstack_base = task_stack_alloc(1);
+    ptr_t kstack_base = task_stack_alloc();
     if (kstack_base == 0)
         goto fail_pcb;
     ptr_t kstack_top = kstack_base + PAGE_SIZE;
@@ -363,7 +354,7 @@ pid_t do_exec(char *name, int argc, char **argv, uint64_t mask)
     return newpid;
 
 fail_stack:
-    task_stack_free(kstack_base, 1);
+    task_stack_free(kstack_base);
 fail_pcb:
     task->name[0] = '\0';
     task->pgdir = 0;
@@ -390,9 +381,11 @@ pid_t do_pthread_create(void (*entry)(void *, void *),
     FINE_LOCK(&sched_lock);
 
     /* 锁内再找主线程：另一核可能刚好把主 PCB 复用走。 */
-    pcb_t *main_task = find_main_pcb(current_running->pid);
+    pcb_t *main_task = find_pcb_by_pid(current_running->pid);
+    /* 主线程可以先 return，只要进程还有线程（thread_count>0）且页表还在，
+     * 就仍然允许继续创建线程。 */
     if (main_task == 0 || main_task->pgdir == 0 ||
-        main_task->status == TASK_EXITED) {
+        main_task->thread_count <= 0) {
         FINE_UNLOCK(&sched_lock);
         return 0;
     }
@@ -403,7 +396,7 @@ pid_t do_pthread_create(void (*entry)(void *, void *),
         return 0;
     }
 
-    ptr_t kstack_base = task_stack_alloc(1);
+    ptr_t kstack_base = task_stack_alloc();
     if (kstack_base == 0) {
         task->name[0] = '\0';
         FINE_UNLOCK(&sched_lock);
@@ -417,7 +410,7 @@ pid_t do_pthread_create(void (*entry)(void *, void *),
     uintptr_t stack_kva = map_user_page(stack_va, main_task->pgdir,
                                         _PAGE_READ | _PAGE_WRITE | _PAGE_EXEC);
     if (stack_kva == 0) {
-        task_stack_free(kstack_base, 1);
+        task_stack_free(kstack_base);
         task->name[0] = '\0';
         FINE_UNLOCK(&sched_lock);
         return 0;
@@ -430,7 +423,8 @@ pid_t do_pthread_create(void (*entry)(void *, void *),
     task->pgdir = main_task->pgdir;
     strcpy(task->name, main_task->name);
     task->kernel_stack_base = kstack_base;
-    task->user_stack_base = 0;
+    /* 线程独占这一页用户栈；退出时由 do_exit 归还（free_user_page）。 */
+    task->user_stack_base = stack_va;
     task->status = TASK_READY;
     /* 线程钉在创建者所在核：同一进程的线程不会同时在两个核上跑，
      * 页表/TLB 修改只需本地 flush。 */
@@ -454,8 +448,11 @@ pid_t do_pthread_create(void (*entry)(void *, void *),
     regs->regs[11] = (reg_t)arg;
 
     /* 同一进程的主线程和所有线程钉在同一核：页表只有一个核在改，
-     * 换页/TLB flush 不需要跨核 shootdown。 */
-    main_task->cpu_mask = 1UL << get_current_cpu_id();
+     * 换页/TLB flush 不需要跨核 shootdown。已存在的线程也要一起改，
+     * 否则它们会留在旧核上。 */
+    for (int i = 0; i < NUM_MAX_TASK; ++i)
+        if (pcb[i].name[0] != '\0' && pcb[i].pid == main_task->pid)
+            pcb[i].cpu_mask = 1UL << get_current_cpu_id();
     main_task->thread_count++;
     list_add_tail(&task->list, &ready_queue);
 
@@ -505,8 +502,14 @@ void do_exit(void)
     while (!list_empty(&task->wait_list))
         do_unblock(task->wait_list.next);
 
+    /* P4：线程退出时归还它独占的那页用户栈；页表仍由整个进程共享。 */
+    if (task->is_thread && task->user_stack_base != 0 && task->pgdir != 0) {
+        free_user_page(task->user_stack_base, task->pgdir);
+        task->user_stack_base = 0;
+    }
+
     /* P4：线程/进程共用一个根页表。最后一个线程退出时才回收页表。 */
-    pcb_t *main_task = find_main_pcb(task->pid);
+    pcb_t *main_task = find_pcb_by_pid(task->pid);
     if (main_task != 0 && main_task->thread_count > 0) {
         main_task->thread_count--;
         if (main_task->thread_count == 0 && main_task->pgdir != 0) {
@@ -547,55 +550,66 @@ void do_exit(void)
 int do_kill(pid_t pid)
 {
     int ret = 0;
-    pcb_t *task;
-
     /* 任务5：mlocks 的 owner 属 sync 域、队列/状态属 sched 域——按锁序
      *   sync→sched 双锁齐拿，把"释放锁 + 摘队 + 置终态 + 唤醒"做成一个
      *   跨核原子事务；do_scheduler 挪到放锁之后（自己杀自己时用）。 */
     FINE_LOCK(&sync_lock);
     FINE_LOCK(&sched_lock);
 
-    task = find_pcb_by_pid(pid);
-
-    if (task == 0 || is_idle_pcb(task) || task->status == TASK_EXITED)
+    /* P4：pid 对应的是一个线程组。kill 主线程时所有同 pid 线程一起杀；
+     * 主线程先 return 了（PCB EXITED）但还有线程活着时，也按同样规则杀。 */
+    pcb_t *main_task = find_pcb_by_pid(pid);
+    if (main_task == 0 || is_idle_pcb(main_task))
         goto out;
 
-    /* ① 替它释放持有的互斥锁 */
-    for (int i = 0; i < LOCK_NUM; ++i) {
-        if (mlocks[i].owner == task) {
-            mlocks[i].owner = 0;
-            spin_lock_release(&mlocks[i].lock);
-            if (!list_empty(&mlocks[i].block_queue))
-                do_unblock(mlocks[i].block_queue.next);
+    int killed = 0;
+    for (int i = 0; i < NUM_MAX_TASK; ++i) {
+        pcb_t *task = &pcb[i];
+        if (task->name[0] == '\0' || task->pid != pid ||
+            task->status == TASK_EXITED)
+            continue;
+
+        /* ① 替它释放持有的互斥锁 */
+        for (int j = 0; j < LOCK_NUM; ++j) {
+            if (mlocks[j].owner == task) {
+                mlocks[j].owner = 0;
+                spin_lock_release(&mlocks[j].lock);
+                if (!list_empty(&mlocks[j].block_queue))
+                    do_unblock(mlocks[j].block_queue.next);
+            }
         }
+
+        /* ② 从当前所在队列里摘除 */
+        if (task->status == TASK_READY || task->status == TASK_BLOCKED)
+            list_del(&task->list);
+
+        /* ③ 终态 + 唤醒所有等待者 */
+        task->status = TASK_EXITED;
+        while (!list_empty(&task->wait_list))
+            do_unblock(task->wait_list.next);
+
+        /* ④ 归还栈：只有它已完整下核才能动。还在核上的（正在跑、切换中、
+         *   或处在 block 与 do_scheduler 之间的几步里）留给 alloc_pcb 复用
+         *   时归还——那里同样以 task_on_cpu 为闸。 */
+        if (!task_on_cpu(task)) {
+            task_stack_free(task->kernel_stack_base);
+            task->kernel_stack_base = 0;
+            task->user_stack_base = 0;
+        }
+        killed = 1;
     }
 
-    /* ② 从当前所在队列里摘除 */
-    if (task->status == TASK_READY || task->status == TASK_BLOCKED)
-        list_del(&task->list);
+    if (!killed)
+        goto out;
 
-    /* ③ 终态 + 唤醒所有等待者 */
-    task->status = TASK_EXITED;
-    while (!list_empty(&task->wait_list))
-        do_unblock(task->wait_list.next);
-
-    /* ④ 归还栈：只有它已完整下核才能动。还在核上的（正在跑、切换中、
-     *   或处在 block 与 do_scheduler 之间的几步里）留给 alloc_pcb 复用时
-     *   归还——那里同样以 task_on_cpu 为闸。 */
-    if (!task_on_cpu(task)) {
-        task_stack_free(task->kernel_stack_base, 1);
-        task_stack_free(task->user_stack_base, 0);
-        task->kernel_stack_base = 0;
-        task->user_stack_base = 0;
-
-        /* P4：没有线程的进程被 kill 且已完整下核时，回收它的用户页表。
-         * 有线程的先不回收（线程可能还持有同一 pgdir）。 */
-        if (task->thread_count <= 1 && task->pgdir != 0) {
-            free_user_pgdir(task->pgdir);
-            task->pgdir = 0;
-        }
+    /* 整个线程组都已置终态；页表要等所有同 pid PCB 都下核才能回收，
+     * 否则还在核上的线程还在用这张页表。下不了核的那份留给 alloc_pcb
+     * 复用主 PCB 时回收（它也检查 pid_on_cpu）。 */
+    main_task->thread_count = 0;
+    if (main_task->pgdir != 0 && !pid_on_cpu(pid)) {
+        free_user_pgdir(main_task->pgdir);
+        main_task->pgdir = 0;
     }
-
     ret = 1;
 
 out:
@@ -603,7 +617,7 @@ out:
     FINE_UNLOCK(&sync_lock);
 
     /* ⑤ 杀到自己头上：放锁后也走一次让出 */
-    if (ret && task == current_running)
+    if (ret && current_running->pid == pid)
         do_scheduler();
 
     return ret;
@@ -748,6 +762,12 @@ int do_taskset_p(pid_t pid, uint64_t mask)
 
     pcb_t *task = find_pcb_by_pid(pid);
     if (task != 0 && !is_idle_pcb(task)) {
+        /* 带线程的进程只允许单核：同一页表若同时在两个核上跑，
+         * 换页/TLB flush 的"本地 flush 就够"前提就不成立了。 */
+        if (task->thread_count > 1 && (mask & (mask - 1)) != 0) {
+            FINE_UNLOCK(&sched_lock);
+            return 0;
+        }
         /* 线程与主线程共享地址空间，必须整体改到同一组核上，
          * 否则同一页表会被两个核同时改（换页/TLB）。 */
         for (int i = 0; i < NUM_MAX_TASK; ++i)

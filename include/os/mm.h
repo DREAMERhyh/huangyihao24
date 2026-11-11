@@ -38,12 +38,12 @@
 
 extern ptr_t allocPage(int numPage);
 extern void freePage(ptr_t baseAddr);
-extern void *kmalloc(size_t size);
 
 extern void share_pgtable(uintptr_t dest_pgdir, uintptr_t src_pgdir);
 extern PTE *walk_page_table(uintptr_t va, uintptr_t pgdir, int create);
 extern uintptr_t alloc_page_helper(uintptr_t va, uintptr_t pgdir);
 extern uintptr_t map_user_page(uintptr_t va, uintptr_t pgdir, uint64_t perm);
+extern void free_user_page(uintptr_t va, uintptr_t pgdir);
 extern void free_user_pgdir(uintptr_t pgdir);
 extern void remove_identity_map(void);
 extern void paging_init(void);

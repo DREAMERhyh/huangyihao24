@@ -6,19 +6,29 @@
   /* TODO: [p2-task3] save all general purpose registers here! */
   /* HINT: Pay attention to the function of tp and sp, and save them carefully! */
 
-  /* 任务3：把用户态现场存到当前任务的**内核栈**上，布局即 regs_context_t。
-   *   难点是 sp：陷入时 sp 还是用户栈指针，而现场要落在内核栈顶。这里拿
-   *   sscratch 当中转——平时它存着本任务的内核栈顶（每次 sret 回用户态前由
-   *   RESTORE_CONTEXT 写好），一条 csrrw 就原子地完成
-   *     sp ← 内核栈顶，sscratch ← 用户 sp
-   *   交换后再往下让出 288 字节（= sizeof(regs_context_t)）作为陷阱帧。 */
+  /* 任务3：把陷入现场存到内核栈上，布局即 regs_context_t。
+   *   sscratch 的约定（P4 改为可重入）：
+   *     · 在用户态运行时 = 本任务内核栈顶；
+   *     · 在 S 态运行时   = 0。
+   *   陷入时一条 csrrw 即可区分来源，且不占用任何通用寄存器：
+   *     · 来自 U 态：sp=内核栈顶，sscratch=用户 sp；
+   *     · 来自 S 态：sp=0，sscratch=陷入前的内核 sp（可能是更深一层的帧）。
+   *   来自 S 态说明内核在处理一个陷阱时又同步缺页了（P4 换页后内核读
+   *   用户缓冲会这样），此时必须沿用当前内核栈向下再压一帧，绝不能拿
+   *   sscratch 里的用户 sp 当栈——否则会把陷阱帧写到用户栈上。 */
   csrrw sp, CSR_SSCRATCH, sp
+  bnez  sp, 1f
+  /* 来自 S 态：换回内核 sp，同时把 sscratch 重新置 0 */
+  csrrw sp, CSR_SSCRATCH, sp
+1:
   addi  sp, sp, -(OFFSET_SIZE)
+
+  /* 先把 t0 原值落盘：下面要用 t0 判断/保存"陷入前的 sp"。 */
+  sd x5,  OFFSET_REG_T0(sp)
 
   sd x1,  OFFSET_REG_RA(sp)
   sd x3,  OFFSET_REG_GP(sp)
   sd x4,  OFFSET_REG_TP(sp)
-  sd x5,  OFFSET_REG_T0(sp)
   sd x6,  OFFSET_REG_T1(sp)
   sd x7,  OFFSET_REG_T2(sp)
   sd x8,  OFFSET_REG_S0(sp)
@@ -46,9 +56,15 @@
   sd x30, OFFSET_REG_T5(sp)
   sd x31, OFFSET_REG_T6(sp)
 
-  /* 用户 sp 此刻还在 sscratch 里，取出来补进现场 */
+  /* 补"陷入前的 sp"：来自 U 态时它在 sscratch；来自 S 态时
+   * sscratch 已为 0，原 sp 就是当前帧基址 + OFFSET_SIZE。 */
   csrr t0, CSR_SSCRATCH
+  bnez  t0, 2f
+  addi  t0, sp, OFFSET_SIZE
+2:
   sd   t0, OFFSET_REG_SP(sp)
+  /* 进入内核态标记：下次陷入（同步缺页/中断）走"当前栈向下压帧"分支。 */
+  csrw CSR_SSCRATCH, zero
 
   /*
    * P4：保留 SUM=1。内核需要直接读写用户地址（exec 拷 argv、写子进程
@@ -82,6 +98,19 @@
   ld t0, OFFSET_REG_SEPC(sp)
   csrw CSR_SEPC, t0
 
+  /* sscratch 约定：回 U 态时写内核栈顶（下一次陷入用它换 sp）；
+   * 回 S 态时保持 0（仍在核内，不能再拿它当栈）。t0 马上会从帧里恢复，
+   * 这里先拿来当临时寄存器是安全的。 */
+  ld t0, OFFSET_REG_SSTATUS(sp)
+  andi t0, t0, SR_SPP
+  bnez t0, 3f
+  addi t0, sp, OFFSET_SIZE
+  csrw CSR_SSCRATCH, t0
+  j 4f
+3:
+  csrw CSR_SSCRATCH, zero
+4:
+
   ld x1,  OFFSET_REG_RA(sp)
   ld x3,  OFFSET_REG_GP(sp)
   ld x4,  OFFSET_REG_TP(sp)
@@ -113,11 +142,7 @@
   ld x30, OFFSET_REG_T5(sp)
   ld x31, OFFSET_REG_T6(sp)
 
-  /* 任务3：两个"不能提前动"的寄存器放在最后。
-   *   ① sscratch 要还给"本任务内核栈顶"（= 帧基址 + 288），下次陷入时才换得回来；
-   *   ② sp 最后一步才换成用户 sp，之前一直当帧基址用来寻址。 */
-  addi t0, sp, OFFSET_SIZE
-  csrw CSR_SSCRATCH, t0
+  /* sp 最后一步才换：回 U 态换成用户 sp，回 S 态换成陷入前的内核 sp。 */
   ld   sp, OFFSET_REG_SP(sp)
 .endm
 

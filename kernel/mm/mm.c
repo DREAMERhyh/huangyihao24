@@ -26,6 +26,7 @@ typedef struct {
     PTE *pte;
     uintptr_t pgdir;
     uintptr_t va;
+    uint64_t seq;       /* 加入顺序：换出时选 seq 最小的页（严格 FIFO） */
     int used;
 } swap_entry_t;
 
@@ -36,7 +37,7 @@ static ptr_t free_pages[MAX_FREE_PAGES];
 static int free_n;
 
 static swap_entry_t swap_entries[MAX_SWAP_ENTRIES];
-static int swap_hand;
+static uint64_t swap_seq;
 static uint8_t swap_slot_used[SWAP_MAX_PAGES / 8];
 
 typedef struct {
@@ -48,24 +49,16 @@ typedef struct {
 
 static shm_entry_t shm_entries[32];
 
-static void *memset_local(void *s, int c, size_t n)
-{
-    unsigned char *p = s;
-    while (n--)
-        *p++ = (unsigned char)c;
-    return s;
-}
-
 void paging_init(void)
 {
     spin_lock_init(&mem_lock);
     spin_lock_init(&paging_lock);
     free_top = FREEMEM_KERNEL;
     free_n = 0;
-    swap_hand = 0;
-    memset_local(swap_entries, 0, sizeof(swap_entries));
-    memset_local(swap_slot_used, 0, sizeof(swap_slot_used));
-    memset_local(shm_entries, 0, sizeof(shm_entries));
+    swap_seq = 0;
+    memset(swap_entries, 0, sizeof(swap_entries));
+    memset(swap_slot_used, 0, sizeof(swap_slot_used));
+    memset(shm_entries, 0, sizeof(shm_entries));
 }
 
 /* ------------------------------------------------------------------ */
@@ -111,12 +104,6 @@ void freePage(ptr_t baseAddr)
     spin_lock_release(&mem_lock);
 }
 
-void *kmalloc(size_t size)
-{
-    int pages = (int)((size + PAGE_SIZE - 1) / PAGE_SIZE);
-    return (void *)allocPage(pages);
-}
-
 /* ------------------------------------------------------------------ */
 /* 页表                                                                */
 /* ------------------------------------------------------------------ */
@@ -136,6 +123,9 @@ PTE *walk_page_table(uintptr_t va, uintptr_t pgdir, int create)
         set_pfn(&l2[vpn2], kva2pa(page) >> NORMAL_PAGE_SHIFT);
         set_attribute(&l2[vpn2], _PAGE_PRESENT);
     }
+    /* 2MB 叶子（内核直接映射）不能再往下一级走，否则会把物理页当页表。 */
+    if (l2[vpn2] & (_PAGE_READ | _PAGE_WRITE | _PAGE_EXEC))
+        return 0;
     l1 = (PTE *)pa2kva(get_pa(l2[vpn2]));
 
     if (!(l1[vpn1] & _PAGE_PRESENT)) {
@@ -146,6 +136,8 @@ PTE *walk_page_table(uintptr_t va, uintptr_t pgdir, int create)
         set_pfn(&l1[vpn1], kva2pa(page) >> NORMAL_PAGE_SHIFT);
         set_attribute(&l1[vpn1], _PAGE_PRESENT);
     }
+    if (l1[vpn1] & (_PAGE_READ | _PAGE_WRITE | _PAGE_EXEC))
+        return 0;
     l0 = (PTE *)pa2kva(get_pa(l1[vpn1]));
 
     return &l0[vpn0];
@@ -198,6 +190,7 @@ static void swap_entry_add(PTE *pte, uintptr_t pgdir, uintptr_t va)
             swap_entries[i].pte = pte;
             swap_entries[i].pgdir = pgdir;
             swap_entries[i].va = va;
+            swap_entries[i].seq = ++swap_seq;
             swap_entries[i].used = 1;
             return;
         }
@@ -215,39 +208,46 @@ static void swap_entry_remove(PTE *pte)
 }
 
 /* 从本进程里挑一页写回 SD，返回腾出来的物理页 KVA（供新页复用）。
+ * FIFO：选本进程里 seq 最小（最早加入）且仍在内存的页。
  * 只挑本进程自己的页：同一进程的线程被钉在同一核上，别的核不会同时
  * 跑它，所以换出后不需要给别的核发 TLB shootdown。 */
 static ptr_t swap_out_one(uintptr_t pgdir)
 {
-    for (int scan = 0; scan < MAX_SWAP_ENTRIES; ++scan) {
-        int i = swap_hand;
-        swap_hand = (swap_hand + 1) % MAX_SWAP_ENTRIES;
+    swap_entry_t *victim = 0;
 
+    for (int i = 0; i < MAX_SWAP_ENTRIES; ++i) {
         if (!swap_entries[i].used || swap_entries[i].pgdir != pgdir)
             continue;
-
-        PTE *pte = swap_entries[i].pte;
-        if (!(*pte & _PAGE_PRESENT))
+        if (!(*swap_entries[i].pte & _PAGE_PRESENT))
             continue;
-
-        int slot = swap_slot_alloc();
-        if (slot < 0)
-            break;
-
-        ptr_t page = (ptr_t)pa2kva(get_pa(*pte));
-        bios_sd_write((unsigned)kva2pa(page),
-                      SWAP_SECTORS_PER_PAGE,
-                      SWAP_START_SECTOR + (unsigned)slot * SWAP_SECTORS_PER_PAGE);
-
-        /* PTE 变成"在磁盘上"：V=0，SOFT=1，PFN 存槽号 */
-        set_pfn(pte, (uint64_t)slot);
-        *pte &= ~_PAGE_PRESENT;
-        *pte |= _PAGE_SOFT;
-        local_flush_tlb_page(swap_entries[i].va);
-        swap_entry_remove(pte);
-        return page;
+        if (victim == 0 || swap_entries[i].seq < victim->seq)
+            victim = &swap_entries[i];
     }
-    return 0;
+    if (victim == 0)
+        return 0;
+
+    int slot = swap_slot_alloc();
+    if (slot < 0)
+        return 0;
+
+    PTE *pte = victim->pte;
+    ptr_t page = (ptr_t)pa2kva(get_pa(*pte));
+    if (bios_sd_write((unsigned)kva2pa(page), SWAP_SECTORS_PER_PAGE,
+                      SWAP_START_SECTOR +
+                          (unsigned)slot * SWAP_SECTORS_PER_PAGE) != 0) {
+        /* 写失败就别换出：保持 PTE 原样，宁可暂时多分配一页，也不能
+         * 把没落盘的数据标成"已在磁盘上"。 */
+        swap_slot_free(slot);
+        return 0;
+    }
+
+    /* PTE 变成"在磁盘上"：V=0，SOFT=1，PFN 存槽号 */
+    set_pfn(pte, (uint64_t)slot);
+    *pte &= ~_PAGE_PRESENT;
+    *pte |= _PAGE_SOFT;
+    local_flush_tlb_page(victim->va);
+    swap_entry_remove(pte);
+    return page;
 }
 
 static void swap_in_one(PTE *pte, uintptr_t va, uintptr_t pgdir)
@@ -264,8 +264,14 @@ static void swap_in_one(PTE *pte, uintptr_t va, uintptr_t pgdir)
     if (page == 0)
         page = allocPage(1);
 
-    bios_sd_read((unsigned)kva2pa(page), SWAP_SECTORS_PER_PAGE,
-                 SWAP_START_SECTOR + (unsigned)slot * SWAP_SECTORS_PER_PAGE);
+    if (bios_sd_read((unsigned)kva2pa(page), SWAP_SECTORS_PER_PAGE,
+                     SWAP_START_SECTOR +
+                         (unsigned)slot * SWAP_SECTORS_PER_PAGE) != 0) {
+        /* 读不回来就明确停机；继续把垃圾页标成 present 会静默毁数据。 */
+        printk("swap in failed: slot %d\n", slot);
+        while (1)
+            ;
+    }
 
     set_pfn(pte, kva2pa(page) >> NORMAL_PAGE_SHIFT);
     *pte &= ~_PAGE_SOFT;
@@ -285,7 +291,7 @@ static ptr_t alloc_user_page(uintptr_t pgdir, uintptr_t va)
     if (page == 0)
         page = allocPage(1);
 
-    memset_local((void *)page, 0, PAGE_SIZE);
+    memset((void *)page, 0, PAGE_SIZE);
     return page;
 }
 
@@ -415,14 +421,23 @@ static uintptr_t shm_page_get_locked(int key)
 {
     pcb_t *task = current_running;
     uintptr_t pgdir = task->pgdir;
-    shm_entry_t *se = shm_find_key(key);
+    shm_entry_t *se;
     uintptr_t va;
 
+    /* 先找空虚拟页；找不到就直接失败，别先分配物理页/条目造成泄漏。 */
+    for (va = SHM_VA_BASE; va < SHM_VA_END; va += PAGE_SIZE) {
+        if (shm_va_free(va, pgdir))
+            break;
+    }
+    if (va >= SHM_VA_END)
+        return 0;
+
+    se = shm_find_key(key);
     if (se == 0) {
         for (int i = 0; i < (int)(sizeof(shm_entries) / sizeof(shm_entries[0])); ++i) {
             if (!shm_entries[i].used) {
                 ptr_t page = allocPage(1);
-                memset_local((void *)page, 0, PAGE_SIZE);
+                memset((void *)page, 0, PAGE_SIZE);
                 shm_entries[i].used = 1;
                 shm_entries[i].key = key;
                 shm_entries[i].kva = page;
@@ -434,13 +449,6 @@ static uintptr_t shm_page_get_locked(int key)
         if (se == 0)
             return 0;
     }
-
-    for (va = SHM_VA_BASE; va < SHM_VA_END; va += PAGE_SIZE) {
-        if (shm_va_free(va, pgdir))
-            break;
-    }
-    if (va >= SHM_VA_END)
-        return 0;
 
     PTE *pte = walk_page_table(va, pgdir, 1);
     set_pfn(pte, kva2pa(se->kva) >> NORMAL_PAGE_SHIFT);
@@ -488,8 +496,37 @@ static int shm_unmap_va(uintptr_t va, uintptr_t pgdir)
 
 void shm_page_dt(uintptr_t addr)
 {
+    /* 只接受用户半区的地址；内核半区没有可解除的共享映射。 */
+    if ((addr >> 38) != 0)
+        return;
+
     spin_lock_acquire(&paging_lock);
     shm_unmap_va(addr & ~OFFSET_MASK_4K, current_running->pgdir);
+    spin_lock_release(&paging_lock);
+}
+
+/* 释放单个用户虚拟页（线程退出时归还它独占的用户栈页）。
+ * 共享内存页走引用计数，不会直接 freePage。 */
+void free_user_page(uintptr_t va, uintptr_t pgdir)
+{
+    spin_lock_acquire(&paging_lock);
+    PTE *pte = walk_page_table(va, pgdir, 0);
+
+    if (pte != 0) {
+        if (*pte & _PAGE_PRESENT) {
+            ptr_t page = (ptr_t)pa2kva(get_pa(*pte));
+            if (va >= SHM_VA_BASE && va < SHM_VA_END) {
+                shm_unmap_va(va, pgdir);
+            } else {
+                swap_entry_remove(pte);
+                freePage(page);
+            }
+        } else if (*pte & _PAGE_SOFT) {
+            swap_slot_free((int)get_pfn(*pte));
+        }
+        *pte = 0;
+        local_flush_tlb_page(va);
+    }
     spin_lock_release(&paging_lock);
 }
 

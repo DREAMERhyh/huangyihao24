@@ -22,10 +22,20 @@ void interrupt_helper(regs_context_t *regs, uint64_t stval, uint64_t scause)
      *   1 → 中断（异步，如时钟中断），低 63 位是中断号
      *   0 → 例外（同步，如 ecall/env call、缺页），低 63 位是例外号
      * 两者用不同的入口表分发。 */
-    if (scause & SCAUSE_IRQ_FLAG)
-        irq_table[scause & ~SCAUSE_IRQ_FLAG](regs, stval, scause);
-    else
+    if (scause & SCAUSE_IRQ_FLAG) {
+        uint64_t code = scause & ~SCAUSE_IRQ_FLAG;
+        if (code >= IRQC_COUNT) {
+            handle_other(regs, stval, scause);
+            return;
+        }
+        irq_table[code](regs, stval, scause);
+    } else {
+        if (scause >= EXCC_COUNT) {
+            handle_other(regs, stval, scause);
+            return;
+        }
         exc_table[scause](regs, stval, scause);
+    }
 }
 
 /* ★ P3 起删掉了 P2 的"Ctrl+C 暖重启"：

@@ -11,9 +11,11 @@ mutex_lock_t mlocks[LOCK_NUM];
 /* 临界区用的"是否被打断"开关。
  *   不能用 disable_interrupt()/enable_interrupt() 直接配一对：后者会把
  *   sstatus.SIE 无条件置 1。内核里绝大多数临界区都跑在陷阱处理中，那时
- *   SIE 本该是 0（陷入时硬件清掉的）；一旦被置 1，内核就可能被再次打断，
- *   而 sscratch 此刻存的是用户 sp，嵌套陷入会把陷阱帧写到用户栈上。
- *   所以这里"存原值-关-按原值恢复"。 */
+ *   SIE 本该是 0（陷入时硬件清掉的）；一旦被置 1，内核就可能被时钟中断
+ *   再次打断并触发嵌套调度。
+ *   所以这里"存原值-关-按原值恢复"。
+ *   （P4 的 entry.S 已让同步缺页可以从 S 态安全压帧，但定时器抢占仍要
+ *   按原 SIE 恢复，不能无条件开。） */
 static inline uint64_t irq_save(void)
 {
     uint64_t sstatus;
@@ -88,10 +90,19 @@ int do_mutex_lock_init(int key)
     /* TODO: [p2-task2] initialize mutex lock */
     /* 题目要求：同一个 key 在整个生命周期内映射到同一个 handle。
      *   所以先找有没有 key 相同的锁，有就直接复用它的下标当 handle；
-     *   没有才占一个空闲槽位。handle 就是 mlocks 的下标，范围 0..LOCK_NUM-1。 */
+     *   没有才占一个空闲槽位。handle 就是 mlocks 的下标，范围 0..LOCK_NUM-1。
+     * P4：key/owner 属 sync 域；双核同时 init 同一个 key 可能各自选中
+     *   不同槽位，必须和 barrier/condition 一样用 sync_lock 串行化。 */
+    uint64_t sstatus = irq_save();
+    int ret = -1;
+
+    FINE_LOCK(&sync_lock);
+
     for (int i = 0; i < LOCK_NUM; ++i) {
-        if (mlocks[i].key == key)
-            return i;
+        if (mlocks[i].key == key) {
+            ret = i;
+            goto out;
+        }
     }
 
     for (int i = 0; i < LOCK_NUM; ++i) {
@@ -100,11 +111,15 @@ int do_mutex_lock_init(int key)
             list_init(&mlocks[i].block_queue);
             mlocks[i].owner = 0;
             mlocks[i].key = key;
-            return i;
+            ret = i;
+            break;
         }
     }
 
-    return -1;   // 锁用光了
+out:
+    FINE_UNLOCK(&sync_lock);
+    irq_restore(sstatus);
+    return ret;   // -1 = 锁用光了
 }
 
 void do_mutex_lock_acquire(int mlock_idx)
