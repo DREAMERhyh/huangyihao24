@@ -268,4 +268,18 @@ int sys_mbox_recv(int mbox_idx, void *msg, int msg_length)
     return (int)invoke_syscall(SYSCALL_MBOX_RECV, (long)mbox_idx, (long)msg,
                                (long)msg_length, IGNORE, IGNORE);
 }
+
+/* P4：线程创建/等待。线程与进程共享页表，内核只分配新的内核栈和用户栈。 */
+long sys_pthread_create(void (*entry)(void*, void*),
+                        void (*start_routine)(void*), void *arg)
+{
+    return invoke_syscall(SYSCALL_PTHREAD_CREATE, (long)entry,
+                          (long)start_routine, (long)arg, IGNORE, IGNORE);
+}
+
+int sys_pthread_join(pthread_t tid)
+{
+    return (int)invoke_syscall(SYSCALL_PTHREAD_JOIN, (long)tid, IGNORE, IGNORE,
+                               IGNORE, IGNORE);
+}
 /************************************************************/

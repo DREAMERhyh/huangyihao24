@@ -82,6 +82,16 @@ typedef struct pcb
     /* process id */
     pid_t pid;
 
+    /* P4：线程号（主线程 tid == pid；pthread 线程 tid 唯一） */
+    pid_t tid;
+
+    /* P4：线程与进程的区别。线程共享 pid 和 pgdir，只独占内核栈/用户栈。 */
+    int is_thread;
+
+    /* P4：本进程的线程数（只在主线程 PCB 上有意义，用于最后一个线程退出时
+     * 回收页表）。 */
+    int thread_count;
+
     /* P4：本任务使用的根页表（内核虚拟地址）。idle 用内核页表。 */
     ptr_t pgdir;
 
@@ -196,6 +206,10 @@ extern pid_t do_exec(char *name, int argc, char *argv[], uint64_t mask);
 extern void do_exit(void);
 extern int do_kill(pid_t pid);
 extern int do_waitpid(pid_t pid);
+/* P4：pthread_create/join 的内核实现 */
+extern pid_t do_pthread_create(void (*entry)(void *, void *),
+                               void (*start_routine)(void *), void *arg);
+extern int do_pthread_join(pid_t tid);
 /* 任务4：修改已存在进程的核亲和掩码，成功返回 1（找不到进程返回 0） */
 extern int do_taskset_p(pid_t pid, uint64_t mask);
 extern void do_process_show();

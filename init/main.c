@@ -163,6 +163,9 @@ static void init_syscall(void)
     // P3 任务4：taskset -p（改进程核亲和掩码）
     syscall[SYSCALL_TASKSET]      = (long (*)())do_taskset_p;
 
+    // P4：线程
+    syscall[SYSCALL_PTHREAD_CREATE] = (long (*)())do_pthread_create;
+    syscall[SYSCALL_PTHREAD_JOIN]   = (long (*)())do_pthread_join;
 }
 /************************************************************/
 

@@ -7,7 +7,7 @@
 #include <printk.h>
 
 /* =====================================================================
- * P4 内存管理（任务1：启用虚拟内存）
+ * P4 内存管理（C-core）
  *
  * 物理页：0x52000000 起按 4KB 向上分配；freePage 回收进小 free list。
  * 用户页表：三级 Sv39，根页表里 256..511 项从内核页表复制（内核空间），
@@ -343,8 +343,9 @@ uintptr_t map_user_page(uintptr_t va, uintptr_t pgdir, uint64_t perm)
 /* ------------------------------------------------------------------ */
 /* 缺页处理（任务2）                                                   */
 /* ------------------------------------------------------------------ */
-/* 注意：本函数只做"分配 + 建映射"，不得调用 do_scheduler/do_block
- * 等会切换任务的函数——大锁版的 BKL 重入深度依赖"最外层 trap 才放锁"。 */
+/* 注意：本函数只做"分配/换入 + 建映射"，不得调用 do_scheduler/do_block
+ * 等会切换任务的函数——大锁版的 BKL 重入深度依赖"最外层 trap 才放锁"，
+ * 在嵌套缺页里调度会让接棒方只减一层深度。 */
 void handle_page_fault(regs_context_t *regs, uint64_t stval, uint64_t scause)
 {
     uintptr_t va = (uintptr_t)stval;
@@ -384,6 +385,26 @@ void handle_page_fault(regs_context_t *regs, uint64_t stval, uint64_t scause)
 
     local_flush_tlb_page(va);
     local_flush_icache_all();
+    spin_lock_release(&paging_lock);
+}
+
+/* 释放单个用户虚拟页（线程退出时归还它独占的用户栈页）。 */
+void free_user_page(uintptr_t va, uintptr_t pgdir)
+{
+    spin_lock_acquire(&paging_lock);
+    PTE *pte = walk_page_table(va, pgdir, 0);
+
+    if (pte != 0) {
+        if (*pte & _PAGE_PRESENT) {
+            ptr_t page = (ptr_t)pa2kva(get_pa(*pte));
+            swap_entry_remove(pte);
+            freePage(page);
+        } else if (*pte & _PAGE_SOFT) {
+            swap_slot_free((int)get_pfn(*pte));
+        }
+        *pte = 0;
+        local_flush_tlb_page(va);
+    }
     spin_lock_release(&paging_lock);
 }
 

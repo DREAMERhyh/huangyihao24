@@ -60,6 +60,12 @@ void sys_mbox_close(int mbox_id);
 int sys_mbox_send(int mbox_idx, void *msg, int msg_length);
 int sys_mbox_recv(int mbox_idx, void *msg, int msg_length);
 
+/* P4：线程。sys_pthread_create 返回内核分配的线程号（失败 0）。
+ * entry 是用户侧 trampoline（a0=start_routine, a1=arg），负责在用户函数
+ * 返回后调用 sys_exit。 */
+long sys_pthread_create(void (*entry)(void*, void*),
+                        void (*start_routine)(void*), void *arg);
+int  sys_pthread_join(pthread_t tid);
 /************************************************************/
 
 #endif

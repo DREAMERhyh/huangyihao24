@@ -13,11 +13,14 @@
 #define FREEMEM_KERNEL    0xffffffc052000000lu
 #define ALLMEM_KERNEL     0xffffffc060000000lu
 
-/* P4 任务1：所有用户进程共用同一套用户虚拟地址布局。
+/* P4 C-core：所有用户进程共用同一套用户虚拟地址布局。
  *   程序：0x10000 起（由 ELF 的 p_vaddr 决定）
- *   主线程栈：0xf00010000 向下 */
+ *   主线程栈：0xf00010000 向下
+ *   线程栈：0xe00000000 起，每线程一页 */
 #define USER_STACK_ADDR   0xf00010000lu
 #define USER_STACK_PAGES  8
+#define THREAD_STACK_BASE 0xe00000000lu
+#define THREAD_STACK_STEP 0x2000lu
 
 /* 人为限制"可换出的用户页"数量，超过就触发 FIFO 换页。
  * 128 页 = 512KB，足够普通测试；swap 测试会访问超过这个数量的页。 */
@@ -37,6 +40,7 @@ extern void share_pgtable(uintptr_t dest_pgdir, uintptr_t src_pgdir);
 extern PTE *walk_page_table(uintptr_t va, uintptr_t pgdir, int create);
 extern uintptr_t alloc_page_helper(uintptr_t va, uintptr_t pgdir);
 extern uintptr_t map_user_page(uintptr_t va, uintptr_t pgdir, uint64_t perm);
+extern void free_user_page(uintptr_t va, uintptr_t pgdir);
 extern void free_user_pgdir(uintptr_t pgdir);
 extern void remove_identity_map(void);
 extern void paging_init(void);
