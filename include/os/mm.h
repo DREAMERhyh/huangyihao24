@@ -16,11 +16,14 @@
 /* P4 C-core：所有用户进程共用同一套用户虚拟地址布局。
  *   程序：0x10000 起（由 ELF 的 p_vaddr 决定）
  *   主线程栈：0xf00010000 向下
- *   线程栈：0xe00000000 起，每线程一页 */
+ *   线程栈：0xe00000000 起，每线程一页
+ *   共享内存：0x100000000 起，内核动态找空页 */
 #define USER_STACK_ADDR   0xf00010000lu
 #define USER_STACK_PAGES  8
 #define THREAD_STACK_BASE 0xe00000000lu
 #define THREAD_STACK_STEP 0x2000lu
+#define SHM_VA_BASE       0x100000000lu
+#define SHM_VA_END        0x100100000lu
 
 /* 人为限制"可换出的用户页"数量，超过就触发 FIFO 换页。
  * 128 页 = 512KB，足够普通测试；swap 测试会访问超过这个数量的页。 */
@@ -44,5 +47,9 @@ extern void free_user_page(uintptr_t va, uintptr_t pgdir);
 extern void free_user_pgdir(uintptr_t pgdir);
 extern void remove_identity_map(void);
 extern void paging_init(void);
+
+/* 共享内存 */
+extern uintptr_t shm_page_get(int key);
+extern void shm_page_dt(uintptr_t addr);
 
 #endif /* MM_H */

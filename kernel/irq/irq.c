@@ -68,7 +68,7 @@ void init_exception()
     for (int i = 0; i < EXCC_COUNT; ++i)
         exc_table[i] = handle_other;
     exc_table[EXCC_SYSCALL] = handle_syscall;
-    /* P4：三类缺页都走同一个按需调页处理程序 */
+    /* P4：三类缺页都走同一个按需调页/换页处理程序 */
     exc_table[EXCC_INST_PAGE_FAULT]  = handle_page_fault;
     exc_table[EXCC_LOAD_PAGE_FAULT]  = handle_page_fault;
     exc_table[EXCC_STORE_PAGE_FAULT] = handle_page_fault;

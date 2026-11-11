@@ -14,6 +14,7 @@
  *   0..255 项给用户空间。
  * 换页：每个进程最多 USER_PAGE_LIMIT 个常驻可换出页；超过后按 FIFO
  *   选本进程自己的一个页写 SD 卡，PTE 清 V、置 SOFT、PFN 存 swap 槽号。
+ * 共享内存：0x100000000 起找空页，多个进程映射到同一物理页。
  * ===================================================================== */
 
 #define MAX_FREE_PAGES 1024
@@ -39,6 +40,15 @@ static swap_entry_t swap_entries[MAX_SWAP_ENTRIES];
 static uint64_t swap_seq;
 static uint8_t swap_slot_used[SWAP_MAX_PAGES / 8];
 
+typedef struct {
+    int key;
+    uintptr_t kva;
+    int refcount;
+    int used;
+} shm_entry_t;
+
+static shm_entry_t shm_entries[32];
+
 void paging_init(void)
 {
     spin_lock_init(&mem_lock);
@@ -48,6 +58,7 @@ void paging_init(void)
     swap_seq = 0;
     memset(swap_entries, 0, sizeof(swap_entries));
     memset(swap_slot_used, 0, sizeof(swap_slot_used));
+    memset(shm_entries, 0, sizeof(shm_entries));
 }
 
 /* ------------------------------------------------------------------ */
@@ -69,6 +80,8 @@ ptr_t allocPage(int numPage)
         ret = ROUND(free_top, PAGE_SIZE);
         if (ret + (uintptr_t)numPage * PAGE_SIZE > ALLMEM_KERNEL) {
             spin_lock_release(&mem_lock);
+            /* 物理内存用尽：继续跑只会把页表映到未映射的 KVA 上，
+             * 直接明确停机，比随机缺页好定位。 */
             printk("kernel out of physical memory!\n");
             while (1)
                 ;
@@ -341,7 +354,7 @@ uintptr_t map_user_page(uintptr_t va, uintptr_t pgdir, uint64_t perm)
 }
 
 /* ------------------------------------------------------------------ */
-/* 缺页处理（任务2）                                                   */
+/* 缺页处理                                                            */
 /* ------------------------------------------------------------------ */
 /* 注意：本函数只做"分配/换入 + 建映射"，不得调用 do_scheduler/do_block
  * 等会切换任务的函数——大锁版的 BKL 重入深度依赖"最外层 trap 才放锁"，
@@ -388,7 +401,122 @@ void handle_page_fault(regs_context_t *regs, uint64_t stval, uint64_t scause)
     spin_lock_release(&paging_lock);
 }
 
-/* 释放单个用户虚拟页（线程退出时归还它独占的用户栈页）。 */
+/* ------------------------------------------------------------------ */
+/* 共享内存                                                            */
+/* ------------------------------------------------------------------ */
+static shm_entry_t *shm_find_key(int key)
+{
+    for (int i = 0; i < (int)(sizeof(shm_entries) / sizeof(shm_entries[0])); ++i)
+        if (shm_entries[i].used && shm_entries[i].key == key)
+            return &shm_entries[i];
+    return 0;
+}
+
+static shm_entry_t *shm_find_kva(uintptr_t kva)
+{
+    for (int i = 0; i < (int)(sizeof(shm_entries) / sizeof(shm_entries[0])); ++i)
+        if (shm_entries[i].used && shm_entries[i].kva == kva)
+            return &shm_entries[i];
+    return 0;
+}
+
+static int shm_va_free(uintptr_t va, uintptr_t pgdir)
+{
+    PTE *pte = walk_page_table(va, pgdir, 0);
+    /* SOFT = 该虚拟页已换出到磁盘，仍然属于本进程，不能拿来当共享内存。 */
+    return (pte == 0) || !(*pte & (_PAGE_PRESENT | _PAGE_SOFT));
+}
+
+static uintptr_t shm_page_get_locked(int key)
+{
+    pcb_t *task = current_running;
+    uintptr_t pgdir = task->pgdir;
+    shm_entry_t *se;
+    uintptr_t va;
+
+    /* 先找空虚拟页；找不到就直接失败，别先分配物理页/条目造成泄漏。 */
+    for (va = SHM_VA_BASE; va < SHM_VA_END; va += PAGE_SIZE) {
+        if (shm_va_free(va, pgdir))
+            break;
+    }
+    if (va >= SHM_VA_END)
+        return 0;
+
+    se = shm_find_key(key);
+    if (se == 0) {
+        for (int i = 0; i < (int)(sizeof(shm_entries) / sizeof(shm_entries[0])); ++i) {
+            if (!shm_entries[i].used) {
+                ptr_t page = allocPage(1);
+                memset((void *)page, 0, PAGE_SIZE);
+                shm_entries[i].used = 1;
+                shm_entries[i].key = key;
+                shm_entries[i].kva = page;
+                shm_entries[i].refcount = 0;
+                se = &shm_entries[i];
+                break;
+            }
+        }
+        if (se == 0)
+            return 0;
+    }
+
+    PTE *pte = walk_page_table(va, pgdir, 1);
+    set_pfn(pte, kva2pa(se->kva) >> NORMAL_PAGE_SHIFT);
+    set_attribute(pte, _PAGE_PRESENT | _PAGE_READ | _PAGE_WRITE |
+                       _PAGE_EXEC | _PAGE_USER | _PAGE_ACCESSED | _PAGE_DIRTY);
+    se->refcount++;
+    local_flush_tlb_page(va);
+    return va;
+}
+
+uintptr_t shm_page_get(int key)
+{
+    uintptr_t va;
+    spin_lock_acquire(&paging_lock);
+    va = shm_page_get_locked(key);
+    spin_lock_release(&paging_lock);
+    return va;
+}
+
+/* 解除一个共享页映射（进程退出时也用它回收残留映射） */
+static int shm_unmap_va(uintptr_t va, uintptr_t pgdir)
+{
+    PTE *pte = walk_page_table(va, pgdir, 0);
+    shm_entry_t *se;
+
+    if (pte == 0 || !(*pte & _PAGE_PRESENT))
+        return 0;
+
+    se = shm_find_kva((uintptr_t)pa2kva(get_pa(*pte)));
+    if (se == 0)
+        return 0;
+
+    *pte = 0;
+    local_flush_tlb_page(va);
+    se->refcount--;
+    if (se->refcount <= 0) {
+        freePage((ptr_t)se->kva);
+        se->used = 0;
+        se->kva = 0;
+        se->key = 0;
+        se->refcount = 0;
+    }
+    return 1;
+}
+
+void shm_page_dt(uintptr_t addr)
+{
+    /* 只接受用户半区的地址；内核半区没有可解除的共享映射。 */
+    if ((addr >> 38) != 0)
+        return;
+
+    spin_lock_acquire(&paging_lock);
+    shm_unmap_va(addr & ~OFFSET_MASK_4K, current_running->pgdir);
+    spin_lock_release(&paging_lock);
+}
+
+/* 释放单个用户虚拟页（线程退出时归还它独占的用户栈页）。
+ * 共享内存页走引用计数，不会直接 freePage。 */
 void free_user_page(uintptr_t va, uintptr_t pgdir)
 {
     spin_lock_acquire(&paging_lock);
@@ -397,8 +525,12 @@ void free_user_page(uintptr_t va, uintptr_t pgdir)
     if (pte != 0) {
         if (*pte & _PAGE_PRESENT) {
             ptr_t page = (ptr_t)pa2kva(get_pa(*pte));
-            swap_entry_remove(pte);
-            freePage(page);
+            if (va >= SHM_VA_BASE && va < SHM_VA_END) {
+                shm_unmap_va(va, pgdir);
+            } else {
+                swap_entry_remove(pte);
+                freePage(page);
+            }
         } else if (*pte & _PAGE_SOFT) {
             swap_slot_free((int)get_pfn(*pte));
         }
@@ -430,7 +562,12 @@ static void free_level(PTE *table, int level, uintptr_t base_va,
         }
 
         if (level == 0) {
-            freePage((ptr_t)pa2kva(get_pa(entry)));
+            ptr_t page = (ptr_t)pa2kva(get_pa(entry));
+            if (va >= SHM_VA_BASE && va < SHM_VA_END &&
+                shm_unmap_va(va, pgdir))
+                ;               /* 共享页由 shm_unmap_va 按引用计数回收 */
+            else
+                freePage(page);
         } else if (entry & (_PAGE_READ | _PAGE_WRITE | _PAGE_EXEC)) {
             /* 大页（本实验不用） */
             freePage((ptr_t)pa2kva(get_pa(entry)));

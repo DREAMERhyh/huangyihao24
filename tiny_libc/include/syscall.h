@@ -42,7 +42,9 @@
 /* P3 任务4：修改进程的核亲和掩码（与内核侧 asm/unistd.h 同号） */
 #define SYSCALL_TASKSET 57
 
-/* P4：线程（P3 已占用 56/57，这里顺延） */
+/* P4：共享内存与线程（P3 已占用 56/57，这里顺延到 58..61） */
+#define SYSCALL_SHM_GET 58
+#define SYSCALL_SHM_DT 59
 #define SYSCALL_PTHREAD_CREATE 60
 #define SYSCALL_PTHREAD_JOIN 61
 
