@@ -26,11 +26,9 @@
 /* 内核根页表固定放在 0x51000000 物理页 */
 #define PGDIR_PA 0x51000000lu
 #define PGDIR_KVA (PGDIR_PA + KERNEL_KVA_BASE)
+#define BOOT_PGDIR_PA (PGDIR_PA + NORMAL_PAGE_SIZE)
 
-/*
- * Flush entire local TLB.  'sfence.vma' implicitly fences with the instruction
- * cache as well, so a 'fence.i' is not necessary.
- */
+/* Flush translations in this hart's TLB. */
 static inline void local_flush_tlb_all(void)
 {
     __asm__ __volatile__ ("sfence.vma" : : : "memory");

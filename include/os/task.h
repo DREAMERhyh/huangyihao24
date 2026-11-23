@@ -34,9 +34,10 @@
 #define APPINFO_BYTES    (TASK_MAXNUM * sizeof(task_info_t))   /* 32×32 = 1024 字节 */
 
 /* bootblock 经寄存器传给内核的引导参数（任务5 起为【字节】语义）：
- *   a0 = AppInfo 起始字节偏移（镜像内）
- *   a1 = 用户程序数目（bootblock 从镜像偏移 0x1f8 读出）
- *   a2 = apps 区起始字节偏移（= kernel.img 总字节数）
+ *   a0 = 核号
+ *   a1 = AppInfo 起始字节偏移（镜像内）
+ *   a2 = 用户程序数目（bootblock 从镜像偏移 0x1f8 读出）
+ *   a3 = apps 区起始字节偏移（= kernel.img 总字节数）
  * head.S 在清完 BSS 后把这三个值存进下面的全局量，再跳 main。
  * 注意：内核一律不直接读 0x50200xxx（那是 bootblock 扇区，只允许 bootblock 读）。 */
 extern uint64_t boot_appinfo_off;

@@ -19,25 +19,14 @@ ENTRY(_boot)
   csrw CSR_SIE, zero
   csrw CSR_SIP, zero
 
-  /* 选启动栈：mhartid != 0 的从核用独立栈 */
-  csrr t0, CSR_MHARTID
-  bnez t0, boot_secondary_stack
+  /* a0 是 bootblock 传来的核号；主核的镜像参数在 a1/a2/a3。 */
+  bnez a0, boot_secondary_stack
   la sp, boot_stack_top_base
   j boot_stack_ready
 boot_secondary_stack:
   la sp, boot_stack_top_secondary
 boot_stack_ready:
 
-  /* bootblock 传来的 a0/a1/a2 是 AppInfo/apps 布局参数；boot_kernel 要
-   * 先把它们保存到 callee-saved 寄存器，再把 mhartid 作为第一个参数。 */
-  mv s0, a0
-  mv s1, a1
-  mv s2, a2
-
-  csrr a0, CSR_MHARTID
-  mv a1, s0
-  mv a2, s1
-  mv a3, s2
   call boot_kernel
 
 loop:
