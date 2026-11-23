@@ -160,7 +160,7 @@ static pcb_t *pick_next(int cpu)
     return best;
 }
 
-void do_scheduler(void)
+static void schedule(int timer_tick)
 {
     /* 任务5：细粒度版整个调度决策持 sched_lock（大锁版此处宏为空，
      *   BKL 由 trap 入口持有）。自旋锁不可重入——check_sleeping/
@@ -237,7 +237,16 @@ void do_scheduler(void)
         next = prev;                   /* 已经在怠速且没别的事，继续 */
     }
 
+    /* 时钟中断必须重装定时器。主动让出又选回自己的任务沿用原截止时间。
+     * 真正切换时，在更新 tp 和 satp 前把固件调用做完。 */
+    if (timer_tick || next != prev)
+        bios_set_timer(get_ticks() + SLICE_LEN);
+
     next->status = TASK_RUNNING;
+    if (next == prev) {
+        FINE_UNLOCK(&sched_lock);
+        return;
+    }
     /* 任务5（路线A）：派遣即认领——先把核号写进 next 的 PCB，再改
      *   current_running（此后 get_current_cpu_id() 读 next 也得到本核号；
      *   跨核迁移时旧核号就是在这里被新核改写覆盖的）。 */
@@ -248,13 +257,11 @@ void do_scheduler(void)
     /* P4：进程切换时切换 satp（页表根）。内核空间的映射所有进程相同，
      * 所以切换后内核代码/栈照样可访问。ASID 用 pid，线程同 pid 共享。 */
     ptr_t pgdir = next->pgdir ? next->pgdir : pa2kva(PGDIR_PA);
-    set_satp(SATP_MODE_SV39, (unsigned)(next->pid & 0xffff),
-             kva2pa(pgdir) >> NORMAL_PAGE_SHIFT);
+    if (next->pgdir != prev->pgdir)
+        set_satp(SATP_MODE_SV39, (unsigned)(next->pid & 0xffff),
+                 kva2pa(pgdir) >> NORMAL_PAGE_SHIFT);
     local_flush_tlb_all();
     local_flush_icache_all();
-
-    /* 时间片统一为 1/4 个时钟节拍——绝不为 0，飞机不会"停下"。 */
-    bios_set_timer(get_ticks() + SLICE_LEN);
 
     // TODO: [p2-task1] switch_to current_running
     /* P3 任务3：大内核锁在"切换缝隙"里交接（与 entry.S 的 new_task_entry、
@@ -290,6 +297,16 @@ void do_scheduler(void)
      *   为空，-O2 会把本函数末尾编成 tail call（`j switch_to`，objdump 已
      *   确认）——switch_to 的返回点直接回到 do_scheduler 的调用者，语义
      *   等价，但本函数不再有自己的返回路径。 */
+}
+
+void do_scheduler(void)
+{
+    schedule(0);
+}
+
+void do_scheduler_tick(void)
+{
+    schedule(1);
 }
 
 void do_sleep(uint32_t sleep_time)

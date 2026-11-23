@@ -54,9 +54,8 @@ void handle_irq_timer(regs_context_t *regs, uint64_t stval, uint64_t scause)
      *   当前任务对 CPU 的占用。被抢下的任务现场已由 exception_handler_entry
      *   存好，下次调度到它时会从 ret_from_exception 原样恢复、sret 回用户态。
      *
-     * 任务5：下一次中断的触发时刻由 do_scheduler 按"下一个任务的时间片"重设
-     *   （见 sched.c），所以这里不需要再重设 timer——两条返回路径都设了。 */
-    do_scheduler();
+     * 时钟入口即使选回同一个任务也要重装定时器。 */
+    do_scheduler_tick();
 }
 
 void init_exception()
