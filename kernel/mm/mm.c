@@ -629,11 +629,3 @@ void free_user_pgdir(uintptr_t pgdir)
     freePage((ptr_t)pgdir);
     spin_lock_release(&paging_lock);
 }
-
-/* 撤掉启动期的恒等映射（0x50000000-0x51000000，顶层的第 1 项） */
-void remove_identity_map(void)
-{
-    PTE *pgdir = (PTE *)pa2kva(PGDIR_PA);
-    pgdir[1] = 0;
-    local_flush_tlb_all();
-}

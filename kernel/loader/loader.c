@@ -29,8 +29,10 @@ uint64_t load_task_img(const char *taskname, uintptr_t pgdir)
         uint32_t size = tasks[i].byte_size;
         uint32_t mem_size = tasks[i].mem_size;
         uint32_t need = NBYTES2SEC(offset + size);
+        uintptr_t va = tasks[i].vaddr_entry;
 
-        if (size == 0 || need * SECTOR_SIZE > LOAD_STAGING_BYTES)
+        if ((va & OFFSET_MASK_4K) || size == 0 ||
+            offset + (uint64_t)size > LOAD_STAGING_BYTES)
             return 0;
         if (mem_size < size)
             mem_size = size;
@@ -39,12 +41,6 @@ uint64_t load_task_img(const char *taskname, uintptr_t pgdir)
                          sector) != 0)
             return 0;
 
-        /* 下面的逐页拷贝假设程序入口是页对齐的（本课程 ELF 都在
-         * 0x10000）；非对齐入口会让第 2 页起的数据整体错位，直接拒绝。 */
-        if (tasks[i].vaddr_entry & (PAGE_SIZE - 1))
-            return 0;
-
-        uintptr_t va = tasks[i].vaddr_entry;
         uint32_t remain = size;
         uint32_t src_off = 0;
 

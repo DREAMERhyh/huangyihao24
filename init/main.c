@@ -19,7 +19,7 @@
 #include <csr.h>
 
 // bootblock 经 head.S 传来的引导参数（任务5 起为【字节】语义）：
-//   a0 = AppInfo 起始字节偏移，a1 = 用户程序数目，a2 = apps 区起始字节偏移
+//   a1 = AppInfo 起始字节偏移，a2 = 用户程序数目，a3 = apps 区起始字节偏移
 //   定义见 task.h；赋值在 head.S 清完 BSS 后完成
 uint64_t boot_appinfo_off;
 uint64_t boot_appnum;
@@ -170,13 +170,13 @@ static void init_syscall(void)
 }
 /************************************************************/
 
-/* P3 任务5（路线A）：boot_cpu = 本核 mhartid，由 head.S 在进入内核时
- *   读一次传进来（a0）。全内核仅此一处得到"我是哪个核"，之后一律读
- *   current_running->running_cpu（get_current_cpu_id），不再碰 mhartid——
- *   细粒度版 + 双核 + 高频 syscall 下 csrr mhartid 偶发被判非法指令，
- *   残值当返回值用会让 PC 飞进数据区（详见 include/os/smp.h）。 */
+/* boot_cpu 是 bootblock 经 a0 传入的核号。 */
 int main(uint64_t boot_cpu)
 {
+    /* 当前 PC 和栈已在高地址。切到常驻页表后，本核不再有低地址恒等映射。 */
+    set_satp(SATP_MODE_SV39, 0, PGDIR_PA >> NORMAL_PAGE_SHIFT);
+    local_flush_tlb_all();
+
     /* P3 任务3：从核（核号 != 0）走从核路径。
      *   主核已完成全部全局初始化（BSS/任务表/锁/异常/屏幕），从核只做
      *   本核必要设置：陷阱入口、陷阱栈、自己的 idle PCB、第一个时钟，
@@ -199,14 +199,14 @@ int main(uint64_t boot_cpu)
         current_running = &pid0_pcb[boot_cpu];
         core_running[boot_cpu] = &pid0_pcb[boot_cpu];
         pid0_pcb[boot_cpu].status = TASK_RUNNING;
+        lock_kernel();
+        screen_move_cursor(0, 2);
         printk("> [INIT] CPU #%u has entered kernel with VM!\n",
                (unsigned int)boot_cpu);
         printl("[SMP] hart %d idle ready, entering scheduler loop\n",
                boot_cpu);
-        /* 从核已经完整运行在内核虚地址上：这时才可以撤掉启动期的
-         * 0x50000000-0x51000000 恒等映射（主核此时早在 KVA 上跑）。 */
-        remove_identity_map();
         bios_set_timer(get_ticks() + TIMER_INTERVAL);
+        unlock_kernel();
         enable_preempt();               /* sie 全开：从核时钟开始节拍 */
         while (1)
             asm volatile("wfi");
@@ -281,14 +281,11 @@ int main(uint64_t boot_cpu)
     //    时钟打断就直接在当前内核栈上向下压帧，不再需要专用陷阱栈。
     asm volatile("csrw sscratch, zero");
 
-    // ② 再打开 sie 的 STIE 位（允许时钟中断）。此时 sstatus.SIE 已经是 1
-    //    （内核态由 setup_exception 打开，用户态由 sret 按陷阱帧的 SPIE 恢复），
-    //    所以中断立刻就会来——抢占模式下的"第一次调度"就由这次时钟中断发起。
-    enable_preempt();
-
-    // P3 任务3：全部初始化完毕，唤醒从核（写唤醒标志；从核在 bootblock
-    //   自旋轮询到后直接跳 head.S 从核入口 → main 从核路径 → 参与全局调度）
+    /* 先发 IPI，再允许时钟调度；此时两个启动路径的固件调用也经大锁串行。 */
+    lock_kernel();
     wakeup_other_hart();
+    unlock_kernel();
+    enable_preempt();
 
     // Infinite while loop, where CPU stays in a low-power state (QAQQQQQQQQQQQ)
     while (1)

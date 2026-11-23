@@ -4,13 +4,14 @@
 
 #define ARRTIBUTE_BOOTKERNEL __attribute__((section(".bootkernel")))
 
-typedef void (*kernel_entry_t)(unsigned long, unsigned long, unsigned long);
+typedef void (*kernel_entry_t)(unsigned long, unsigned long, unsigned long,
+                               unsigned long);
 
 /********* setup memory mapping ***********/
 static uintptr_t ARRTIBUTE_BOOTKERNEL alloc_page()
 {
-    static uintptr_t pg_base = PGDIR_PA;
-    pg_base += 0x1000;
+    static uintptr_t pg_base = BOOT_PGDIR_PA;
+    pg_base += NORMAL_PAGE_SIZE;
     return pg_base;
 }
 
@@ -37,8 +38,8 @@ static void ARRTIBUTE_BOOTKERNEL map_page(uint64_t va, uint64_t pa, PTE *pgdir)
 
 static void ARRTIBUTE_BOOTKERNEL enable_vm()
 {
-    // write satp to enable paging
-    set_satp(SATP_MODE_SV39, 0, PGDIR_PA >> NORMAL_PAGE_SHIFT);
+    // 每个核先通过含恒等映射的启动页表跳到高地址。
+    set_satp(SATP_MODE_SV39, 0, BOOT_PGDIR_PA >> NORMAL_PAGE_SHIFT);
     local_flush_tlb_all();
 }
 
@@ -49,38 +50,41 @@ static void ARRTIBUTE_BOOTKERNEL enable_vm()
 static void ARRTIBUTE_BOOTKERNEL setup_vm()
 {
     clear_pgdir(PGDIR_PA);
+    clear_pgdir(BOOT_PGDIR_PA);
     // map kernel virtual address(kva) to kernel physical
     // address(kpa) kva = kpa + 0xffff_ffc0_0000_0000 use 2MB page,
     // map all physical memory
-    PTE *early_pgdir = (PTE *)PGDIR_PA;
+    PTE *kernel_pgdir = (PTE *)PGDIR_PA;
     for (uint64_t kva = 0xffffffc050000000lu;
          kva < 0xffffffc060000000lu; kva += 0x200000lu) {
-        map_page(kva, kva2pa(kva), early_pgdir);
+        map_page(kva, kva2pa(kva), kernel_pgdir);
     }
-    // map boot address
+    // 两张根页表共享高地址映射，恒等映射只装入启动页表。
+    PTE *boot_pgdir = (PTE *)BOOT_PGDIR_PA;
+    for (unsigned i = NUM_PTE_ENTRY / 2; i < NUM_PTE_ENTRY; ++i)
+        boot_pgdir[i] = kernel_pgdir[i];
     for (uint64_t pa = 0x50000000lu; pa < 0x51000000lu;
          pa += 0x200000lu) {
-        map_page(pa, pa, early_pgdir);
+        map_page(pa, pa, boot_pgdir);
     }
-    enable_vm();
 }
 
 extern uintptr_t _start[];
 
 /*********** start here **************/
-int ARRTIBUTE_BOOTKERNEL boot_kernel(unsigned long mhartid, unsigned long arg0,
-                                     unsigned long arg1, unsigned long arg2)
+int ARRTIBUTE_BOOTKERNEL boot_kernel(unsigned long hartid,
+                                     unsigned long appinfo_off,
+                                     unsigned long appnum,
+                                     unsigned long apps_base_off)
 {
-    if (mhartid == 0) {
+    if (hartid == 0)
         setup_vm();
-    } else {
-        enable_vm();
-    }
+    enable_vm();
 
-    /* enter kernel（a0/a1/a2 = AppInfo 起始偏移 / app 数 / apps 区偏移）。
-     * boot 阶段 PC 还在物理地址上，-mcmodel=medany 对 _start 的引用算出的
+    /* boot 阶段 PC 还在物理地址上，-mcmodel=medany 对 _start 的引用算出的
      * 是它的物理地址；pa2kva 把它换成链接时的内核虚地址。 */
-    ((kernel_entry_t)(uintptr_t)pa2kva((uintptr_t)_start))(arg0, arg1, arg2);
+    ((kernel_entry_t)pa2kva((uintptr_t)_start))(hartid, appinfo_off, appnum,
+                                               apps_base_off);
 
     return 0;
 }
