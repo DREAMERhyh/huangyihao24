@@ -248,6 +248,12 @@ static ptr_t swap_out_one(uintptr_t pgdir)
     *pte |= _PAGE_SOFT;
     local_flush_tlb_page(victim->va);
     swap_entry_remove(pte);
+
+    static int reported_write;
+    if (!reported_write) {
+        reported_write = 1;
+        printk("swap: first SD write OK (slot %d)\n", slot);
+    }
     return page;
 }
 
@@ -282,6 +288,12 @@ static void swap_in_one(PTE *pte, uintptr_t va, uintptr_t pgdir)
                        _PAGE_EXEC | _PAGE_USER | _PAGE_ACCESSED | _PAGE_DIRTY);
     swap_slot_free(slot);
     swap_entry_add(pte, pgdir, va);
+
+    static int reported_read;
+    if (!reported_read) {
+        reported_read = 1;
+        printk("swap: first SD read OK (slot %d)\n", slot);
+    }
 }
 
 /* 为一个用户虚页分配物理页；超过本进程上限时先换出一页。 */

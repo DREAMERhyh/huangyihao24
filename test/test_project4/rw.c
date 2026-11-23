@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <stdint.h>
-#include <stdint.h>
 #include <time.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -10,20 +9,18 @@ int main(int argc, char* argv[])
 {
 	assert(argc > 1);
 	srand(clock());
-	long mem2 = 0;
-	uintptr_t mem1 = 0;
-	int curs = 0;
-	int i;
 	sys_move_cursor(2, 2);
-	for (i = 1; i < argc; i++)
+	for (int i = 1; i < argc; i++)
 	{
-		mem1 = atol(argv[i]);
-		// sys_move_cursor(2, curs+i);
-		mem2 = rand();
-		*(long*)mem1 = mem2;
-		printf("0x%lx, %ld\n", mem1, mem2);
-		if (*(long*)mem1 != mem2) {
-			printf("Error!\n");
+		uintptr_t addr = atol(argv[i]);
+		volatile long *page = (volatile long *)addr;
+		long expected = rand();
+		*page = expected;
+		long actual = *page;
+		printf("0x%lx, %ld\n", addr, expected);
+		if (actual != expected) {
+			printf("Error! Read %ld\n", actual);
+			return 1;
 		}
 	}
 	//Only input address.
